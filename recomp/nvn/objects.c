@@ -187,10 +187,16 @@ NVN(nvnMemoryPoolInitialize) {
     p->storage = FLD(uint64_t, A(1), 0x10);
     p->size = FLD(uint64_t, A(1), 0x18);
     p->flags = FLD(uint32_t, A(1), 8);
+    if (getenv("FIFA_LOG_POOLS")) LOG("[nvn] pool %#llx+%#llx flags %#x\n", (unsigned long long)p->storage, (unsigned long long)p->size, p->flags);
+    backend_pool_created(p);
     SET_HOST(A(0), p);
     RET(1);
 }
-NVN(nvnMemoryPoolFinalize) { free(HOST(NvnPool, A(0))); SET_HOST(A(0), 0); }
+NVN(nvnMemoryPoolFinalize) {
+    backend_pool_destroyed(HOST(NvnPool, A(0)));
+    free(HOST(NvnPool, A(0)));
+    SET_HOST(A(0), 0);
+}
 NVN(nvnMemoryPoolSetDebugLabel) { (void)c; }
 NVN(nvnMemoryPoolMap) { RET(HOST(NvnPool, A(0))->storage); }
 NVN(nvnMemoryPoolGetBufferAddress) { RET(HOST(NvnPool, A(0))->storage); }  // GPU address == CPU address

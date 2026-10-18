@@ -197,6 +197,7 @@ static void load_module(const HostModule *m) {
 }
 
 HostThread *thread_create_context(uint64_t stack_size);
+void ui_run(void) __attribute__((noreturn));
 
 static void *main_thread(void *p) {
   cur_thread = p;
@@ -204,7 +205,7 @@ static void *main_thread(void *p) {
   HLOG("[host] calling nn::init::Start\n");
   a64_call(&cur_thread->cpu, host_nn_init_start);
   HLOG("[host] nn::init::Start returned\n");
-  return 0;
+  exit(0);
 }
 
 int main(int argc, char **argv) {
@@ -236,6 +237,6 @@ int main(int argc, char **argv) {
   pthread_attr_setstacksize(&a, 512 << 20);
   pthread_t pt;
   pthread_create(&pt, &a, main_thread, t);
-  pthread_join(pt, 0);
-  return 0;
+  /* The main thread runs the window (AppKit wants it there): recomp/nvn/metal.m. */
+  ui_run();
 }

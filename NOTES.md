@@ -271,8 +271,8 @@ Chosen: (1) first, as a quick path to a first frame and a shader dump, then
 (2) as the main backend.
 
 Progress on (1) (2026-10-18): the game boots past graphics init and runs
-its frame loop on a null renderer (`recomp/nvn/backend_null.c`): 8.7k
-presents in 300 s, no crash. Pieces:
+its frame loop, now on the Metal executor (below; before that on a null
+renderer, 8.7k presents in 300 s, no crash). Pieces:
 - The NRO is a third module at 0x1A000000 (`tools/nso.py` reads NRO,
   `tools/elfsyms.py` takes function starts and names from the `.nrs`).
   `recomp/hle/ro.c`: `nn::ro::LoadModule` checks the build id and runs the
@@ -296,9 +296,41 @@ presents in 300 s, no crash. Pieces:
   the caller's frame (`build.py`), and `recomp/hle/setjmp.c` longjmps there.
 - Jump tables: SIMD/FP instructions were read as GPR definitions, and
   `cfg_const` gave up on any other definition; now 0 of 1,224 unresolved.
-- Next: the Metal executor (LAS `renderer.m`/`metal.m`; needs per-pool
-  `MTLBuffer`s instead of one buffer over the guest heap), a window, the
-  Maxwell translator.
+- Metal executor: `recomp/nvn/renderer.m` (LAS `renderer.m` without its
+  game-specific parts: widescreen, mirror mode, highlight tint, texture
+  patches, output scaling), `recomp/nvn/metal.m` (formats, texture uploads,
+  pool buffers, present; an AppKit window instead of SDL) and the Maxwell
+  translator `recomp/nvn/maxwell/` (LAS, MIT). The host main thread now runs
+  the window (`ui_run`); guest `nnMain` stays on its own thread and the
+  process exits when it returns. `FIFA_HIDDEN=1` renders without showing
+  the window, `FIFA_WINDOW=WxH`, `FIFA_SCREENSHOT_EVERY=n`,
+  `FIFA_DEBUG_FRAME=n`, `FIFA_LOG_POOLS=1`; LAS's `LARECOMP_*` switches are
+  `FIFA_*`.
+  - GPU memory: the game's ~200 memory pools (671 MB) lie spread over
+    0x26000000-0x222400000, ~8.5 GB, and an M1's `maxBufferLength` is
+    4 GB, so LAS's one buffer over the heap can't work. Each pool gets a
+    no-copy `MTLBuffer` over its pages (widened to 16 KB host pages;
+    overlapping wraps are allowed) at `nvnMemoryPoolInitialize`; vertex,
+    index and readback copies bind through `renderer_pool_buffer()`,
+    anything outside a pool is copied into the ring. Virtual pools (no
+    storage, 512 MB, flags 0x221) are not wrapped.
+  - Shader global memory (LDG/STG): the translator no longer bakes a heap
+    base into MSL; shaders take `constant ulong4 &gmem_win [[buffer(17)]]` =
+    {GPU address of a pool buffer, its guest address, its size} and form a
+    `device uchar *` from the integer (Metal 3 `gpuAddress`, checked on the
+    M1). The window is the pool of the stage's first storage buffer (else
+    uniform buffer); reads outside it give 0. GLSL output is unchanged.
+  - Fixes over LAS: float `ClearColor` recorded the guest's x6 as the clear
+    kind (garbage -> nil fragment function); depth textures with 1D/3D
+    targets (Metal has none) become 2D (arrays); cube views for one face
+    asked for 6 slices from that face; texture-level swizzles (alpha-one
+    formats) aren't allowed with render-target usage on M1, so the swizzle
+    moved to the sampled view.
+  - State: runs 2 min at 30 fps, ~1,150 passes and ~11,700 draws per 2 s,
+    but every draw is skipped: programs fail to translate (FS "bindless
+    tex", a few unknown instructions) and every compute shader fails at
+    offset 0x8 ("unknown instruction 0"), so its code address is probably
+    off by the NVN header. No screenshot is written yet.
 
 - `recomp/rt/apm.c`: `apm` → `ISession` (Set/GetPerformanceConfiguration,
   per-mode configs; reports boost mode to match am's docked state).
@@ -427,8 +459,14 @@ presents in 300 s, no crash. Pieces:
 
 ## Next steps
 
-- Choose the renderer path (see Status) and load or replace the
-  RenderCore2 NRO (`ldr:ro` / `nn::ro::LoadModule`).
+- Renderer (NVN HLE path, Metal): make shaders translate. Compute code
+  address/header offset first (all compute fails at 0x8), then bindless
+  texture handles in fragment shaders, then the unknown instructions; then
+  check that draws land and the presented image shows up
+  (`FIFA_SCREENSHOT_EVERY`).
+- Virtual memory pools (`nvnMemoryPoolMapVirtual`): textures in them have
+  no backing buffer yet.
+- Later: the WebGPU RenderCore2 backend (option 2 in Status).
 - `nvdrv`: real responses for Open/Initialize/ioctls the driver init needs
   (only if the NVN HLE path doesn't bypass it).
 - Dump shaders as the game creates them; extend the Maxwell translator

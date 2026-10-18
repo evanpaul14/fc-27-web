@@ -5,6 +5,7 @@
 
 /* Guest address space (all offsets from `mem`, 20 GB reserved, committed on touch). */
 #define GUEST_SPACE        0x500000000ull
+#define NULL_GUARD_END     0x07E00000ull  /* [0, here) is PROT_NONE so null accesses fault */
 #define HOST_THUNK_BASE    0x07E00000ull  /* host callbacks callable from guest code, 16 bytes each */
 #define HOST_THUNK_END     0x07F00000ull
 #define MISSING_BASE       0x07F00000ull  /* unresolved imports (recomp/image.py) */
@@ -28,6 +29,7 @@ typedef struct { const char *name; uint64_t base, size, init; } HostModule;
 extern const HostModule host_modules[];
 extern const unsigned host_module_count;
 extern const uint64_t host_nn_init_start;
+extern const uint64_t host_ro_lookup_slot_ptr;  /* nn::ro::detail::g_pLookupGlobalManualFunctionPointer */
 
 extern int host_trace;  /* FIFA_TRACE env: log svcs and dispatcher misses */
 

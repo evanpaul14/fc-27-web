@@ -484,14 +484,10 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
     __atomic_store_n(u32p(key), 1, __ATOMIC_SEQ_CST);
     self->wait_kind = W_CVAR; self->wait_addr = key; self->wait_mutex = maddr; self->wait_tag = tag;
     uint32_t r = timeout == 0 ? R_TIMED_OUT : kwait(self, timeout);
-    if (r) {
-      /* timed out: leave the condvar queue, then take the mutex back */
-      if (self->wait_kind == W_CVAR) {
-        self->wait_kind = W_NONE;
-        mutex_acquire_for(self, maddr);
-      }
-      if (!self->woken) kwait(self, -1);
-    }
+    /* Timed out (still a condvar waiter, or signaled but queued on the busy
+     * mutex): leave the queue and return without the mutex, as Horizon does;
+     * nnSdk takes it back itself. A stale HAS_WAITERS bit is harmless. */
+    if (r) self->wait_kind = W_NONE;
     pthread_mutex_unlock(&klock);
     x[0] = r;
     return;

@@ -585,7 +585,9 @@ def main():
     layout = ['#include "gen.h"', '#include "../../recomp/rt/host.h"', 'const HostModule host_modules[] = {']
     layout += [f'  {{"{m["name"]}", {m["base"]:#x}ull, {m["size"]:#x}ull, {m["init"] or 0:#x}ull}},' for m in mods]
     layout += ['};', f'const unsigned host_module_count = {len(mods)};',
-               f'const uint64_t host_nn_init_start = {p.by_name["_ZN2nn4init5StartEmmPFvvES2_S2_"]:#x}ull;']
+               f'const uint64_t host_nn_init_start = {p.by_name["_ZN2nn4init5StartEmmPFvvES2_S2_"]:#x}ull;',
+               'const uint64_t host_ro_lookup_slot_ptr = '
+               f'{p.by_name["_ZN2nn2ro6detail36g_pLookupGlobalManualFunctionPointerE"]:#x}ull;']
     write_if_changed(os.path.join(gdir, 'layout.c'), '\n'.join(layout) + '\n')
     write_if_changed(os.path.join(gdir, 'gen.h'), '#include "../../recomp/rt/runtime.h"\n')
     json.dump({'functions': len(order), 'instructions': stats['insns'], 'tus': tu_i,

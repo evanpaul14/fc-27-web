@@ -133,6 +133,7 @@ static void crash_handler(int sig, siginfo_t *si, void *uc_) {
        (unsigned long long)pc, di.dli_sname ? di.dli_sname : "?",
        (unsigned long long)(pc - (uint64_t)di.dli_saddr), (unsigned long long)sp, (unsigned long long)fault,
        (unsigned long long)(fault - (uint64_t)mem));
+  if (fault - (uint64_t)mem < NULL_GUARD_END) HLOG("  (guest null-region access)\n");
   if (cur_thread)
     for (int i = 0; i < 31; i++)
       HLOG("  x%-2d %016llx%s", i, (unsigned long long)cur_thread->cpu.x[i], i % 4 == 3 || i == 30 ? "\n" : "");
@@ -198,6 +199,9 @@ int main(int argc, char **argv) {
   install_crash_handler();
   mem = mmap(0, GUEST_SPACE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
   if (mem == MAP_FAILED) HDIE("cannot reserve guest space\n");
+  /* Nothing is mapped below 0x07E00000 on the Switch: make null-pointer
+   * accesses fault instead of silently hitting zeroed memory. */
+  if (mprotect(mem, NULL_GUARD_END, PROT_NONE)) HDIE("cannot protect the guest null region\n");
   for (unsigned i = 0; i < host_module_count; i++) load_module(&host_modules[i]);
   load_symbols("build/symbols.tsv");
 
@@ -205,6 +209,9 @@ int main(int argc, char **argv) {
   CPU *c = &t->cpu;
   c->x[0] = t->handle;
   c->x[1] = guest_alloc(0x1000, 0x1000);  /* rtld's module list block */
+  /* rtld points nn::ro at its global-lookup hook slot; nn::ro::Initialize
+   * stores LookupGlobalManual there. */
+  *(uint64_t *)gptr(host_ro_lookup_slot_ptr) = guest_alloc(8, 8);
   c->x[2] = host_thunk(rtld_set_initialized, "rtld_set_initialized");
   c->x[3] = host_thunk(rtld_run_inits, "rtld_run_inits");
   c->x[4] = host_thunk(rtld_run_finis, "rtld_run_finis");

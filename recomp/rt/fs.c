@@ -358,6 +358,10 @@ static void filesystem(void *state, IpcMsg *m) {
     out_size(m, 0x20);
     return;
   case 15: return;  /* QueryEntry */
+  case 16:          /* GetFileSystemAttribute -> FileSystemAttribute (0xC0): no limits defined */
+    memset(m->out, 0, 0xC0);
+    out_size(m, 0xC0);
+    return;
   default: unhandled("IFileSystem", m);
   }
 }

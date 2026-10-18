@@ -156,12 +156,17 @@ memory is `mem + addr`; with `mem = 0` guest pointers are host pointers.
 
 ```
 python3 -I recomp/image.py extracted/code build      # relocated main.img + sdk.img, layout.json, symbols.tsv
-python3 -I recomp/build.py build --all                # ~14 min: C for all 310k functions -> build/gen (2.6 GB)
+python3 -I recomp/build.py build --all                # C for all 338k functions -> build/gen (2.6 GB)
 make -C recomp -j6                                    # build/fifa (native, AArch64 host)
 ./build/fifa                                          # FIFA_TRACE=1 logs svcs
 ```
 
-- Layout: main at 0x08000000, nnSdk at 0x18000000, host thunks 0x07E00000,
+Always pass `--all`: without it `build.py` emits only the closure reachable
+from the roots (215k functions), which rewrites every unit and costs a full
+~43 min rebuild, and running `--all` again afterwards rewrites them back.
+
+- Layout: `[0, 0x07E00000)` is `PROT_NONE` (null guard), main at
+  0x08000000, nnSdk at 0x18000000, host thunks 0x07E00000,
   unresolved imports 0x07F00000, host allocations (stacks, TLRs)
   0x1C000000, heap (svcSetHeapSize) 0x20000000, stack region (GetInfo
   14/15) 0xC0000000, alias region (GetInfo 2/3: svcMapMemory,
@@ -181,7 +186,9 @@ make -C recomp -j6                                    # build/fifa (native, AArc
   taken (type Stack) and the rest of the region as free.
 - Startup: the host plays rtld and calls `nn::init::Start(thread, rtld_data,
   f1, f2, f3)` with host thunks; f2 runs DT_INIT of nnSdk then main. nnSdk
-  itself calls `nninitStartup` and `nnMain`.
+  itself calls `nninitStartup` and `nnMain`. Like the real rtld, the host
+  also points `nn::ro::detail::g_pLookupGlobalManualFunctionPointer` at an
+  8-byte slot first.
 - Both main and nnSdk are recompiled; libc, libc++ and nn::os come from
   nnSdk's own code. The OS boundary is the svc layer in
   `recomp/rt/kernel.c` (threads are host pthreads; mutex/condvar/address
@@ -233,9 +240,23 @@ make -C recomp -j6                                    # build/fifa (native, AArc
 
 `./build/fifa` gets through nnSdk init, `nninitStartup`, all 3,325 of
 main's `init_array` entries and into `nnMain`: it mounts the RomFS, opens
-two save data filesystems (types 4 and 5), asks `ldr:ro` for the NRO, and
-then dies in `nn::oe::ApmSetPerformanceConfiguration` because `apm`
-`OpenSession` is a stub and the client calls through a garbage `ISession`.
+two save data filesystems (types 4 and 5), asks `ldr:ro` for the NRO, sets
+the apm performance configuration, opens `nifm:u` (still a stub) and then
+faults in stripped game code under `nnMain` (lr 0x116aea10, called from
+0x119e9990): an FNV-1a hash over a name ("CraniumSecondary...") followed by
+a load through a garbage pointer (0x8bc10010ffff).
+
+- `recomp/rt/apm.c`: `apm` → `ISession` (Set/GetPerformanceConfiguration,
+  per-mode configs; reports boost mode to match am's docked state).
+- `recomp/rt/pctl.c`: `pctl`, `pctl:s/a/r` → `IParentalControlService`
+  with no restrictions, no pairing, no play timer.
+- Guest `[0, 0x07E00000)` is `PROT_NONE`; crash reports flag null-region
+  accesses. It immediately found that rtld must set
+  `nn::ro::detail::g_pLookupGlobalManualFunctionPointer` to a slot (the
+  host does this before `nn::init::Start`; `build.py` emits its address as
+  `host_ro_lookup_slot_ptr` in `layout.c`).
+- `svcWaitProcessWideKeyAtomic` that times out returns 0xEA01 *without*
+  the mutex: nnSdk reacquires it itself and aborts if it already owns it.
 
 - `recomp/rt/fs.c` (`fsp-srv`): `IFileSystemProxy` → `IStorage` for the
   RomFS (`OpenDataStorageByCurrentProcess`), `IFileSystem`/`IFile`/
@@ -291,14 +312,12 @@ then dies in `nn::oe::ApmSetPerformanceConfiguration` because `apm`
 
 ## Next steps
 
-- `apm` `OpenSession` → `ISession` (Set/GetPerformanceConfiguration).
-- `pctl`/`pctl:*` `CreateService(WithoutInitialize)` → IParentalControlService.
+- Find out where the garbage pointer behind the fault under `nnMain` comes from.
+- `nifm:u` → `IGeneralService` (offline: no internet connection).
 - `ldr:ro` / `nn::ro`: load the RenderCore2 NRO (or hand back our own
   WebGPU backend in its place).
 - Then keep pushing through `nnMain` and the services it reaches (hid, vi,
   nvdrv, audio, …).
-- Make guest page 0 trap: anything below 0x07E00000 is unmapped on the
-  Switch, and null writes there currently go unnoticed.
 - Avoid full rebuilds when starts change: make bucket contents stable so a
   new start only touches its own bucket.
 - Name the primitive `T_*` types; tie vtables to reflection classes.

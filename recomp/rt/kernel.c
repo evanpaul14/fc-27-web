@@ -18,6 +18,7 @@
 #define R_TIMED_OUT 0xEA01
 #define R_CANCELLED 0xEC01
 #define R_OUT_OF_MEMORY 0xD001
+#define R_INVALID_SIZE 0xCA01
 
 #define HAS_WAITERS 0x40000000u
 #define PSEUDO_THREAD 0xFFFF8000u
@@ -60,6 +61,9 @@ HostThread *thread_create_context(uint64_t stack_size) {
   pthread_mutex_lock(&klock);
   t->id = next_thread_id++;
   t->handle = handle_new(H_THREAD, t);
+  /* nn::os tags mutex/critical-section ownership with the thread handle the
+   * kernel leaves at TLR+0x110 (nnSdk only ever reads it). */
+  memcpy(gptr(t->tlr + 0x110), &t->handle, 4);
   t->next = all_threads;
   all_threads = t;
   pthread_mutex_unlock(&klock);
@@ -160,14 +164,15 @@ static void sync_notify(void) {
 /* ---- memory ---- */
 static uint64_t heap_size;
 
-/* svcMapMemory destinations, so QueryMemory shows them as taken. */
-typedef struct { uint64_t base, size; } Mapping;
+/* svcMapMemory / svcMapSharedMemory destinations, so QueryMemory shows them as taken. */
+enum { MEM_SHARED = 0x6, MEM_STACK = 0xB };  /* Horizon MemoryState */
+typedef struct { uint64_t base, size; uint32_t type; } Mapping;
 static Mapping mappings[1024];
 static unsigned mapping_count;
 
-static void mapping_add(uint64_t base, uint64_t size) {
+static void mapping_add(uint64_t base, uint64_t size, uint32_t type) {
   pthread_mutex_lock(&klock);
-  if (mapping_count < sizeof mappings / sizeof *mappings) mappings[mapping_count++] = (Mapping){base, size};
+  if (mapping_count < sizeof mappings / sizeof *mappings) mappings[mapping_count++] = (Mapping){base, size, type};
   else HLOG("[svc] MapMemory: mapping table full\n");
   pthread_mutex_unlock(&klock);
 }
@@ -192,7 +197,7 @@ static void query_memory(uint64_t info, uint64_t addr) {
     uint64_t lo = 0, hi = GUEST_SPACE;  /* free block around addr, bounded by mappings */
     for (unsigned i = 0; i < mapping_count; i++) {
       const Mapping *m = &mappings[i];
-      if (addr >= m->base && addr < m->base + m->size) { base = m->base; size = m->size; type = 0xB; perm = 3; }
+      if (addr >= m->base && addr < m->base + m->size) { base = m->base; size = m->size; type = m->type; perm = 3; }
       else if (m->base + m->size <= addr && m->base + m->size > lo) lo = m->base + m->size;
       else if (m->base > addr && m->base < hi) hi = m->base;
     }
@@ -230,7 +235,10 @@ static uint64_t get_info(uint32_t type, uint64_t sub, uint32_t *res) {
   case 13: return 0xF8000000ull;
   case 14: return STACK_BASE;               /* stack region */
   case 15: return STACK_END - STACK_BASE;
-  case 16: case 17: return 0;               /* system resource size */
+  /* System resource (kernel page tables for MapPhysicalMemory). Non-zero
+   * enables nn::os virtual address memory (VammManager) over the alias region. */
+  case 16: return 0x2000000ull;             /* system resource size total */
+  case 17: return 0;                        /* system resource size used */
   case 18: return 0x0100C49025D3E000ull;    /* program id */
   case 20: return 0;                        /* user exception context */
   case 21: return 0xCD500000ull;            /* total non-system memory */
@@ -273,6 +281,21 @@ KEvent *kevent_create(uint32_t *readable, uint32_t *writable) {
   pthread_mutex_unlock(&klock);
   return ev;
 }
+/* Shared memory without page aliasing (host pages are 16 KB, guest
+ * addresses 4 KB aligned, and wasm can't alias at all): the contents live
+ * in a host buffer while unmapped and at the guest address while mapped,
+ * and only one guest mapping exists at a time. Host code must go through
+ * kshmem_ptr() on every access. */
+struct KSharedMemory { uint64_t size, guest; uint8_t *backing; };
+KSharedMemory *kshmem_create(uint64_t size, uint32_t *handle) {
+  KSharedMemory *s = calloc(1, sizeof *s);
+  s->size = size;
+  s->backing = calloc(1, size);
+  if (handle) *handle = kobj_new(H_SHMEM, s);
+  return s;
+}
+void *kshmem_ptr(KSharedMemory *s) { return s->guest ? gptr(s->guest) : s->backing; }
+
 void kevent_signal(KEvent *e) {
   pthread_mutex_lock(&klock);
   e->signaled = 1;
@@ -306,7 +329,7 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
     return;
   case 0x04: case 0x05: {  /* MapMemory / UnmapMemory(dst, src, size): flat space, so move the contents */
     uint64_t dst = x[0], src = x[1], size = x[2];
-    if (imm == 0x04) { memmove(gptr(dst), gptr(src), size); mapping_add(dst, size); }
+    if (imm == 0x04) { memmove(gptr(dst), gptr(src), size); mapping_add(dst, size, MEM_STACK); }
     else { memmove(gptr(src), gptr(dst), size); mapping_remove(dst); }
     x[0] = RES_OK;
     return;
@@ -579,6 +602,34 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
       }
     pthread_mutex_unlock(&klock);
     x[0] = r;
+    return;
+  }
+  case 0x13: case 0x14: {  /* MapSharedMemory / UnmapSharedMemory(handle, addr, size[, perm]) */
+    KSharedMemory *s = kobj_get((uint32_t)x[0], H_SHMEM);
+    uint64_t addr = x[1], size = x[2];
+    if (!s) { x[0] = R_INVALID_HANDLE; return; }
+    if (size > s->size) { x[0] = R_INVALID_SIZE; return; }
+    pthread_mutex_lock(&klock);
+    uint32_t res = RES_OK;
+    if (imm == 0x13) {
+      if (s->guest) res = R_INVALID_STATE;  /* second simultaneous mapping: unsupported */
+      else { memcpy(gptr(addr), s->backing, size); s->guest = addr; }
+    } else {
+      if (s->guest != addr) res = R_INVALID_STATE;
+      else { memcpy(s->backing, gptr(addr), size); memset(gptr(addr), 0, size); s->guest = 0; }
+    }
+    pthread_mutex_unlock(&klock);
+    if (res == R_INVALID_STATE) HLOG("[svc] %sSharedMemory %#llx at %#llx: already %smapped\n", imm == 0x13 ? "Map" : "Unmap",
+                                     (unsigned long long)x[0], (unsigned long long)addr, imm == 0x13 ? "" : "un");
+    else if (imm == 0x13) mapping_add(addr, size, MEM_SHARED);
+    else mapping_remove(addr);
+    x[0] = res;
+    return;
+  }
+  case 0x50: {  /* CreateSharedMemory(_, size, local perm, remote perm) -> handle */
+    uint32_t h;
+    kshmem_create(x[1], &h);
+    x[0] = RES_OK; x[1] = h;
     return;
   }
   case 0x45: {  /* CreateEvent -> writable, readable */

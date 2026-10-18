@@ -6,7 +6,7 @@ CFLAGS := -O1 -w -mllvm -enable-misched=false -mllvm -global-isel -mllvm -global
 # Largest units first so the long ones don't finish last.
 GEN := $(shell ls -S $(B)/gen/*.c 2>/dev/null)
 OBJ := $(GEN:$(B)/gen/%.c=$(B)/obj/%.o)
-RT := rt/host.c rt/kernel.c rt/ipc.c rt/services.c rt/am.c rt/a64_rt.c $(wildcard hle/*.c)
+RT := rt/host.c rt/kernel.c rt/ipc.c rt/services.c rt/am.c rt/time.c rt/a64_rt.c $(wildcard hle/*.c)
 HDR := rt/cpu.h rt/runtime.h rt/host.h rt/ipc.h
 
 $(B)/fifa: $(OBJ) $(RT) $(HDR)

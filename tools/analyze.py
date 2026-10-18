@@ -4,7 +4,8 @@ Applies relocations, discovers function starts and vtables, and writes:
   OUT/relocs.npy     pointer slots: (slot, value, kind) kind 0=relative 1=import
   OUT/imports.tsv    import index, fake address, symbol
   OUT/functions.tsv  start, size, sources (b=bl target, p=data pointer, v=vtable,
-                     e=eh_frame, i=init_array, x=export), name
+                     e=eh_frame, i=init_array, a=address taken by adr/adrp+add,
+                     x=export), name
   OUT/vtables.tsv    address point, n slots, slot targets
   OUT/stats.json
 
@@ -101,6 +102,37 @@ def main():
     for a in bl_targets.tolist():
         mark(a, 'b')
 
+    # Address-taken code: adr, or adrp + add on the same register within 4
+    # instructions, landing in text. Jump-table labels are materialised the
+    # same way, so keep only targets that look like a function entry: 16-byte
+    # aligned (99.4% of known starts) right after ret / b / udf / nop.
+    def imm21(x):
+        v = (((x >> 5) & 0x7FFFF) << 2) | ((x >> 29) & 3)
+        return np.where(v & (1 << 20), v - (1 << 21), v)
+    w64 = words.astype(np.int64)
+    adr_t = []
+    m = (w64 & 0x9F000000) == 0x10000000
+    ai, rd = idx[m], w64[m] & 31
+    table = np.zeros(len(ai), bool)  # adr of a jump-table base: add xD, xN, xM/wM (shifted or extended) follows
+    for k in range(1, 5):
+        x = w64[np.minimum(ai + k, len(w64) - 1)]
+        table |= ((x & 0xFF000000) == 0x8B000000) & (((x >> 5) & 31) == rd)
+    adr_t.append(ai[~table] * 4 + imm21(w64[m][~table]))
+    m = (w64 & 0x9F000000) == 0x90000000
+    ai, rd = idx[m], w64[m] & 31
+    page = ((ai * 4) & ~0xFFF) + (imm21(w64[m]) << 12)
+    for k in range(1, 5):
+        x = w64[np.minimum(ai + k, len(w64) - 1)]
+        ok = ((x & 0xFFC00000) == 0x91000000) & (((x >> 5) & 31) == rd)
+        adr_t.append(page[ok] + ((x[ok] >> 10) & 0xFFF))
+    t = np.unique(np.concatenate(adr_t))
+    t = t[(t > 0) & (t < text_end) & (t % 16 == 0)]
+    prev = w64[t // 4 - 1]
+    entry = (((prev & 0xFFFFFC1F) == 0xD65F0000) | ((prev & 0xFC000000) == 0x14000000) | (prev == 0)
+             | (prev == 0xD503201F))
+    for a in t[entry].tolist():
+        mark(a, 'a')
+
     text_ptr = (sl[:, 1] >= 0) & (sl[:, 1] < text_end) & (sl[:, 2] == 0)
     for a in sl[text_ptr, 1].tolist():
         mark(a, 'p')
@@ -172,7 +204,7 @@ def main():
         n_text_ptrs=int(text_ptr.sum()), n_bl=int(bl.sum()), n_bl_targets=len(bl_targets),
         n_eh_fde=nfde, n_init=dyn[0x1B] // 8, n_vtables=len(vtables), n_vtable_slots=vslots,
         n_functions=len(starts),
-        by_source={c: sum(1 for v in src.values() if c in v) for c in 'bpveix'},
+        by_source={c: sum(1 for v in src.values() if c in v) for c in 'bpveiax'},
         only_p=sum(1 for v in src.values() if v == 'p'),
         hottest_bl_targets=[(f'{t:#x}', c) for c, t in hot],
     )

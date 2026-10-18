@@ -192,7 +192,17 @@ def resolve_jump_table(p, br_pc, body):
 
 
 def is_store(w):
-    return bits(w, 27, 27) == 1 and bits(w, 25, 25) == 0 and bits(w, 22, 22) == 0
+    """Loads/stores whose Rt is not a GPR destination: stores, and SIMD&FP loads."""
+    if bits(w, 27, 27) != 1 or bits(w, 25, 25) != 0:
+        return False
+    if bits(w, 26, 26):
+        return True  # SIMD&FP: Rt is a V register
+    cls = bits(w, 29, 28)
+    if cls == 0b11:  # register forms: opc 00 = store; 01/10/11 = loads (10/11 sign-extending)
+        return bits(w, 23, 22) == 0
+    if cls == 0b01:  # ldr (literal)
+        return False
+    return bits(w, 22, 22) == 0  # pairs and exclusives: L bit
 
 
 def is_cmp(w):
@@ -372,7 +382,8 @@ def emit_region(p, fn, addrs, built, hle, decls, inside):
         elif k == 'br':
             ts = fn.jt.get(a)
             if ts:
-                cases = ' '.join(f'case {t:#x}ull: {jump(t)}' for t in ts)
+                cases = ' '.join(f'case {t:#x}ull: {jump(t)}' if local(t) else f'case {t:#x}ull: {{ {call(t)} {ret} }}'
+                                 for t in ts)
                 out.append(f'  {{ uint64_t t = {ins.c}; switch (t) {{ {cases} default: a64_bad_jump(c, {a:#x}ull, t); {ret} }} }}')
             else:
                 out.append(f'  a64_call(c, {ins.c}); {ret}')

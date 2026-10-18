@@ -72,6 +72,12 @@ python3 -I tools/mkelf.py      extracted/code/main extracted/analysis/main extra
   and vtables (42k vtables, 577k slots, recognised by a run of text pointers
   after two zero qwords). 99.75% of starts directly follow a terminator. The
   whole 194 MB is real code (~1,500 RETs per MB everywhere).
+- Address-taken code (source `a`, +27.7k starts → 300,643): targets of `adr`
+  or `adrp`+`add`, kept only if 16-byte aligned (99.4% of known starts are)
+  and right after ret/b/udf/nop. `adr`s feeding a register `add` are
+  jump-table bases, not functions, and are excluded. Needed for callbacks
+  that are only ever materialised in code, e.g. the memalign hook main
+  hands nnmusl (0x97f6990).
 - Frostbite reflection survives: 19,188 TypeInfoData records (names, size,
   GUID, super, fields), 7,697 classes with 52,488 fields → `fb_types.h`,
   `types.tsv`, `fields.tsv`. Record layout is in `tools/reflection.py`.
@@ -187,6 +193,18 @@ make -C recomp -j6                                    # build/fifa (native, AArc
     each job under ~0.5 GB so `make -j8` fits in 8 GB; largest units build
     first. Flags live in a function-local `Flags F` (14% smaller code,
     same compile time).
+  - A full rebuild is ~43 min (50.5M instructions, 768 units). Only C
+    files whose text changed are rewritten, so a generator fix that touches
+    few functions recompiles in minutes; new function starts touch every
+    bucket. Things measured on a median unit (3.9 MB C, 18 s) that don't
+    pay off: `-fno-inline` (functions are WEAK, nothing inlines anyway),
+    no unwind tables (no change); `-O0` 1.6x faster but 3.5x the code;
+    emitting LLVM IR (parsing `.ll` costs as much as parsing the C, `.bc`
+    saves ~10%); a pass plugin keeping only sroa/early-cse/instcombine/
+    simplifycfg (-13% time, +24% code; codegen gets slower on the bigger
+    IR, and no -O1 pass is over 16% of pass time). Only 4.3% of
+    instructions are translated twice (overlapping bodies), and compiling
+    just the closure from the roots would keep 78% of the instructions.
 - IPC: `recomp/rt/ipc.c` parses HIPC messages (special header, X/A/B/W/C
   descriptors, CMIF `SFCI`/`SFCO`, domains, TIPC for `sm:`) from the TLR on
   `svcSendSyncRequest` and routes them to host services registered in
@@ -203,11 +221,11 @@ make -C recomp -j6                                    # build/fifa (native, AArc
 
 ## Status (2026-10-18)
 
-`./build/fifa` gets through libc/os init and all of `nn::oe::Initialize`
-(applet proxy, GPU error handler thread, focus/message queue), then opens
-lm, apm, aoc:u, ectx:aw, pctl*, time:u as stubs and dies on the
-unimplemented `svcMapSharedMemory` (0x13) with handle 0: `time:u` cmd 20
-(GetSharedMemoryNativeHandle) returned no handle.
+`./build/fifa` gets through nnSdk init (`nn::oe`, `nn::time`, ...),
+`nninitStartup`, nnSdk's module initializers and into main's 3,325
+`init_array` entries. The first fs call (`nn::fs::QueryMountRomCacheSize`
+from a static initializer) opens `fsp-srv`, which is still a stub, and
+nn::fs aborts in `GetFileSystemProxyServiceObject`.
 
 - `recomp/rt/am.c`: `appletOE` → `IApplicationProxy` and its
   sub-interfaces. Each interface is its own `Service`, so unknown commands
@@ -219,17 +237,35 @@ unimplemented `svcMapSharedMemory` (0x13) with handle 0: `time:u` cmd 20
   handle can't be stubbed, because the client then reads garbage. In a
   domain this shows up as `[ipc] bad domain object 1229145683` (`SFCI`, the
   leftover request magic read as an object id), e.g. pctl `CreateService`.
+- Shared memory (`svcCreateSharedMemory`, `svcMapSharedMemory`/`Unmap`):
+  no page aliasing (host pages are 16 KB, guest maps 4 KB-aligned, and
+  wasm can't alias). Contents live in a host buffer while unmapped and at
+  the guest address while mapped (one mapping at a time); host code goes
+  through `kshmem_ptr()` on every access.
+- `recomp/rt/time.c`: `time:u/a/s` in UTC. nnSdk reads clocks straight from
+  the service's shared memory (`nn::time::detail::SharedMemoryClient`);
+  layout taken from its readers and documented at the top of the file
+  (steady clock is a `ContinuousAdjustmentTimePoint` at 0xD0, system
+  clock contexts at 0x38/0x80, time = steady seconds + context offset).
+- Kernel facts nnSdk relies on: the thread handle at TLR+0x110 (nn::os
+  tags mutex/critical-section ownership with it and never writes it; with
+  0 there, every lock looked unlocked), and a non-zero system resource
+  size (GetInfo 16) to enable `nn::os` virtual address memory
+  (VammManager over the alias region, backed by svcMapPhysicalMemory).
+- Jump tables with sign-extended offsets (`ldrsw`/`ldrsb`/`ldrsh`) were
+  never resolved: `is_store` read only bit 22, which is 0 for those loads.
+  Unresolved `br`s fall back to `a64_call`, which only works when the
+  target happens to be a function start.
 
 ## Next steps
 
-- Shared memory: a kernel object (`svcCreateSharedMemory`,
-  `svcMapSharedMemory`/`Unmap`) backed by host memory that host services
-  can write, then `time:u` (GetStandardUserSystemClock etc. return
-  ISystemClock/ISteadyClock/ITimeZoneService objects; cmd 20 the shared
-  memory with the clock contexts).
+- `fsp-srv`: SetCurrentProcess, OpenDataStorageByCurrentProcess (RomFS from
+  `extracted/`), save data, SD card, and IFileSystem/IFile/IStorage.
 - `pctl`/`pctl:*` `CreateService(WithoutInitialize)` → IParentalControlService.
-- Then keep pushing through init: the remaining services nnSdk opens
-  (fs, hid, vi, nvdrv, audio, …) and the 3,325 init_array entries.
+- Then keep pushing through the 3,325 init_array entries and the services
+  they reach (hid, vi, nvdrv, audio, …).
+- Avoid full rebuilds when starts change: make bucket contents stable so a
+  new start only touches its own bucket.
 - Name the primitive `T_*` types; tie vtables to reflection classes.
 - Dump the DWARF types for the `rc2*` interface and the opcode structs from
   the `.nrs` (needed before the WebGPU RenderCore2 backend).

@@ -61,7 +61,7 @@ static inline const char *gstr(uint64_t a) { return a ? (const char *)(mem + a) 
 void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc);
 
 /* kernel objects (kernel.c) */
-enum { H_FREE, H_THREAD, H_EVENT_R, H_EVENT_W, H_SESSION };
+enum { H_FREE, H_THREAD, H_EVENT_R, H_EVENT_W, H_SESSION, H_SHMEM };
 uint32_t kobj_new(int kind, void *obj);
 void *kobj_get(uint32_t h, int kind);
 void kobj_close(uint32_t h);
@@ -69,6 +69,9 @@ typedef struct KEvent KEvent;
 KEvent *kevent_create(uint32_t *readable, uint32_t *writable);  /* writable may be NULL */
 void kevent_signal(KEvent *e);
 void kevent_clear(KEvent *e);
+typedef struct KSharedMemory KSharedMemory;
+KSharedMemory *kshmem_create(uint64_t size, uint32_t *handle);  /* handle may be NULL */
+void *kshmem_ptr(KSharedMemory *s);  /* current contents: guest mapping if mapped, else host buffer */
 
 /* IPC (ipc.c) */
 uint32_t ipc_connect_port(const char *name, uint32_t *out_handle);

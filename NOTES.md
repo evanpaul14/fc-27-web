@@ -50,9 +50,11 @@ Texture is in use; expect Oodle (Kraken/etc.) compressed chunks.
    `rc2DeviceInitTemporary`, `rc2DeviceShutdown`, `rc2DeviceVersion`,
    `rc2Get/SetSystemServiceProvider`) and consumes RenderCore2's platform-neutral
    opcode IR (`fb::Opcode*`, `fb::OpcodeProcessorBase<PlatformEncoderNvn>`).
-   Replacing the NRO with a WebGPU RenderCore2 backend avoids emulating NVN,
-   and the DWARF gives us its exact types. `main` itself only uses 14 NVN
-   entry points directly (texture/memory-pool setup and readback).
+   Two ways to put WebGPU under it, compared in Status (renderer options):
+   implement NVN on the host and run the recompiled NRO on top, or replace
+   the NRO with a WebGPU RenderCore2 backend (no NVN emulation; the DWARF
+   gives its exact types). `main` itself uses 14 NVN entry points directly
+   (texture/memory-pool setup and readback), so either way needs those.
 
 ## Static analysis of main
 
@@ -263,7 +265,8 @@ contains 1,065 `nvn*` names. Renderer options at this point:
    on WebGPU. Coarser calls and pipelines built up front, so less CPU per
    draw and no NVN state reconstruction (better for the web, where CPU is
    the likely bottleneck). Shaders and textures are the same work either
-   way: both get Maxwell binaries and block-linear/ASTC data.
+   way: both get Maxwell binaries and block-linear/ASTC data. Still needs
+   the 14 NVN entry points `main` calls itself (Seams for the port).
 Undecided; a quick (1) as a reference and shader dump, then (2), is one way.
 
 - `recomp/rt/apm.c`: `apm` → `ISession` (Set/GetPerformanceConfiguration,

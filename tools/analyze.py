@@ -16,7 +16,7 @@ import numpy as np
 
 IMPORT_BASE = 0x1_0000_0000  # fake addresses for imported symbols, 16 bytes apart
 
-R_ABS64, R_GLOB_DAT, R_JUMP_SLOT, R_RELATIVE = 257, 1025, 1026, 1027
+R_ABS64, R_GLOB_DAT, R_JUMP_SLOT, R_RELATIVE, R_TLSDESC = 257, 1025, 1026, 1027, 1031
 
 
 def main():
@@ -52,6 +52,8 @@ def main():
                     v, kind = int(syms[si][1], 16) + add, 0
                 else:
                     v, kind = IMPORT_BASE + si * 16 + add, 1
+            elif typ == R_TLSDESC:  # resolver + TLS offset, filled at load time
+                continue
             else:
                 raise ValueError(f'reloc type {typ} at {o:#x}')
             struct.pack_into('<Q', img, o, v & (2**64 - 1))

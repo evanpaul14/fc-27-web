@@ -267,7 +267,38 @@ contains 1,065 `nvn*` names. Renderer options at this point:
    the likely bottleneck). Shaders and textures are the same work either
    way: both get Maxwell binaries and block-linear/ASTC data. Still needs
    the 14 NVN entry points `main` calls itself (Seams for the port).
-Undecided; a quick (1) as a reference and shader dump, then (2), is one way.
+Chosen: (1) first, as a quick path to a first frame and a shader dump, then
+(2) as the main backend.
+
+Progress on (1) (2026-10-18): the game boots past graphics init and runs
+its frame loop on a null renderer (`recomp/nvn/backend_null.c`): 8.7k
+presents in 300 s, no crash. Pieces:
+- The NRO is a third module at 0x1A000000 (`tools/nso.py` reads NRO,
+  `tools/elfsyms.py` takes function starts and names from the `.nrs`).
+  `recomp/hle/ro.c`: `nn::ro::LoadModule` checks the build id and runs the
+  module's `_init` once (nnmusl's `__nnmusl_init_dso` sets up its TLS and
+  applies its two TLSDESC relocations itself; image.py leaves them alone).
+  main's 14 NVN imports are the NRO's `nvn::pfncpp_*` pointers, so they
+  resolve statically.
+- `recomp/nvn/`: `nvnBootstrapLoader` / `nvnDeviceGetProcAddress` give a host
+  thunk per name (`boot.c`; unimplemented names stop with the name).
+  objects/cmdbuf/tegra/formats/astc come from LAS Recomp (MIT), with guest
+  pointers through `gptr()`/`GP()`. SDK 22 sizes differ from LAS's:
+  `NVNtextureView` is 0x10 (LAS wrote 0x28 and smashed the caller's saved
+  registers) and `NVNsamplerBuilder` 0x40, so both are packed. Struct sizes
+  and all NVN enums are in the NRO's DWARF (`tools/dwarf_enums.py` ->
+  `extracted/analysis/nro/enums.tsv`).
+- `recomp/hle/vi.c` (one display/layer, no binder), `recomp/rt/hid.c`
+  (applet resource with zeroed shared memory), `recomp/hle/npad.c` (one
+  full-key controller as player 1 at the API level, `host_npad` holds its
+  state), `recomp/rt/acc.c` (one user).
+- setjmp/longjmp: calls to setjmp (direct or via PLT) get a host `_setjmp` in
+  the caller's frame (`build.py`), and `recomp/hle/setjmp.c` longjmps there.
+- Jump tables: SIMD/FP instructions were read as GPR definitions, and
+  `cfg_const` gave up on any other definition; now 0 of 1,224 unresolved.
+- Next: the Metal executor (LAS `renderer.m`/`metal.m`; needs per-pool
+  `MTLBuffer`s instead of one buffer over the guest heap), a window, the
+  Maxwell translator.
 
 - `recomp/rt/apm.c`: `apm` → `ISession` (Set/GetPerformanceConfiguration,
   per-mode configs; reports boost mode to match am's docked state).

@@ -9,7 +9,7 @@ Which functions get built:
   --all           every known function start (tools/analyze.py) of every module
   default         closure from the entry points over direct calls, tail calls
                   and code-referenced function/vtable addresses
-Functions named in recomp/hle/*.c with HLE(symbol) are not translated; calls
+Functions named in recomp/{hle,nvn}/*.c with HLE(symbol) are not translated; calls
 to them go to the host implementation instead.
 
 usage: python3 -I recomp/build.py build [--all] [--extra-roots FILE]
@@ -23,6 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PC_RELATIVE = {'adr', 'adrp', 'ldr_lit', 'ldrsw_lit', 'ldr_lit_v', 'svc'}
 BUCKET_SHIFT = 18  # 256 KB of code per translation unit
 ROOT = os.path.dirname(HERE)
+RO_MODULES = {'nro'}  # loaded through nn::ro::LoadModule
 
 
 def code_pointer_starts(img, base, t0, t1):
@@ -31,7 +32,8 @@ def code_pointer_starts(img, base, t0, t1):
     start analysis takes for the caller's tail, or a leaf right after another
     function's final branch). adr targets that are jump table bases (the adr
     register is added to a scaled table entry) are skipped; the rest are kept
-    when they begin with a prologue or follow an unconditional terminator."""
+    when they begin with a prologue or follow an unconditional terminator (or the
+    store of 0xdeadc0de to address 0 that some crash paths end with)."""
     import numpy as np
     w = np.frombuffer(img, dtype='<u4', count=(t1 - base) // 4).astype(np.int64)
     pc = base + np.arange(len(w), dtype=np.int64) * 4
@@ -56,6 +58,7 @@ def code_pointer_starts(img, base, t0, t1):
     t = np.unique(np.concatenate(targets))
     t = t[(t > t0) & (t < t1) & (t % 4 == 0)]
     first, prev = w[(t - base) // 4], w[(t - base) // 4 - 1]
+    prev2 = w[(t - base) // 4 - 2]
     prologue = (((first & 0xffc07fff) == 0xa9807bfd)     # stp x29, x30, [sp, #-n]!
                 | ((first & 0xff0003ff) == 0xd10003ff)   # sub sp, sp, #n
                 | (first == 0xd503237f))                 # pacibsp
@@ -63,7 +66,9 @@ def code_pointer_starts(img, base, t0, t1):
                  | ((prev & 0xfc000000) == 0x14000000)   # b
                  | ((prev & 0xfffffc1f) == 0xd61f0000)   # br
                  | ((prev & 0xffff0000) == 0)            # udf
-                 | ((prev & 0xffe0001f) == 0xd4200000))  # brk
+                 | ((prev & 0xffe0001f) == 0xd4200000)   # brk
+                 # crash idiom: movk wK, #0xdead, lsl #16; str wK, [xN] (xN = 0)
+                 | (((prev & 0xffc00000) == 0xb9000000) & ((prev2 & 0xffffffe0) == 0x72bbd5a0)))
     return set(int(a) for a in t[prologue | after_end])
 
 
@@ -89,10 +94,28 @@ class Program:
             for line in open(os.path.join(adir, 'functions.tsv')):
                 self.starts.add(base + int(line.split('\t', 1)[0], 16))
             self.starts.update(code_pointer_starts(img, base, t0, t1))
+            elf = os.path.join(ROOT, 'extracted', 'code', m['name'] + '.elfsyms.tsv')
+            if os.path.exists(elf):  # FUNC symbols of an unstripped ELF (tools/elfsyms.py)
+                for line in open(elf):
+                    nm, val, sz, shn, inf = line.rstrip('\n').split('\t')
+                    if int(inf) & 15 == 2 and shn != '0' and int(sz):
+                        self.starts.add(base + int(val, 16))
             for line in open(os.path.join(adir, 'vtables.tsv')):
                 a, n, slots = line.rstrip('\n').split('\t')
                 self.vtables[base + int(a, 16)] = [base + int(s, 16) for s in slots.split(',') if s.startswith('0x')]
         self.vt_sorted = sorted(self.vtables)
+        # setjmp, directly or through a PLT stub (adrp x16; ldr x17, [x16, #o]; add x16, x16, #o; br x17)
+        sj = {self.by_name[n] for n in ('setjmp', '_setjmp', '__setjmp', 'sigsetjmp') if n in self.by_name}
+        self.setjmp_calls = set(sj)
+        for f in self.starts:
+            if not self.is_text(f) or not self.is_text(f + 12):
+                continue
+            w0, w1, w3 = self.word(f), self.word(f + 4), self.word(f + 12)
+            if (w0 & 0x9f00001f) == 0x90000010 and (w1 & 0xffc003ff) == 0xf9400211 and w3 == 0xd61f0220:
+                page = (f & ~0xfff) + (sx((bits(w0, 23, 5) << 2) | bits(w0, 30, 29), 21) << 12)
+                raw = self.read(page + (bits(w1, 21, 10) << 3), 8)
+                if raw and int.from_bytes(raw, 'little') in sj:
+                    self.setjmp_calls.add(f)
         self.cache = {}
         self.wcache = {}
 
@@ -145,6 +168,18 @@ def reg_writes(w):
     return bits(w, 4, 0)
 
 
+def writes_vreg(w):
+    """SIMD&FP data processing whose destination is a V register, not a GPR (its
+    Rd field must not be read as one)."""
+    if bits(w, 27, 25) != 0b111:
+        return False
+    if bits(w, 30, 29) == 0 and bits(w, 28, 24) == 0b11110 and bits(w, 21, 21) and bits(w, 15, 10) == 0:
+        return bits(w, 18, 16) in (2, 3, 7)  # FP<->int: scvtf, ucvtf, fmov to FP write V; the rest a GPR
+    if not bits(w, 31, 31) and bits(w, 29, 21) == 0b001110000 and not bits(w, 15, 15) and bits(w, 10, 10):
+        return bits(w, 14, 11) not in (0b0101, 0b0111)  # copy: smov/umov write a GPR
+    return True
+
+
 def resolve_jump_table(p, br_pc, body, jt=None):
     """Return the possible targets of the `br` at br_pc, or None. jt: the
     function's already resolved tables (br -> targets), edges for cfg_const."""
@@ -171,7 +206,8 @@ def resolve_jump_table(p, br_pc, body, jt=None):
     def find_def(reg, start_idx):
         for k in range(start_idx, len(seq)):
             pc, ww = seq[k]
-            if reg_writes(ww) == reg and not is_store(ww) and not is_cmp(ww) and not is_branch(ww):
+            if reg_writes(ww) == reg and not is_store(ww) and not is_cmp(ww) and not is_branch(ww) \
+                    and not writes_vreg(ww):
                 return k, pc, ww
         return None
 
@@ -218,9 +254,12 @@ def resolve_jump_table(p, br_pc, body, jt=None):
     preds = None
 
     def cfg_const(reg, use_pc):
-        """reg's value at use_pc when every definition reaching it backwards through
-        the body (fall-through and direct branches) is the same adrp(+add #imm)
-        constant: a table base kept in a register set up far from the br."""
+        """reg's value at use_pc when the definitions reaching it backwards through
+        the body (fall-through and direct branches) give one adrp(+add #imm)
+        constant: a table base kept in a register set up far from the br. Paths
+        through other definitions (the register reused elsewhere in a loop) are
+        ignored; a wrong base only adds case labels, since the emitted switch
+        dispatches on the target computed at run time."""
         nonlocal preds
         if preds is None:
             preds = collections.defaultdict(list)
@@ -245,14 +284,12 @@ def resolve_jump_table(p, br_pc, body, jt=None):
                 ww, ins = p.word(s), p.insn(s)
                 if ins.kind in ('bl', 'blr') and reg < 19:
                     return None  # clobbered by the call
-                if is_branch(ww) or is_store(ww) or is_cmp(ww) or reg_writes(ww) != reg:
+                if is_branch(ww) or is_store(ww) or is_cmp(ww) or writes_vreg(ww) or reg_writes(ww) != reg:
                     work.append((s, off))
                 elif bits(ww, 31, 31) and bits(ww, 28, 24) == 0b10000:  # adrp
                     vals.add((s & ~0xfff) + (sx((bits(ww, 23, 5) << 2) | bits(ww, 30, 29), 21) << 12) + off)
                 elif bits(ww, 31, 22) == 0b1001000100 and bits(ww, 9, 5) == reg:  # add xR, xR, #imm
                     work.append((s, off + bits(ww, 21, 10)))
-                else:
-                    return None
                 if len(vals) > 1:
                     return None
         return vals.pop() if len(vals) == 1 else None
@@ -429,13 +466,17 @@ def emit_func(p, fn, built, hle, decls):
         lines = emit_region(p, fn, body, built, hle, decls, None)
         if body[0] != fn.start:  # the body reaches code below the entry (b to a non-start)
             lines.insert(0, f'  goto L_{fn.start:x};')
-        return head + f'WEAK void {cname(fn.start)}(CPU *c) {{\n  Flags F = {{0}};\n' + '\n'.join(lines) + '\n}'
+        jbs = ''.join(f'  jmp_buf JB_{a:x};\n' for a in body
+                      if p.insn(a).kind == 'bl' and p.insn(a).target in p.setjmp_calls)
+        return head + f'WEAK void {cname(fn.start)}(CPU *c) {{\n  Flags F = {{0}};\n' + jbs + '\n'.join(lines) + '\n}'
     chunks = [body[i:i + CHUNK] for i in range(0, len(body), CHUNK)]
     out = []
     for k, ch in enumerate(chunks):
         inside = set(ch)
         entries = sorted({ch[0]} | (fn.labels & inside))
         lines = emit_region(p, fn, ch, built, hle, decls, inside)
+        if any(p.insn(a).kind == 'bl' and p.insn(a).target in p.setjmp_calls for a in ch):
+            raise ValueError(f'setjmp call in chunked function {fn.start:#x}: its jmp_buf would not outlive the chunk')
         cases = ' '.join(f'case {t:#x}ull: goto L_{t:x};' for t in entries)
         out.append(f'static uint64_t {cname(fn.start)}_{k}(CPU *c, uint64_t pc) {{\n'
                    f'  Flags F = c->fl;\n'
@@ -486,6 +527,10 @@ def emit_region(p, fn, addrs, built, hle, decls, inside):
                 out.append(f'  if ({ins.c}) {jump(t)}')
             else:
                 out.append(f'  if ({ins.c}) {{ {call(t)} {ret} }}')
+        elif k == 'bl' and ins.target in p.setjmp_calls:
+            # setjmp returns twice: the host context is taken here, in the caller's
+            # frame, and recomp/hle/setjmp.c's longjmp comes back to it
+            out.append(f'  c->x[30] = {a + 4:#x}ull; if (!_setjmp(JB_{a:x})) {{ a64_pending_jb = &JB_{a:x}; {call(ins.target)} }}')
         elif k == 'bl':
             out.append(f'  c->x[30] = {a + 4:#x}ull; {call(ins.target)}')
         elif k == 'blr':
@@ -517,7 +562,7 @@ def emit_region(p, fn, addrs, built, hle, decls, inside):
 
 def load_hle(p):
     hle = {}
-    for path in glob.glob(os.path.join(HERE, 'hle', '*.c')):
+    for path in glob.glob(os.path.join(HERE, 'hle', '*.c')) + glob.glob(os.path.join(HERE, 'nvn', '*.c')):
         for m in re.finditer(r'^HLE\((\w+)\)', open(path).read(), re.M):
             a = p.by_name.get(m.group(1))
             if a is None:
@@ -694,13 +739,18 @@ def main():
     write_hle_table(gdir, hle)
     mods = p.layout['modules']
     layout = ['#include "gen.h"', '#include "../../recomp/rt/host.h"', 'const HostModule host_modules[] = {']
-    layout += [f'  {{"{m["name"]}", {m["base"]:#x}ull, {m["size"]:#x}ull, {m["init"] or 0:#x}ull}},' for m in mods]
+    # modules nn::ro loads at run time (recomp/hle/ro.c) are initialised by LoadModule, not at startup
+    layout += [f'  {{"{m["name"]}", {m["base"]:#x}ull, {m["size"]:#x}ull, {m["init"] or 0:#x}ull, '
+               f'{int(m["name"] in RO_MODULES)}}},' for m in mods]
     layout += ['};', f'const unsigned host_module_count = {len(mods)};',
                f'const uint64_t host_nn_init_start = {p.by_name["_ZN2nn4init5StartEmmPFvvES2_S2_"]:#x}ull;',
                'const uint64_t host_ro_lookup_slot_ptr = '
                f'{p.by_name["_ZN2nn2ro6detail36g_pLookupGlobalManualFunctionPointerE"]:#x}ull;']
     write_if_changed(os.path.join(gdir, 'layout.c'), '\n'.join(layout) + '\n')
-    write_if_changed(os.path.join(gdir, 'gen.h'), '#include "../../recomp/rt/runtime.h"\n')
+    # (not a make dependency of the units, so additions here don't rebuild them all)
+    write_if_changed(os.path.join(gdir, 'gen.h'), '#include "../../recomp/rt/runtime.h"\n#include <setjmp.h>\n'
+                     '/* host context of the setjmp call being made (recomp/hle/setjmp.c) */\n'
+                     'extern __thread jmp_buf *a64_pending_jb;\n')
     json.dump({'functions': len(order), 'instructions': stats['insns'], 'tus': tu_i,
                'unsupported': unsupported.most_common(20)},
               open(os.path.join(args.bdir, 'build_stats.json'), 'w'), indent=1)

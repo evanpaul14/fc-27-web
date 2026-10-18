@@ -6,11 +6,15 @@ CFLAGS := -O1 -w -mllvm -enable-misched=false -mllvm -global-isel -mllvm -global
 # Largest units first so the long ones don't finish last.
 GEN := $(shell ls -S $(B)/gen/*.c 2>/dev/null)
 OBJ := $(GEN:$(B)/gen/%.c=$(B)/obj/%.o)
-RT := rt/host.c rt/kernel.c rt/ipc.c rt/services.c rt/am.c rt/time.c rt/fs.c rt/apm.c rt/pctl.c rt/nifm.c rt/aoc.c rt/audout.c rt/a64_rt.c $(wildcard hle/*.c)
-HDR := rt/cpu.h rt/runtime.h rt/host.h rt/ipc.h
+RT := rt/host.c rt/kernel.c rt/ipc.c rt/services.c rt/am.c rt/time.c rt/fs.c rt/apm.c rt/pctl.c rt/nifm.c rt/aoc.c rt/audout.c rt/hid.c rt/acc.c rt/a64_rt.c $(wildcard hle/*.c)
+NVN := $(wildcard nvn/*.c)
+HDR := rt/cpu.h rt/runtime.h rt/host.h rt/ipc.h nvn/nvn.h
 
-$(B)/fifa: $(OBJ) $(RT) $(HDR)
-	$(CC) -O1 -g -o $@ $(OBJ) $(RT)
+$(B)/fifa: $(OBJ) $(RT) $(NVN) $(B)/nvn_table.c $(HDR)
+	$(CC) -O1 -g -o $@ $(OBJ) $(RT) $(NVN) $(B)/nvn_table.c
+
+$(B)/nvn_table.c: $(NVN) nvn/table.py
+	python3 -I nvn/table.py $@ $(NVN)
 
 $(B)/obj/%.o: $(B)/gen/%.c rt/cpu.h rt/runtime.h | $(B)/obj
 	$(CC) $(CFLAGS) -c $< -o $@

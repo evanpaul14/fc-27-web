@@ -28,10 +28,16 @@ uint64_t guest_alloc(uint64_t size, uint64_t align) {
 /* ---- host thunks ---- */
 static struct { A64Func fn; const char *name; } thunks[(HOST_THUNK_END - HOST_THUNK_BASE) / 16];
 static unsigned n_thunks;
+static pthread_mutex_t thunk_lock = PTHREAD_MUTEX_INITIALIZER;
+__thread const char *host_thunk_name;
 uint64_t host_thunk(A64Func fn, const char *name) {
+  pthread_mutex_lock(&thunk_lock);
+  if (n_thunks == sizeof thunks / sizeof *thunks) HDIE("out of host thunks\n");
   thunks[n_thunks].fn = fn;
   thunks[n_thunks].name = name;
-  return HOST_THUNK_BASE + 16 * n_thunks++;
+  uint64_t a = HOST_THUNK_BASE + 16 * n_thunks++;
+  pthread_mutex_unlock(&thunk_lock);
+  return a;
 }
 
 /* ---- symbols for diagnostics (build/symbols.tsv) ---- */
@@ -65,6 +71,13 @@ const char *host_symbol(uint64_t addr, uint64_t *off) {
   return hsyms[lo - 1].name;
 }
 
+/* Address of the symbol `name` defined in [lo, hi), or 0. */
+uint64_t host_symbol_addr(const char *name, uint64_t lo, uint64_t hi) {
+  for (size_t i = 0; i < n_hsyms; i++)
+    if (hsyms[i].a >= lo && hsyms[i].a < hi && !strcmp(hsyms[i].name, name)) return hsyms[i].a;
+  return 0;
+}
+
 /* ---- dispatch ---- */
 static const A64Fn *find_fn(uint64_t t) {
   unsigned lo = 0, hi = a64_fn_count;
@@ -79,6 +92,7 @@ void a64_call(CPU *c, uint64_t t) {
   const A64Fn *f = find_fn(t);
   if (f) { f->fn(c); return; }
   if (t >= HOST_THUNK_BASE && t < HOST_THUNK_BASE + 16 * n_thunks && !(t & 15)) {
+    host_thunk_name = thunks[(t - HOST_THUNK_BASE) / 16].name;
     thunks[(t - HOST_THUNK_BASE) / 16].fn(c);
     return;
   }
@@ -163,7 +177,7 @@ static void rtld_run_inits(CPU *c) {
    * caller's callee-saved registers survive; x30 is restored for the return. */
   uint64_t lr = c->x[30];
   for (int i = (int)host_module_count - 1; i >= 0; i--) {
-    if (!host_modules[i].init) continue;
+    if (!host_modules[i].init || host_modules[i].ro) continue;
     if (host_trace) HLOG("[rtld] init %s @ %#llx\n", host_modules[i].name, (unsigned long long)host_modules[i].init);
     a64_call(c, host_modules[i].init);
   }

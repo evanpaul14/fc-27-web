@@ -13,11 +13,13 @@ usage: python3 -I recomp/image.py extracted/code OUT
 """
 import json, os, struct, sys
 
-MODULES = [('main', 0x08000000), ('sdk', 0x18000000)]
+# The RenderCore2 NRO is placed statically too; nn::ro::LoadModule (HLE)
+# only runs its initializers. main imports its nvn::pfncpp_* pointers.
+MODULES = [('main', 0x08000000), ('sdk', 0x18000000), ('nro', 0x1A000000)]
 MISSING_BASE = 0x07F00000  # stub slots for unresolved symbols, 16 bytes each
 PAGE = 0x1000
 
-R_ABS64, R_GLOB_DAT, R_JUMP_SLOT, R_RELATIVE = 257, 1025, 1026, 1027
+R_ABS64, R_GLOB_DAT, R_JUMP_SLOT, R_RELATIVE, R_TLSDESC = 257, 1025, 1026, 1027, 1031
 
 
 def load(code_dir, name, base):
@@ -68,6 +70,7 @@ def main():
     for m in mods:
         img, dyn, base = m['img'], m['dyn'], m['base']
         n_rel = 0
+        m['tlsdesc'] = []  # (slot, offset in the module's TLS block): the host installs the resolver
 
         def rela(off, size):
             nonlocal n_rel
@@ -78,6 +81,9 @@ def main():
                     v = base + add
                 elif typ in (R_ABS64, R_GLOB_DAT, R_JUMP_SLOT):
                     v = resolve(m, si) + add
+                elif typ == R_TLSDESC and si == 0:
+                    m['tlsdesc'].append((base + o, add))
+                    continue
                 else:
                     raise ValueError(f'{m["name"]}: reloc type {typ} at {o:#x}')
                 struct.pack_into('<Q', img, o, v & (2**64 - 1))
@@ -117,7 +123,7 @@ def main():
         segs = [{'name': s['name'], 'addr': m['base'] + s['mem_off'], 'size': s['size']} for s in m['info']['segments']]
         mod = {'name': m['name'], 'base': m['base'], 'size': m['size'], 'segments': segs,
                'init': m['base'] + m['dyn'][12] if 12 in m['dyn'] else None,
-               'init_array': arr(m, 25, 27), 'fini_array': arr(m, 26, 28)}
+               'init_array': arr(m, 25, 27), 'fini_array': arr(m, 26, 28), 'tlsdesc': m['tlsdesc']}
         layout['modules'].append(mod)
     json.dump(layout, open(os.path.join(out, 'layout.json'), 'w'), indent=1)
     with open(os.path.join(out, 'symbols.tsv'), 'w') as f:
@@ -125,6 +131,14 @@ def main():
             for nm, val, sz, shn, inf in m['syms']:
                 if nm and shn != 0:
                     f.write(f'{m["base"] + val:#x}\t{m["name"]}\t{nm}\t{sz}\t{inf & 15}\n')
+            # static symbols from an unstripped ELF of the module (tools/elfsyms.py), after the dynamic ones
+            elf = os.path.join(code_dir, m['name'] + '.elfsyms.tsv')
+            if os.path.exists(elf):
+                dyn_names = {s[0] for s in m['syms']}
+                for line in open(elf):
+                    nm, val, sz, shn, inf = line.rstrip('\n').split('\t')
+                    if shn != '0' and int(inf) & 15 in (1, 2) and nm not in dyn_names:
+                        f.write(f'{m["base"] + int(val, 16):#x}\t{m["name"]}\t{nm}\t{sz}\t{int(inf) & 15}\n')
     print(f'{len(missing)} unresolved: {", ".join(list(missing)[:8])}{" ..." if len(missing) > 8 else ""}')
 
 

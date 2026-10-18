@@ -55,15 +55,24 @@ def lz4_block(src, out_size):
 def main():
     path, prefix = sys.argv[1], sys.argv[2]
     d = open(path, 'rb').read()
-    assert d[:4] == b'NSO0'
-    flags = struct.unpack_from('<I', d, 0xC)[0]
     segs = []
-    for k, name in enumerate(('text', 'ro', 'data')):
-        foff, moff, size, extra = struct.unpack_from('<IIII', d, 0x10 + k * 0x10)
-        csize = struct.unpack_from('<I', d, 0x60 + k * 4)[0]
-        segs.append(dict(name=name, file_off=foff, mem_off=moff, size=size, csize=csize,
-                         compressed=bool(flags >> k & 1), extra=extra))
-    build_id = d[0x40:0x60].hex()
+    if d[0x10:0x14] == b'NRO0':  # NRO: uncompressed, file offsets are memory offsets
+        flags = 0
+        for k, name in enumerate(('text', 'ro', 'data')):
+            off, size = struct.unpack_from('<II', d, 0x20 + k * 8)
+            segs.append(dict(name=name, file_off=off, mem_off=off, size=size, csize=size,
+                             compressed=False, extra=0))
+        segs[2]['extra'] = struct.unpack_from('<I', d, 0x38)[0]
+        build_id = d[0x40:0x60].hex()
+    else:
+        assert d[:4] == b'NSO0'
+        flags = struct.unpack_from('<I', d, 0xC)[0]
+        for k, name in enumerate(('text', 'ro', 'data')):
+            foff, moff, size, extra = struct.unpack_from('<IIII', d, 0x10 + k * 0x10)
+            csize = struct.unpack_from('<I', d, 0x60 + k * 4)[0]
+            segs.append(dict(name=name, file_off=foff, mem_off=moff, size=size, csize=csize,
+                             compressed=bool(flags >> k & 1), extra=extra))
+        build_id = d[0x40:0x60].hex()
     img = bytearray(segs[2]['mem_off'] + segs[2]['size'])
     for s in segs:
         raw = d[s['file_off']:s['file_off'] + s['csize']]

@@ -144,6 +144,10 @@ static void application_functions(void *state, IpcMsg *m) {
   switch (m->cmd) {
   case 1: m->result = R_AM_NO_DATA; return;  /* PopLaunchParameter: none */
   case 20: SET_OUT(uint64_t, 0, 0); return;  /* EnsureSaveData -> required size (0 = exists) */
+  case 26: case 28:  /* GetSaveDataSize / GetSaveDataSizeMax(type, uid) -> size, journal size: host directories */
+    SET_OUT(int64_t, 0, 1ll << 30);
+    SET_OUT(int64_t, 8, 1ll << 30);
+    return;
   case 21: {                                 /* GetDesiredLanguage -> LanguageCode */
     uint64_t code = 0;
     memcpy(&code, "en-US", 5);

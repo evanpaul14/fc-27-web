@@ -2,6 +2,7 @@
 #pragma once
 #include "runtime.h"
 #include <stdio.h>
+#include <stdlib.h>
 
 /* Guest address space (all offsets from `mem`, 68 GB reserved, committed on touch). */
 #define GUEST_SPACE        0x1100000000ull
@@ -26,7 +27,7 @@
 
 #define APP_PID            0x51ull  /* process id, also the applet resource user id */
 
-typedef struct { const char *name; uint64_t base, size, init; } HostModule;
+typedef struct { const char *name; uint64_t base, size, init; int ro; } HostModule;  /* ro: initialised by nn::ro::LoadModule */
 extern const HostModule host_modules[];
 extern const unsigned host_module_count;
 extern const uint64_t host_nn_init_start;
@@ -39,7 +40,9 @@ extern int host_trace;  /* FIFA_TRACE env: log svcs and dispatcher misses */
 
 uint64_t guest_alloc(uint64_t size, uint64_t align);
 uint64_t host_thunk(A64Func fn, const char *name);
+extern __thread const char *host_thunk_name;  /* name of the thunk being called */
 const char *host_symbol(uint64_t addr, uint64_t *off);
+uint64_t host_symbol_addr(const char *name, uint64_t lo, uint64_t hi);
 void host_backtrace(void);
 void host_thread_signals(void);  /* call first on every host thread that runs guest code */
 

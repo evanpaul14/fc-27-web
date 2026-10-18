@@ -87,7 +87,7 @@ def main():
     with open(os.path.join(args.out, 'tests.c'), 'w') as f:
         f.write('#include "difftest.h"\n\n')
         for i, (w, ins) in enumerate(tests):
-            f.write(f'void nat_{i}(void);\nstatic void tr_{i}(CPU *c) {{ {ins.c} }}\n')
+            f.write(f'void nat_{i}(void);\nstatic void tr_{i}(CPU *c) {{ Flags F = c->fl; {{ {ins.c} }} c->fl = F; }}\n')
         f.write('\nconst Test tests[] = {\n')
         for i, (w, ins) in enumerate(tests):
             mem = int(bits(w, 27, 27) == 1 and bits(w, 25, 25) == 0)

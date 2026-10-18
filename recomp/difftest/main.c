@@ -69,7 +69,7 @@ static void to_cpu(const NState *s, CPU *c) {
   memset(c, 0, sizeof *c);
   memcpy(c->x, s->x, sizeof s->x);
   c->x[31] = s->sp;
-  c->nf = (s->nzcv >> 31) & 1; c->zf = (s->nzcv >> 30) & 1; c->cf = (s->nzcv >> 29) & 1; c->vf = (s->nzcv >> 28) & 1;
+  c->fl.nf = (s->nzcv >> 31) & 1; c->fl.zf = (s->nzcv >> 30) & 1; c->fl.cf = (s->nzcv >> 29) & 1; c->fl.vf = (s->nzcv >> 28) & 1;
   memcpy(c->v, s->v, sizeof s->v);
   c->excl_addr = ~0ull;
 }
@@ -99,7 +99,7 @@ static int compare(const Test *t, const NState *in, const NState *nat, const CPU
     }
   }
   if (nat->sp != c->x[31]) { bad++; if (verbose) printf("    sp: native %#llx tr %#llx\n", (unsigned long long)nat->sp, (unsigned long long)c->x[31]); }
-  uint64_t f = (c->nf << 31) | (c->zf << 30) | (c->cf << 29) | (c->vf << 28);
+  uint64_t f = (c->fl.nf << 31) | (c->fl.zf << 30) | (c->fl.cf << 29) | (c->fl.vf << 28);
   if ((nat->nzcv & 0xf0000000u) != f) {
     bad++;
     if (verbose) printf("    nzcv: in %llx native %llx tr %llx\n", (unsigned long long)in->nzcv >> 28,

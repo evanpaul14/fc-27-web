@@ -14,9 +14,13 @@ typedef union V128 {
   float f[4]; double fd[2];
 } V128;
 
+/* NZCV. Generated code keeps these in a local `Flags F` so the compiler can
+ * drop dead flag computations; CPU.fl only carries them across chunks. */
+typedef struct Flags { uint64_t nf, zf, cf, vf; } Flags;
+
 typedef struct CPU {
   uint64_t x[32];          /* x[31] is SP; XZR reads are emitted as 0 */
-  uint64_t nf, zf, cf, vf;     /* flags, each 0 or 1 */
+  Flags fl;
   V128 v[32];
   uint64_t tpidr, tpidrro;
   uint64_t fpcr, fpsr;
@@ -57,12 +61,12 @@ uint32_t a64_stxp128(CPU *c, uint64_t a, uint64_t lo, uint64_t hi);
 void a64_ldxp128(CPU *c, uint64_t a, uint64_t *lo, uint64_t *hi);
 
 /* ---- integer ---- */
-A64_INLINE uint64_t adds64(CPU *c, uint64_t a, uint64_t b, uint64_t ci) {
+A64_INLINE uint64_t adds64(Flags *c, uint64_t a, uint64_t b, uint64_t ci) {
   __uint128_t t = (__uint128_t)a + b + ci; uint64_t r = (uint64_t)t;
   c->nf = r >> 63; c->zf = r == 0; c->cf = (uint64_t)(t >> 64); c->vf = ((a ^ r) & (b ^ r)) >> 63;
   return r;
 }
-A64_INLINE uint32_t adds32(CPU *c, uint32_t a, uint32_t b, uint32_t ci) {
+A64_INLINE uint32_t adds32(Flags *c, uint32_t a, uint32_t b, uint32_t ci) {
   uint64_t t = (uint64_t)a + b + ci; uint32_t r = (uint32_t)t;
   c->nf = r >> 31; c->zf = r == 0; c->cf = t >> 32; c->vf = ((a ^ r) & (b ^ r)) >> 31;
   return r;
@@ -104,7 +108,7 @@ A64_INLINE float fminnm32(float a, float b) { if (isnan(a) && !isnan(b) && !ISSN
 A64_INLINE double fmaxnm64(double a, double b) { if (isnan(a) && !isnan(b) && !ISSNAN64(a)) return b; if (isnan(b) && !isnan(a) && !ISSNAN64(b)) return a; return fmax64(a, b); }
 A64_INLINE double fminnm64(double a, double b) { if (isnan(a) && !isnan(b) && !ISSNAN64(a)) return b; if (isnan(b) && !isnan(a) && !ISSNAN64(b)) return a; return fmin64(a, b); }
 
-A64_INLINE void fcmp_flags(CPU *c, double a, double b) {
+A64_INLINE void fcmp_flags(Flags *c, double a, double b) {
   if (isnan(a) || isnan(b)) SETNZCV(c, 3);
   else if (a == b) SETNZCV(c, 6);
   else if (a < b) SETNZCV(c, 8);

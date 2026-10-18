@@ -166,11 +166,22 @@ make -C recomp -j6                                    # build/fifa (native, AArc
   `recomp/rt/kernel.c` (threads are host pthreads; mutex/condvar/address
   arbiter semantics follow Atmosphère). `HLE(symbol)` in `recomp/hle/*.c`
   replaces any function by a host implementation.
-- Compile cost: ~0.58 MB/s of generated C per core with
-  `-O1 -mllvm -enable-misched=false -mllvm -global-isel` (2.5x faster than
-  plain -O1; SelectionDAG combining and the machine scheduler dominated).
-  Translation units are fixed 512 KB address buckets, so rebuilds are
-  incremental unless rt/cpu.h or rt/runtime.h change.
+- Build speed:
+  - Regeneration: 80 s for everything (8 processes; translations are
+    cached per encoding word, ~12x fewer than addresses), under 1 s when
+    nothing changed: each 256 KB bucket is regenerated only if its input
+    hash (generator sources, images, the function starts in it and the
+    next bucket) changes (`build/gen/keys.json`, `--force` to ignore).
+  - Host replacements need no regeneration: translated functions are weak
+    symbols and `build/gen/hle_table.c` (`build.py build --hle-only`)
+    defines strong ones that win at link time.
+  - Compilation is ~linear in code volume (~100 us per guest instruction
+    with `-O1 -mllvm -enable-misched=false -mllvm -global-isel`, 2.5x faster
+    than plain -O1; clang 24 vs Apple clang 21, -disable-lsr and smaller
+    function chunks made no measurable difference). 256 KB buckets keep
+    each job under ~0.5 GB so `make -j8` fits in 8 GB; largest units build
+    first. Flags live in a function-local `Flags F` (14% smaller code,
+    same compile time).
 - IPC: `recomp/rt/ipc.c` parses HIPC messages (special header, X/A/B/W/C
   descriptors, CMIF `SFCI`/`SFCO`, domains, TIPC for `sm:`) from the TLR on
   `svcSendSyncRequest` and routes them to host services registered in

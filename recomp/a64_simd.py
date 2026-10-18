@@ -880,7 +880,7 @@ def fp_scalar(w):
         if bits(w, 15, 14) or bits(w, 2, 0):
             raise Unsupported('fcmp')
         bb = '0.0' if bits(w, 3, 3) else b
-        return op(f'fcmp_flags(c, {a}, {bb});', 'fcmp')
+        return op(f'fcmp_flags(&F, {a}, {bb});', 'fcmp')
     if bits(w, 12, 10) == 0b100:  # FMOV immediate
         if bits(w, 9, 5):
             raise Unsupported('fmov_imm')
@@ -891,7 +891,7 @@ def fp_scalar(w):
         return op(f'{{ V128 R = {{0}}; R.d[0] = {hexc(v)}; c->v[{rd}] = R; }}', 'fmov_imm')
     if bits(w, 11, 10) == 1:  # FCCMP
         cond, nzcv = bits(w, 15, 12), bits(w, 3, 0)
-        return op(f'if ({COND[cond]}) fcmp_flags(c, {a}, {b}); else SETNZCV(c, {nzcv});', 'fccmp')
+        return op(f'if ({COND[cond]}) fcmp_flags(&F, {a}, {b}); else SETNZCV(&F, {nzcv});', 'fccmp')
     if bits(w, 11, 10) == 2:  # 2-source
         opc = bits(w, 15, 12)
         ex = {0: f'{a} * {b}', 1: f'{a} / {b}', 2: f'{a} + {b}', 3: f'{a} - {b}', 4: f'fmax{S}({a}, {b})',

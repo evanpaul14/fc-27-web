@@ -2,6 +2,10 @@
 #pragma once
 #include "cpu.h"
 
+/* Translated functions are weak so host replacements (build/gen/hle_table.c)
+ * override them at link time. */
+#define WEAK __attribute__((weak))
+
 typedef void (*A64Func)(CPU *c);
 typedef struct { uint64_t addr; A64Func fn; } A64Fn;
 typedef struct { uint64_t addr; const char *name; } A64Sym;

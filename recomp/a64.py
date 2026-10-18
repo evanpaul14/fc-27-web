@@ -63,9 +63,9 @@ def wx(n, e, sf=1, sp=False):
 UT = {1: 'uint64_t', 0: 'uint32_t'}
 ST = {1: 'int64_t', 0: 'int32_t'}
 
-COND = ['c->zf', '!c->zf', 'c->cf', '!c->cf', 'c->nf', '!c->nf', 'c->vf', '!c->vf',
-        '(c->cf && !c->zf)', '!(c->cf && !c->zf)', '(c->nf == c->vf)', '(c->nf != c->vf)',
-        '(!c->zf && c->nf == c->vf)', '!(!c->zf && c->nf == c->vf)', '1', '1']
+COND = ['F.zf', '!F.zf', 'F.cf', '!F.cf', 'F.nf', '!F.nf', 'F.vf', '!F.vf',
+        '(F.cf && !F.zf)', '!(F.cf && !F.zf)', '(F.nf == F.vf)', '(F.nf != F.vf)',
+        '(!F.zf && F.nf == F.vf)', '!(!F.zf && F.nf == F.vf)', '1', '1']
 
 
 def shift_expr(v, typ, amt, sf):
@@ -144,7 +144,7 @@ def dp_imm(w, pc):
         imm <<= 12 * sh
         a = rx(rn, sf, sp=True)
         if s:
-            f = f'adds{64 if sf else 32}(c, {a}, {"~" if opn else ""}({UT[sf]}){imm:#x}u, {opn})'
+            f = f'adds{64 if sf else 32}(&F, {a}, {"~" if opn else ""}({UT[sf]}){imm:#x}u, {opn})'
             return op(wx(rd, f, sf), 'subs_imm' if opn else 'adds_imm')
         return op(wx(rd, f'{a} {"-" if opn else "+"} {imm:#x}u', sf, sp=True), 'sub_imm' if opn else 'add_imm')
     if k == 4:  # logical immediate
@@ -160,7 +160,7 @@ def dp_imm(w, pc):
             return op(wx(rd, f'{a} | {lit}', sf, sp=True), 'orr_imm')
         if opc == 2:
             return op(wx(rd, f'{a} ^ {lit}', sf, sp=True), 'eor_imm')
-        return op(wx(rd, f'SETNZ{64 if sf else 32}(c, {a} & {lit})', sf), 'ands_imm')
+        return op(wx(rd, f'SETNZ{64 if sf else 32}(&F, {a} & {lit})', sf), 'ands_imm')
     if k == 5:  # move wide
         opc, hw, imm = bits(w, 30, 29), bits(w, 22, 21), bits(w, 20, 5)
         if opc == 1 or (not sf and hw > 1):
@@ -279,8 +279,8 @@ def branch_sys(w, pc):
             key = (o0, op1, crn, crm, op2)
             if key == (3, 3, 4, 2, 0):  # NZCV
                 if l:
-                    return op(wx(rt, '(c->nf << 31) | (c->zf << 30) | (c->cf << 29) | (c->vf << 28)'), 'mrs_nzcv')
-                return op(f'SETNZCV(c, ({rx(rt)} >> 28) & 15);', 'msr_nzcv')
+                    return op(wx(rt, '(F.nf << 31) | (F.zf << 30) | (F.cf << 29) | (F.vf << 28)'), 'mrs_nzcv')
+                return op(f'SETNZCV(&F, ({rx(rt)} >> 28) & 15);', 'msr_nzcv')
             if l and key == (3, 3, 14, 0, 1):
                 return op(wx(rt, 'a64_cntpct()'), 'mrs_cntpct')
             if l and key == (3, 3, 14, 0, 0):
@@ -581,7 +581,7 @@ def dp_reg(w, pc):
                 return op(wx(rd, f'{a} | {b}', sf), 'orr_reg')
             if opc == 2:
                 return op(wx(rd, f'{a} ^ {b}', sf), 'eor_reg')
-            return op(wx(rd, f'SETNZ{W}(c, {a} & {b})', sf), 'ands_reg')
+            return op(wx(rd, f'SETNZ{W}(&F, {a} & {b})', sf), 'ands_reg')
         opn, s = bits(w, 30, 30), bits(w, 29, 29)
         if not op2 & 1:  # add/sub shifted register
             sh, imm6 = bits(w, 23, 22), bits(w, 15, 10)
@@ -594,7 +594,7 @@ def dp_reg(w, pc):
                 raise Unsupported('addsub_ext')
             a, b = rx(rn, sf, sp=True), ext_expr(rm, opt, imm3, sf)
         if s:
-            e = f'adds{W}(c, {a}, ({UT[sf]}){"~" if opn else ""}({UT[sf]})({b}), {opn})'
+            e = f'adds{W}(&F, {a}, ({UT[sf]}){"~" if opn else ""}({UT[sf]})({b}), {opn})'
             return op(wx(rd, e, sf), 'subs_reg' if opn else 'adds_reg')
         return op(wx(rd, f'{a} {"-" if opn else "+"} ({UT[sf]})({b})', sf, sp=bool(op2 & 1)),
                   'sub_reg' if opn else 'add_reg')
@@ -605,15 +605,15 @@ def dp_reg(w, pc):
         opn, s = bits(w, 30, 30), bits(w, 29, 29)
         b = f'({UT[sf]})~{rx(rm, sf)}' if opn else rx(rm, sf)
         if s:
-            return op(wx(rd, f'adds{W}(c, {rx(rn, sf)}, {b}, ({UT[sf]})c->cf)', sf), 'adcs')
-        return op(wx(rd, f'{rx(rn, sf)} + {b} + ({UT[sf]})c->cf', sf), 'adc')
+            return op(wx(rd, f'adds{W}(&F, {rx(rn, sf)}, {b}, ({UT[sf]})F.cf)', sf), 'adcs')
+        return op(wx(rd, f'{rx(rn, sf)} + {b} + ({UT[sf]})F.cf', sf), 'adc')
     if op2 == 2:  # conditional compare
         opn, s, cond, nzcv = bits(w, 30, 30), bits(w, 29, 29), bits(w, 15, 12), bits(w, 3, 0)
         if not s or bits(w, 10, 10) or bits(w, 4, 4):
             raise Unsupported('ccmp')
         b = f'{rm}u' if bits(w, 11, 11) else rx(rm, sf)
         b = f'({UT[sf]})~({UT[sf]}){b}' if opn else f'({UT[sf]}){b}'
-        return op(f'if ({COND[cond]}) adds{W}(c, {rx(rn, sf)}, {b}, {opn}); else SETNZCV(c, {nzcv});',
+        return op(f'if ({COND[cond]}) adds{W}(&F, {rx(rn, sf)}, {b}, {opn}); else SETNZCV(&F, {nzcv});',
                   'ccmp' if opn else 'ccmn')
     if op2 == 4:  # conditional select
         opn, s, cond, o2 = bits(w, 30, 30), bits(w, 29, 29), bits(w, 15, 12), bits(w, 11, 10)

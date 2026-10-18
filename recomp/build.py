@@ -14,12 +14,14 @@ to them go to the host implementation instead.
 
 usage: python3 -I recomp/build.py build [--all] [--extra-roots FILE]
 """
-import argparse, bisect, collections, glob, json, multiprocessing, os, re, struct, sys, time
+import argparse, bisect, collections, glob, hashlib, json, multiprocessing, os, re, struct, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from a64 import translate, Unsupported, bits, sx  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+PC_RELATIVE = {'adr', 'adrp', 'ldr_lit', 'ldrsw_lit', 'ldr_lit_v', 'svc'}
+BUCKET_SHIFT = 18  # 256 KB of code per translation unit
 ROOT = os.path.dirname(HERE)
 
 
@@ -49,6 +51,7 @@ class Program:
                 self.vtables[base + int(a, 16)] = [base + int(s, 16) for s in slots.split(',') if s.startswith('0x')]
         self.vt_sorted = sorted(self.vtables)
         self.cache = {}
+        self.wcache = {}
 
     def mod_of(self, a):
         for m in self.mods:
@@ -74,11 +77,16 @@ class Program:
         r = self.cache.get(a)
         if r is None:
             w = self.word(a)
-            try:
-                r = translate(w, a)
-            except Unsupported as e:
-                from a64 import Insn
-                r = Insn('trap', f'a64_trap(c, {a:#x}, {w:#x}); return;', tag='unsupported:' + str(e))
+            r = self.wcache.get(w)
+            if r is None:
+                try:
+                    r = translate(w, a)
+                except Unsupported as e:
+                    from a64 import Insn
+                    r = Insn('trap', f'a64_trap(c, {a:#x}, {w:#x}); return;', tag='unsupported:' + str(e))
+                # Most encodings mean the same thing at any address; share those.
+                if r.kind in ('op', 'br', 'blr', 'ret') and r.tag not in PC_RELATIVE:
+                    self.wcache[w] = r
             self.cache[a] = r
         return r
 
@@ -300,7 +308,7 @@ def emit_func(p, fn, built, hle, decls):
     body = sorted(fn.body)
     if len(body) <= CHUNK * 3 // 2:
         lines = emit_region(p, fn, body, built, hle, decls, None)
-        return head + f'void {cname(fn.start)}(CPU *c) {{\n' + '\n'.join(lines) + '\n}'
+        return head + f'WEAK void {cname(fn.start)}(CPU *c) {{\n  Flags F = {{0}};\n' + '\n'.join(lines) + '\n}'
     chunks = [body[i:i + CHUNK] for i in range(0, len(body), CHUNK)]
     out = []
     for k, ch in enumerate(chunks):
@@ -309,12 +317,13 @@ def emit_func(p, fn, built, hle, decls):
         lines = emit_region(p, fn, ch, built, hle, decls, inside)
         cases = ' '.join(f'case {t:#x}ull: goto L_{t:x};' for t in entries)
         out.append(f'static uint64_t {cname(fn.start)}_{k}(CPU *c, uint64_t pc) {{\n'
+                   f'  Flags F = c->fl;\n'
                    f'  switch (pc) {{ {cases} default: a64_bad_jump(c, {fn.start:#x}ull, pc); return 0; }}\n'
                    + '\n'.join(lines) + '\n  return 0;\n}')
     disp = ' else '.join(f'if (pc < {chunks[k + 1][0]:#x}ull) pc = {cname(fn.start)}_{k}(c, pc);'
                          for k in range(len(chunks) - 1))
     disp += f' else pc = {cname(fn.start)}_{len(chunks) - 1}(c, pc);'
-    out.append(head + f'void {cname(fn.start)}(CPU *c) {{\n  uint64_t pc = {fn.start:#x}ull;\n'
+    out.append(head + f'WEAK void {cname(fn.start)}(CPU *c) {{\n  uint64_t pc = {fn.start:#x}ull;\n'
                f'  while (pc) {{ {disp} }}\n}}')
     return '\n\n'.join(out)
 
@@ -326,9 +335,6 @@ def emit_region(p, fn, addrs, built, hle, decls, inside):
     ret = 'return;' if inside is None else 'return 0;'
 
     def call(t):
-        if t in hle:
-            decls.add(f'void H_{t:08x}(CPU *c);')
-            return f'H_{t:08x}(c);'
         if t in built:
             decls.add(f'void {cname(t)}(CPU *c);')
             return f'{cname(t)}(c);'
@@ -337,13 +343,13 @@ def emit_region(p, fn, addrs, built, hle, decls, inside):
     def jump(t):
         if inside is None or t in inside:
             return f'goto L_{t:x};'
-        return f'return {t:#x}ull;'
+        return f'{{ c->fl = F; return {t:#x}ull; }}'
 
     def local(t):
         return t in fn.labels and t in fn.body
 
     for a in addrs:
-        if a in fn.labels:
+        if a in fn.labels or (inside is not None and a == addrs[0]):
             out.append(f'L_{a:x}:;')
         ins = p.insn(a)
         k = ins.kind
@@ -383,7 +389,7 @@ def emit_region(p, fn, addrs, built, hle, decls, inside):
                 else:
                     out.append(f'  a64_trap(c, {t:#x}ull, 0); {ret}')
         elif falls_through and inside is not None and a == addrs[-1]:
-            out.append(f'  return {a + 4:#x}ull;')
+            out.append(f'  c->fl = F; return {a + 4:#x}ull;')
     return out
 
 
@@ -428,7 +434,7 @@ def write_bucket(job):
         funcs = {f: discover(p, f) for f in fs}
     decls = set(f'void {cname(f)}(CPU *c);' for f in fs)
     bodies = [emit_func(p, funcs[f], _BUILT, _HLE, decls) for f in fs]
-    name = f'f_{key << 19:08x}.c'
+    name = bucket_name(key)
     path = os.path.join(_GDIR, name)
     text = '#include "gen.h"\n' + '\n'.join(sorted(decls)) + '\n\n' + '\n\n'.join(bodies) + '\n'
     if not os.path.exists(path) or open(path).read() != text:
@@ -441,15 +447,64 @@ def write_bucket(job):
     return name, st, uns
 
 
+def bucket_name(key):
+    return f'f_{key << BUCKET_SHIFT:08x}.c'
+
+
+def inputs_hash(bdir):
+    """Everything that can change generated code apart from function starts."""
+    h = hashlib.sha1()
+    for f in ('a64.py', 'a64_simd.py', 'build.py'):
+        h.update(open(os.path.join(HERE, f), 'rb').read())
+    for f in sorted(glob.glob(os.path.join(bdir, '*.img'))) + [os.path.join(bdir, 'symbols.tsv')]:
+        st = os.stat(f)
+        h.update(f'{f}:{st.st_size}:{st.st_mtime_ns}'.encode())
+    return h.hexdigest()
+
+
+def write_if_changed(path, text):
+    if not os.path.exists(path) or open(path).read() != text:
+        open(path, 'w').write(text)
+
+
+def table_c(p, order):
+    out = ['#include "gen.h"']
+    out += [f'void {cname(f)}(CPU *c);' for f in order]
+    out.append('const A64Fn a64_fn_table[] = {')
+    out += [f'  {{{f:#x}ull, {cname(f)}}},' for f in order]
+    out.append('};')
+    out.append(f'const unsigned a64_fn_count = {len(order)};')
+    out.append('const A64Sym a64_missing[] = {')
+    out += [f'  {{{a:#x}ull, "{nm}"}},' for a, nm in sorted(p.missing.items())]
+    out.append('};')
+    out.append(f'const unsigned a64_missing_count = {len(p.missing)};')
+    return '\n'.join(out) + '\n'
+
+
+def write_hle_table(gdir, hle):
+    """Strong definitions of F_<addr> for host replacements; they override the
+    weak translated functions at link time, so no regeneration is needed."""
+    out = ['#include "gen.h"']
+    for a, nm in sorted(hle.items()):
+        out.append(f'void hle_{nm}(CPU *c);\nvoid {cname(a)}(CPU *c) {{ hle_{nm}(c); }}')
+    write_if_changed(os.path.join(gdir, 'hle_table.c'), '\n'.join(out) + '\n')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('bdir')
     ap.add_argument('--all', action='store_true')
     ap.add_argument('--extra-roots', default=None)
+    ap.add_argument('--force', action='store_true', help='regenerate every unit')
+    ap.add_argument('--hle-only', action='store_true', help='only rewrite hle_table.c')
     args = ap.parse_args()
     t0 = time.time()
     p = Program(args.bdir)
     hle = load_hle(p)
+    if args.hle_only:
+        write_hle_table(os.path.join(args.bdir, 'gen'), hle)
+        print(f'{len(hle)} host replacements')
+        return
 
     roots = set()
     for m in p.layout['modules']:
@@ -471,68 +526,57 @@ def main():
     os.makedirs(gdir, exist_ok=True)
     global _P, _BUILT, _HLE, _GDIR
     if args.all:
-        order = sorted(f for f in p.starts if p.is_text(f) and f not in hle)
+        order = sorted(f for f in p.starts if p.is_text(f))
         funcs = None
     else:
-        funcs = closure(p, roots, hle)
+        funcs = closure(p, roots, {})
         order = sorted(funcs)
     _P, _BUILT, _HLE, _GDIR = p, set(order), hle, gdir
-    # Translation units are fixed 512 KB address buckets, so adding functions
-    # only changes the units they land in and rebuilds stay incremental.
+    # Translation units are fixed address buckets, so a change only touches
+    # the units it lands in. A bucket is regenerated only when its inputs
+    # (generator sources, images, the function starts it and its successor
+    # hold) change.
     buckets = collections.defaultdict(list)
     for f in order:
-        buckets[f >> 19].append(f)
-    jobs = [(key, fs, None if funcs is None else {f: funcs[f] for f in fs}) for key, fs in sorted(buckets.items())]
+        buckets[f >> BUCKET_SHIFT].append(f)
+    base = inputs_hash(args.bdir)
+    keys_path = os.path.join(gdir, 'keys.json')
+    old_keys = json.load(open(keys_path)) if os.path.exists(keys_path) and not args.force else {}
+    new_keys, jobs = {}, []
+    for key, fs in buckets.items():
+        h = hashlib.sha1(base.encode())
+        h.update(repr((fs, buckets.get(key + 1, [])[:1], funcs is None)).encode())
+        name = bucket_name(key)
+        new_keys[name] = h.hexdigest()
+        if old_keys.get(name) != new_keys[name] or not os.path.exists(os.path.join(gdir, name)):
+            jobs.append((key, fs, None if funcs is None else {f: funcs[f] for f in fs}))
+    jobs.sort(key=lambda j: -len(j[1]))  # biggest first for load balance
     stats = collections.Counter()
     unsupported = collections.Counter()
-    written = set()
-    if funcs is None:
+    if funcs is None and len(jobs) > 1:
         with multiprocessing.get_context('fork').Pool(os.cpu_count()) as pool:
             results = list(pool.imap_unordered(write_bucket, jobs))
     else:
         results = [write_bucket(j) for j in jobs]
     for name, st, uns in results:
-        written.add(name)
         stats.update(st)
         unsupported.update(uns)
     for old in glob.glob(os.path.join(gdir, 'f_*.c')):
-        if os.path.basename(old) not in written:
+        if os.path.basename(old) not in new_keys:
             os.remove(old)
-    tu_i = len(written)
-    print(f'{len(order)} functions, {stats["insns"]} instructions, {stats["jt_ok"]}/{stats["jt"]} indirect jumps '
-          f'resolved as tables, {tu_i} units ({time.time() - t0:.1f}s)')
-    with open(os.path.join(gdir, 'table.c'), 'w') as o:
-        o.write('#include "gen.h"\n')
-        for f in order:
-            o.write(f'void {cname(f)}(CPU *c);\n')
-        for a in sorted(hle):
-            o.write(f'void H_{a:08x}(CPU *c);\n')
-        o.write('const A64Fn a64_fn_table[] = {\n')
-        entries = sorted([(f, cname(f)) for f in order] + [(a, f'H_{a:08x}') for a in hle])
-        for a, n in entries:
-            o.write(f'  {{{a:#x}ull, {n}}},\n')
-        o.write('};\n')
-        o.write(f'const unsigned a64_fn_count = {len(entries)};\n')
-        o.write('const A64Sym a64_missing[] = {\n')
-        for a, nm in sorted(p.missing.items()):
-            o.write(f'  {{{a:#x}ull, "{nm}"}},\n')
-        o.write('};\n')
-        o.write(f'const unsigned a64_missing_count = {len(p.missing)};\n')
-    with open(os.path.join(gdir, 'hle_table.c'), 'w') as o:
-        o.write('#include "gen.h"\n')
-        for a, nm in sorted(hle.items()):
-            o.write(f'void hle_{nm}(CPU *c);\nvoid H_{a:08x}(CPU *c) {{ hle_{nm}(c); }}\n')
-    with open(os.path.join(gdir, 'layout.c'), 'w') as o:
-        o.write('#include "gen.h"\n#include "../../recomp/rt/host.h"\n')
-        mods = p.layout['modules']
-        o.write('const HostModule host_modules[] = {\n')
-        for m in mods:
-            o.write(f'  {{"{m["name"]}", {m["base"]:#x}ull, {m["size"]:#x}ull, {m["init"] or 0:#x}ull}},\n')
-        o.write('};\n')
-        o.write(f'const unsigned host_module_count = {len(mods)};\n')
-        o.write(f'const uint64_t host_nn_init_start = {p.by_name["_ZN2nn4init5StartEmmPFvvES2_S2_"]:#x}ull;\n')
-    with open(os.path.join(gdir, 'gen.h'), 'w') as o:
-        o.write('#include "../../recomp/rt/runtime.h"\n')
+    json.dump(new_keys, open(keys_path, 'w'))
+    tu_i = len(new_keys)
+    print(f'{len(order)} functions in {tu_i} units; regenerated {len(jobs)} units: {stats["insns"]} instructions, '
+          f'{stats["jt_ok"]}/{stats["jt"]} indirect jumps resolved as tables ({time.time() - t0:.1f}s)')
+    write_if_changed(os.path.join(gdir, 'table.c'), table_c(p, order))
+    write_hle_table(gdir, hle)
+    mods = p.layout['modules']
+    layout = ['#include "gen.h"', '#include "../../recomp/rt/host.h"', 'const HostModule host_modules[] = {']
+    layout += [f'  {{"{m["name"]}", {m["base"]:#x}ull, {m["size"]:#x}ull, {m["init"] or 0:#x}ull}},' for m in mods]
+    layout += ['};', f'const unsigned host_module_count = {len(mods)};',
+               f'const uint64_t host_nn_init_start = {p.by_name["_ZN2nn4init5StartEmmPFvvES2_S2_"]:#x}ull;']
+    write_if_changed(os.path.join(gdir, 'layout.c'), '\n'.join(layout) + '\n')
+    write_if_changed(os.path.join(gdir, 'gen.h'), '#include "../../recomp/rt/runtime.h"\n')
     json.dump({'functions': len(order), 'instructions': stats['insns'], 'tus': tu_i,
                'unsupported': unsupported.most_common(20)},
               open(os.path.join(args.bdir, 'build_stats.json'), 'w'), indent=1)

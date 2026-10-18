@@ -164,7 +164,17 @@ make -C recomp -j6                                    # build/fifa (native, AArc
 - Layout: main at 0x08000000, nnSdk at 0x18000000, host thunks 0x07E00000,
   unresolved imports 0x07F00000, host allocations (stacks, TLRs)
   0x1C000000, heap (svcSetHeapSize) 0x20000000, stack region (GetInfo
-  14/15) 0xC0000000, mapped memory 0xE0000000.
+  14/15) 0xC0000000, alias region (GetInfo 2/3: svcMapMemory,
+  svcMapPhysicalMemory) 0x1_0000_0000-0x5_0000_0000. The guest space is a
+  20 GB `MAP_NORESERVE` mapping, so only touched pages cost memory.
+- The alias region has to be big: nn::os VammManager (enabled by GetInfo 16)
+  reserves 0x3fe00000 at the start of it for its own node pool before
+  handing out anything, and the game sets a 1.2 GB heap out of 3.2 GB total
+  and gets the rest through `nn::os::AllocateAddressRegion` +
+  `AllocateMemoryPages`. With the old 512 MB region the search found no gap
+  and returned address 0 with a success result; Frostbite's "BootArena"
+  then failed its first allocation and init wrote through null pointers.
+  For wasm this needs memory64 or a compacting HLE of the VAM calls.
 - `nn::os` threads map their stacks into the stack region at a random
   address (`MapAliasStack`: QueryMemory until free, then svcMapMemory). The
   kernel records svcMapMemory destinations so QueryMemory reports them as
@@ -221,11 +231,33 @@ make -C recomp -j6                                    # build/fifa (native, AArc
 
 ## Status (2026-10-18)
 
-`./build/fifa` gets through nnSdk init (`nn::oe`, `nn::time`, ...),
-`nninitStartup`, nnSdk's module initializers and into main's 3,325
-`init_array` entries. The first fs call (`nn::fs::QueryMountRomCacheSize`
-from a static initializer) opens `fsp-srv`, which is still a stub, and
-nn::fs aborts in `GetFileSystemProxyServiceObject`.
+`./build/fifa` gets through nnSdk init, `nninitStartup`, all 3,325 of
+main's `init_array` entries and into `nnMain`: it mounts the RomFS, opens
+two save data filesystems (types 4 and 5), asks `ldr:ro` for the NRO, and
+then dies in `nn::oe::ApmSetPerformanceConfiguration` because `apm`
+`OpenSession` is a stub and the client calls through a garbage `ISession`.
+
+- `recomp/rt/fs.c` (`fsp-srv`): `IFileSystemProxy` → `IStorage` for the
+  RomFS (`OpenDataStorageByCurrentProcess`), `IFileSystem`/`IFile`/
+  `IDirectory` for save data and the SD card, `ISaveDataInfoReader` (empty).
+  - RomFS is read straight out of the NSP and AES-128-CTR decrypted per
+    read (CommonCrypto); `tools/nsp_extract.py` writes the image offset, key
+    and counter to `extracted/romfs_program.json` (`FIFA_ROMFS` overrides).
+  - Save data and SD card are host directories under `build/fs`
+    (`FIFA_FS` overrides): `save/<program id>/<type>_<user id>_<index>`,
+    `save/system/<id>`, `sdcard`.
+- IPC domains are shared between a session and its clones: nn::sf converts
+  the `fsp-srv` session to a domain, clones it and sends every request on
+  the clone. A `Service` can have a `close` hook, called when its domain
+  object is closed, to free per-object state (open files, directories).
+- Host crashes (SIGSEGV/SIGBUS, including stack overflow via an alternate
+  signal stack on every guest thread) print the host pc and symbol, the
+  fault address in guest terms, the guest registers and the guest
+  backtrace. Guest registers live in `CPU`, so they are exact at the fault.
+- Debugging recipe that worked here: add `fprintf`s to one `build/gen/f_*.c`
+  unit around a call (`c->x[30] = 0x<ret>ull; F_<target>(c);`), `make`
+  rebuilds just that unit, then restore it (`build.py build --all` leaves
+  it alone because only inputs are hashed, so copy the original back).
 
 - `recomp/rt/am.c`: `appletOE` → `IApplicationProxy` and its
   sub-interfaces. Each interface is its own `Service`, so unknown commands
@@ -259,11 +291,14 @@ nn::fs aborts in `GetFileSystemProxyServiceObject`.
 
 ## Next steps
 
-- `fsp-srv`: SetCurrentProcess, OpenDataStorageByCurrentProcess (RomFS from
-  `extracted/`), save data, SD card, and IFileSystem/IFile/IStorage.
+- `apm` `OpenSession` → `ISession` (Set/GetPerformanceConfiguration).
 - `pctl`/`pctl:*` `CreateService(WithoutInitialize)` → IParentalControlService.
-- Then keep pushing through the 3,325 init_array entries and the services
-  they reach (hid, vi, nvdrv, audio, …).
+- `ldr:ro` / `nn::ro`: load the RenderCore2 NRO (or hand back our own
+  WebGPU backend in its place).
+- Then keep pushing through `nnMain` and the services it reaches (hid, vi,
+  nvdrv, audio, …).
+- Make guest page 0 trap: anything below 0x07E00000 is unmapped on the
+  Switch, and null writes there currently go unnoticed.
 - Avoid full rebuilds when starts change: make bucket contents stable so a
   new start only touches its own bucket.
 - Name the primitive `T_*` types; tie vtables to reflection classes.

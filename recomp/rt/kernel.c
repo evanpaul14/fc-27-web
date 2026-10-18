@@ -136,6 +136,7 @@ static void mutex_acquire_for(HostThread *t, uint64_t addr) {
 static void *thread_main(void *p) {
   HostThread *t = p;
   cur_thread = t;
+  host_thread_signals();
   CPU *c = &t->cpu;
   c->x[0] = t->arg;
   c->x[30] = 0;
@@ -231,8 +232,8 @@ static uint64_t get_info(uint32_t type, uint64_t sub, uint32_t *res) {
   case 9: return 0;                         /* resource limit handle */
   case 10: return 0;                        /* idle tick count */
   case 11: return (uint64_t)rand() << 32 | (uint64_t)rand();
-  case 12: return 0x08000000ull;            /* ASLR region */
-  case 13: return 0xF8000000ull;
+  case 12: return 0x08000000ull;            /* ASLR region: everything mappable */
+  case 13: return GUEST_SPACE - 0x08000000ull;
   case 14: return STACK_BASE;               /* stack region */
   case 15: return STACK_END - STACK_BASE;
   /* System resource (kernel page tables for MapPhysicalMemory). Non-zero

@@ -3,8 +3,8 @@
 #include "runtime.h"
 #include <stdio.h>
 
-/* Guest address space (all offsets from `mem`, 4 GB reserved). */
-#define GUEST_SPACE        0x100000000ull
+/* Guest address space (all offsets from `mem`, 20 GB reserved, committed on touch). */
+#define GUEST_SPACE        0x500000000ull
 #define HOST_THUNK_BASE    0x07E00000ull  /* host callbacks callable from guest code, 16 bytes each */
 #define HOST_THUNK_END     0x07F00000ull
 #define MISSING_BASE       0x07F00000ull  /* unresolved imports (recomp/image.py) */
@@ -15,8 +15,12 @@
 #define HEAP_MAX           0xC0000000ull
 #define STACK_BASE         0xC0000000ull  /* guest stack region (alias stacks via svcMapMemory) */
 #define STACK_END          0xE0000000ull
-#define MAP_BASE           0xE0000000ull  /* svcMapMemory / transfer memory / etc. */
-#define MAP_END            0x100000000ull
+/* 0xE0000000-0x100000000 unused */
+/* Alias region: svcMapMemory, svcMapPhysicalMemory. nn::os VammManager
+ * reserves ~1 GB at its start for its own bookkeeping and the game maps a few
+ * GB of physical memory through it, so it can't fit below 4 GB. */
+#define MAP_BASE           0x100000000ull
+#define MAP_END            0x500000000ull
 
 #define APP_PID            0x51ull  /* process id, also the applet resource user id */
 
@@ -34,6 +38,7 @@ uint64_t guest_alloc(uint64_t size, uint64_t align);
 uint64_t host_thunk(A64Func fn, const char *name);
 const char *host_symbol(uint64_t addr, uint64_t *off);
 void host_backtrace(void);
+void host_thread_signals(void);  /* call first on every host thread that runs guest code */
 
 /* threads */
 typedef struct HostThread {

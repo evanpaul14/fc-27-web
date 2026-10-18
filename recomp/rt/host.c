@@ -1,7 +1,9 @@
 /* Loader and dispatcher for the recompiled program (stands in for rtld). */
 #include "host.h"
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -120,6 +122,39 @@ void host_backtrace(void) {
   }
 }
 
+/* ---- host crashes: report where, in host and guest terms ---- */
+static void crash_handler(int sig, siginfo_t *si, void *uc_) {
+  ucontext_t *uc = uc_;
+  uint64_t pc = uc->uc_mcontext->__ss.__pc, sp = uc->uc_mcontext->__ss.__sp;
+  Dl_info di = {0};
+  dladdr((void *)pc, &di);
+  uint64_t fault = (uint64_t)si->si_addr;
+  HLOG("fatal: signal %d at host pc %#llx (%s+%#llx), sp %#llx, fault %#llx (guest %#llx)\n", sig,
+       (unsigned long long)pc, di.dli_sname ? di.dli_sname : "?",
+       (unsigned long long)(pc - (uint64_t)di.dli_saddr), (unsigned long long)sp, (unsigned long long)fault,
+       (unsigned long long)(fault - (uint64_t)mem));
+  if (cur_thread)
+    for (int i = 0; i < 31; i++)
+      HLOG("  x%-2d %016llx%s", i, (unsigned long long)cur_thread->cpu.x[i], i % 4 == 3 || i == 30 ? "\n" : "");
+  host_backtrace();
+  signal(SIGABRT, SIG_DFL);
+  abort();
+}
+
+/* Per thread: an alternate signal stack so stack overflows are reported too. */
+void host_thread_signals(void) {
+  stack_t ss = {.ss_sp = malloc(1 << 16), .ss_size = 1 << 16};
+  sigaltstack(&ss, 0);
+}
+
+static void install_crash_handler(void) {
+  struct sigaction sa = {0};
+  sa.sa_sigaction = crash_handler;
+  sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+  sigaction(SIGSEGV, &sa, 0);
+  sigaction(SIGBUS, &sa, 0);
+}
+
 /* ---- rtld stand-in ---- */
 static void rtld_set_initialized(CPU *c) { (void)c; }
 static void rtld_run_inits(CPU *c) {
@@ -150,6 +185,7 @@ HostThread *thread_create_context(uint64_t stack_size);
 
 static void *main_thread(void *p) {
   cur_thread = p;
+  host_thread_signals();
   HLOG("[host] calling nn::init::Start\n");
   a64_call(&cur_thread->cpu, host_nn_init_start);
   HLOG("[host] nn::init::Start returned\n");
@@ -159,6 +195,7 @@ static void *main_thread(void *p) {
 int main(int argc, char **argv) {
   (void)argc; (void)argv;
   host_trace = getenv("FIFA_TRACE") != 0;
+  install_crash_handler();
   mem = mmap(0, GUEST_SPACE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
   if (mem == MAP_FAILED) HDIE("cannot reserve guest space\n");
   for (unsigned i = 0; i < host_module_count; i++) load_module(&host_modules[i]);

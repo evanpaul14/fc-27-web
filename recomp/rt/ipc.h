@@ -30,6 +30,7 @@ typedef struct IpcMsg {
 typedef struct Service {
   const char *name;
   void (*handle)(void *state, IpcMsg *m);
+  void (*close)(void *state);  /* optional: object closed (frees state) */
 } Service;
 
 /* Find a host service by sm name, or NULL. */

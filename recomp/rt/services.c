@@ -1,13 +1,14 @@
 /* Registry of host services reachable through sm:GetServiceHandle. */
 #include "ipc.h"
 
-extern const Service applet_oe_service, time_u_service, time_a_service, time_s_service;
+extern const Service applet_oe_service, time_u_service, time_a_service, time_s_service, fsp_srv_service;
 
 static const Service *const services[] = {
   &applet_oe_service,
   &time_u_service,
   &time_a_service,
   &time_s_service,
+  &fsp_srv_service,
   0,
 };
 

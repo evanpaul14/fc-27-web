@@ -123,10 +123,25 @@ def section_pfs0(sec):
     return out
 
 
-def romfs_tree(sec):
-    # IVFC: the last of 6 levels holds the RomFS image.
+def romfs_level(sec):
+    """(offset, size) of the RomFS image in the section: the last of 6 IVFC levels."""
     assert sec.fsh[8:12] == b'IVFC', sec.fsh[8:12]
-    lvl_off, lvl_size = struct.unpack_from('<QQ', sec.fsh, 8 + 0x10 + 5 * 0x18)
+    return struct.unpack_from('<QQ', sec.fsh, 8 + 0x10 + 5 * 0x18)
+
+
+def romfs_storage(nsp, sec):
+    """Where the host (recomp/rt/fs.c) finds the RomFS image: file offset of
+    the image in the NSP, and AES-128-CTR parameters. The counter for a byte
+    at NSP offset o is ctr_hi (big endian, high 64 bits) followed by
+    (o - nca_offset) >> 4."""
+    lvl_off, lvl_size = romfs_level(sec)
+    return {'nsp': os.path.abspath(nsp), 'nca_offset': sec.nca_base,
+            'offset': sec.nca_base + sec.start + lvl_off, 'size': lvl_size,
+            'encryption': sec.enc, 'key': sec.key.hex(), 'ctr_hi': sec.ctr_hi.hex()}
+
+
+def romfs_tree(sec):
+    lvl_off, lvl_size = romfs_level(sec)
     h = struct.unpack('<10Q', sec.read(lvl_off, 0x50))
     _, _, _, dm_off, dm_size, _, _, fm_off, fm_size, data_off = h
     dirs = sec.read(lvl_off + dm_off, dm_size)
@@ -197,6 +212,8 @@ def main():
                     for p, fo, fs in tree:
                         o.write(f'{p}\t{fo}\t{fs}\n')
                 si['romfs_files'] = len(tree)
+                with open(os.path.join(a.out, f'romfs_{tag}.json'), 'w') as o:
+                    json.dump(romfs_storage(a.nsp, sec), o, indent=1)
                 print(f'{name} romfs: {len(tree):,} files')
                 if nca.content_type == 0:
                     for p, fo, fs in tree:

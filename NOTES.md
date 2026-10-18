@@ -304,8 +304,13 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   the window (`ui_run`); guest `nnMain` stays on its own thread and the
   process exits when it returns. `FIFA_HIDDEN=1` renders without showing
   the window, `FIFA_WINDOW=WxH`, `FIFA_SCREENSHOT_EVERY=n`,
-  `FIFA_DEBUG_FRAME=n`, `FIFA_LOG_POOLS=1`; LAS's `LARECOMP_*` switches are
-  `FIFA_*`.
+  `FIFA_DEBUG_FRAME=n` (logs every draw of frame n and dumps each pass's
+  colour target to `build/pass_*.png` and sampled 2D textures to
+  `build/dtex_*.png`), `FIFA_DUMP_SHADERS=1` (code and control sections to
+  `build/shaders/<addr>_s<stage>_*.bin`), `FIFA_DBG_FS=addr:pc:reg`
+  (register probe; pc `ffffffff` = solid white), `FIFA_LOG_POOLS=1`; LAS's
+  `LARECOMP_*` switches are `FIFA_*`. Compute programs are also written to
+  `build/cs_<n>.bin` as they're first dispatched.
   - GPU memory: the game's ~200 memory pools (671 MB) lie spread over
     0x26000000-0x222400000, ~8.5 GB, and an M1's `maxBufferLength` is
     4 GB, so LAS's one buffer over the heap can't work. Each pool gets a
@@ -313,7 +318,8 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     overlapping wraps are allowed) at `nvnMemoryPoolInitialize`; vertex,
     index and readback copies bind through `renderer_pool_buffer()`,
     anything outside a pool is copied into the ring. Virtual pools (no
-    storage, 512 MB, flags 0x221) are not wrapped.
+    storage, 512 MB, flags 0x221) are not wrapped; their textures are
+    read through the pool's mappings (see below).
   - Shader global memory (LDG/STG): the translator no longer bakes a heap
     base into MSL; shaders take `constant ulong4 &gmem_win [[buffer(17)]]` =
     {GPU address of a pool buffer, its guest address, its size} and form a
@@ -326,9 +332,9 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     asked for 6 slices from that face; texture-level swizzles (alpha-one
     formats) aren't allowed with render-target usage on M1, so the swizzle
     moved to the sampled view.
-  - State: runs 2 min at 30 fps, ~1,150 passes and ~11,700 draws per 2 s,
-    but every draw is skipped: programs fail to translate (FS "bindless
-    tex", a few unknown instructions). No screenshot is written yet.
+  - State when the executor landed: 30 fps but every draw skipped
+    (programs failed to translate). Fixed by the compute header and
+    bindless items below; current state at the end of this section.
   - Compute blobs from GLSLC have a 0x100-byte header (magic 0x12345679,
     then zeros; graphics is 0x12345678 + 0x30 header + 0x50 SPH) that the
     translator read as code ("unknown instruction 0 at 0x8"); it now skips
@@ -507,8 +513,9 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   container); the game's shaders are inside the CAS archives, whose
   Frostbite 2025 container isn't the documented one. LAS Recomp's Maxwell
   translator (github.com/peiikai/LASRecomp, MIT, `runtime/nvn/maxwell`)
-  builds standalone but fails on that shader at `SUST` (image store). Plan:
-  dump shaders as the game loads them, then decide NVN HLE vs RenderCore2.
+  builds standalone but fails on that shader at `SUST` (image store). The
+  NVN HLE path was taken; the game's shaders are captured as it creates
+  them (`FIFA_DUMP_SHADERS`), see the renderer notes above.
 - Jump tables with sign-extended offsets (`ldrsw`/`ldrsb`/`ldrsh`) were
   never resolved: `is_store` read only bit 22, which is 0 for those loads.
   Unresolved `br`s fall back to `a64_call`, which only works when the
@@ -523,8 +530,8 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
 - Later: the WebGPU RenderCore2 backend (option 2 in Status).
 - `nvdrv`: real responses for Open/Initialize/ioctls the driver init needs
   (only if the NVN HLE path doesn't bypass it).
-- Dump shaders as the game creates them; extend the Maxwell translator
-  (`SUST` first) and measure coverage.
+- Measure translator coverage over a longer run (`FIFA_DUMP_SHADERS`,
+  then translate the dumps offline).
 - Then keep pushing: hid, vi, the rest of graphics, and an audio backend
   for `audout.c`'s sink thread.
 - The 8 table-shaped `br`s in main the resolver still misses (a register

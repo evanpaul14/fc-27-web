@@ -362,6 +362,32 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     gathered otherwise, skipped while unmapped). Virtual-pool textures
     have `addr` 0. Runs 3+ min at 30 fps, ~11,500 draws and ~120
     skipped per 2 s; still black after the title.
+  - Black after the title (frame ~100 on), on all three window buffers.
+    Not found yet; ruled out so far:
+    - present/acquire: indices rotate 0,1,2 and the composite
+      (`fs=16ebcaf00`) renders into the buffer that is presented.
+      `FIFA_SCREENSHOT_EVERY` with a multiple of 3 only ever sees
+      buffer 0 - use e.g. 31.
+    - depth (`FIFA_NO_DEPTH_TEST` changes nothing), blend factor mapping,
+      vertex format 0x25/0x2E mapping.
+    - bindless resolution: the handles OR to valid tic/tsc ids; the 1x1
+      textures some passes bind are the game's own black/white defaults
+      (tic 260/301/302 black, 299 white), not unresolved handles.
+    - skipped draws: besides one-off async compiles, only the programs
+      that fail to translate (FS 16f50ba00 SUST, FS 16e8db200 `3b34…`,
+      16dea1200 with VS `1887…`), ~2 per frame.
+    What the frame does instead: the title background is only drawn into
+    a 320x180 downsample; 135 UI quads (`vs=16e001500 fs=16ea35100`)
+    have all four vertices identical and colour attribute 0 (collapsed /
+    alpha 0, i.e. hidden), so nothing visible lands in the UI target. It
+    looks like the game legitimately shows nothing - a fade or a screen
+    waiting on something (input: hid is a stub; a movie; a load) - but
+    that isn't confirmed. Open check: `FIFA_DBG_FS=16ebcaf00:ffffffff:0`
+    (force white) still gave an all-zero image even on title frames, so
+    either the probe doesn't work for that program or its draw doesn't
+    run; settle that before trusting probe results.
+  - Seen once (with heavy debug logging, ~frame 144): guest null read
+    (0x18) in `F_116768b0`; a 3-minute run without logging didn't hit it.
 
 - `recomp/rt/apm.c`: `apm` → `ISession` (Set/GetPerformanceConfiguration,
   per-mode configs; reports boost mode to match am's docked state).
@@ -490,8 +516,9 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
 
 ## Next steps
 
-- Renderer (NVN HLE path, Metal): the black frames after the title
-  screen. Then SUST/SUATOM/STS/VOTE
+- Black frames after the title screen (see Status for what's ruled
+  out): check the white-probe result first, then whether the game is
+  waiting for input (hid) or a movie. Then SUST/SUATOM/STS/VOTE
   and the other unknown instructions (FS `3b34…`, VS `1887…`).
 - Later: the WebGPU RenderCore2 backend (option 2 in Status).
 - `nvdrv`: real responses for Open/Initialize/ioctls the driver init needs

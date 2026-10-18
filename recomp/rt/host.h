@@ -1,0 +1,48 @@
+/* Host side of the recompiled program: guest memory, modules, threads, HLE. */
+#pragma once
+#include "runtime.h"
+#include <stdio.h>
+
+/* Guest address space (all offsets from `mem`, 4 GB reserved). */
+#define GUEST_SPACE        0x100000000ull
+#define HOST_THUNK_BASE    0x07E00000ull  /* host callbacks callable from guest code, 16 bytes each */
+#define HOST_THUNK_END     0x07F00000ull
+#define MISSING_BASE       0x07F00000ull  /* unresolved imports (recomp/image.py) */
+#define MISSING_END        0x08000000ull
+#define ALLOC_BASE         0x1C000000ull  /* host-made allocations: stacks, TLRs, misc */
+#define ALLOC_END          0x20000000ull
+#define HEAP_BASE          0x20000000ull  /* svcSetHeapSize */
+#define HEAP_MAX           0xC0000000ull
+#define MAP_BASE           0xE0000000ull  /* svcMapMemory / transfer memory / etc. */
+#define MAP_END            0x100000000ull
+
+typedef struct { const char *name; uint64_t base, size, init; } HostModule;
+extern const HostModule host_modules[];
+extern const unsigned host_module_count;
+extern const uint64_t host_nn_init_start;
+
+extern int host_trace;  /* FIFA_TRACE env: log svcs and dispatcher misses */
+
+#define HLOG(...) do { fprintf(stderr, __VA_ARGS__); } while (0)
+#define HDIE(...) do { fprintf(stderr, "fatal: " __VA_ARGS__); host_backtrace(); abort(); } while (0)
+
+uint64_t guest_alloc(uint64_t size, uint64_t align);
+uint64_t host_thunk(A64Func fn, const char *name);
+const char *host_symbol(uint64_t addr, uint64_t *off);
+void host_backtrace(void);
+
+/* threads */
+typedef struct HostThread {
+  CPU cpu;
+  uint64_t tlr;          /* thread local region (TPIDRRO_EL0) */
+  uint64_t stack_top;
+  uint32_t handle;
+  uint64_t id;
+} HostThread;
+extern __thread HostThread *cur_thread;
+
+/* Read/write guest memory from host code. */
+static inline void *gptr(uint64_t a) { return mem + a; }
+static inline const char *gstr(uint64_t a) { return a ? (const char *)(mem + a) : "(null)"; }
+
+void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc);

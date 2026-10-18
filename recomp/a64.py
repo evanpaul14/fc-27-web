@@ -257,7 +257,7 @@ def branch_sys(w, pc):
         opc, ll = bits(w, 23, 21), bits(w, 1, 0)
         imm = bits(w, 20, 5)
         if opc == 0 and ll == 1:
-            return Insn('trap', f'a64_svc(c, {imm:#x}, {pc:#x});', tag='svc')
+            return op(f'a64_svc(c, {imm:#x}, {pc:#x});', 'svc')
         return Insn('trap', f'a64_trap(c, {pc:#x}, {w:#x}); return;', tag='brk')
     if bits(w, 31, 22) == 0b1101010100:  # system
         l, o0, op1, crn, crm, op2, rt = (bits(w, 21, 21), bits(w, 20, 19), bits(w, 18, 16),

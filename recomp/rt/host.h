@@ -18,6 +18,8 @@
 #define MAP_BASE           0xE0000000ull  /* svcMapMemory / transfer memory / etc. */
 #define MAP_END            0x100000000ull
 
+#define APP_PID            0x51ull  /* process id, also the applet resource user id */
+
 typedef struct { const char *name; uint64_t base, size, init; } HostModule;
 extern const HostModule host_modules[];
 extern const unsigned host_module_count;

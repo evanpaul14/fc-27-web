@@ -203,30 +203,31 @@ make -C recomp -j6                                    # build/fifa (native, AArc
 
 ## Status (2026-10-18)
 
-`./build/fifa` gets through libc/os init into `nninitInitializeSdkModule` →
-`nn::oe::Initialize` → `InitializeApplet`, and starts the first worker
-thread (the GPU error handler from `SetupGpuErrorHandler`). It then dies:
-the worker's `WaitSynchronization` gets an invalid handle and aborts.
+`./build/fifa` gets through libc/os init and all of `nn::oe::Initialize`
+(applet proxy, GPU error handler thread, focus/message queue), then opens
+lm, apm, aoc:u, ectx:aw, pctl*, time:u as stubs and dies on the
+unimplemented `svcMapSharedMemory` (0x13) with handle 0: `time:u` cmd 20
+(GetSharedMemoryNativeHandle) returned no handle.
 
-Cause: `appletOE` is only a stub service. `OpenApplicationProxy` (cmd 0)
-must return an interface object, and the stub returns none, so the client
-reads the object id from leftover request bytes (the `[ipc] bad domain
-object 1229145683` lines: that's `SFCI`). Every later call (cmds 20, 11,
-0–4, 1000, 900, 91, 130) lands on the root stub, and commands that return
-events hand back no copy handle.
+- `recomp/rt/am.c`: `appletOE` → `IApplicationProxy` and its
+  sub-interfaces. Each interface is its own `Service`, so unknown commands
+  log as `[am] <Interface> cmd N unhandled`. A launched application gets
+  FocusStateChanged / OperationModeChanged / PerformanceModeChanged queued,
+  reports in focus, docked, 1920x1080. Event getters return a fresh copy
+  handle to a shared `KEvent`.
+- Stub-service pitfall: a command that returns an interface object or a
+  handle can't be stubbed, because the client then reads garbage. In a
+  domain this shows up as `[ipc] bad domain object 1229145683` (`SFCI`, the
+  leftover request magic read as an object id), e.g. pctl `CreateService`.
 
 ## Next steps
 
-- Host `appletOE` service: `OpenApplicationProxy` → `IApplicationProxy`
-  with the sub-interfaces it asks for (ICommonStateGetter, ISelfController,
-  IWindowController, IAudioController, IDisplayController,
-  ILibraryAppletCreator, IApplicationFunctions, IDebugFunctions), with real
-  `KEvent` copy handles for the event getters (e.g. cmd 130
-  GetGpuErrorDetectedSystemEvent) and a FocusState/OperationMode message
-  queue so the app sees itself in focus. Command ids: switchbrew / yuzu
-  `hle/service/am`.
-- Make unknown commands on stub services easier to spot: log the output
-  object/handle counts the client expects, if they can be inferred.
+- Shared memory: a kernel object (`svcCreateSharedMemory`,
+  `svcMapSharedMemory`/`Unmap`) backed by host memory that host services
+  can write, then `time:u` (GetStandardUserSystemClock etc. return
+  ISystemClock/ISteadyClock/ITimeZoneService objects; cmd 20 the shared
+  memory with the clock contexts).
+- `pctl`/`pctl:*` `CreateService(WithoutInitialize)` → IParentalControlService.
 - Then keep pushing through init: the remaining services nnSdk opens
   (fs, hid, vi, nvdrv, audio, …) and the 3,325 init_array entries.
 - Name the primitive `T_*` types; tie vtables to reflection classes.

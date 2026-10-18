@@ -328,9 +328,15 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     moved to the sampled view.
   - State: runs 2 min at 30 fps, ~1,150 passes and ~11,700 draws per 2 s,
     but every draw is skipped: programs fail to translate (FS "bindless
-    tex", a few unknown instructions) and every compute shader fails at
-    offset 0x8 ("unknown instruction 0"), so its code address is probably
-    off by the NVN header. No screenshot is written yet.
+    tex", a few unknown instructions). No screenshot is written yet.
+  - Compute blobs from GLSLC have a 0x100-byte header (magic 0x12345679,
+    then zeros; graphics is 0x12345678 + 0x30 header + 0x50 SPH) that the
+    translator read as code ("unknown instruction 0 at 0x8"); it now skips
+    it when the magic is there. Of the 16 compute programs dumped to
+    `build/cs_*.bin`, 3 translate and build pipelines; the rest stop at
+    bindless tex (3), SUST `eb20…` (5), SUATOM `ea70…` (2), STS `ef5c…`
+    (2) and VOTE `50d9…` (1). (Opcode names are from the encoding
+    patterns, not checked against the translator's tables.)
 
 - `recomp/rt/apm.c`: `apm` → `ISession` (Set/GetPerformanceConfiguration,
   per-mode configs; reports boost mode to match am's docked state).
@@ -459,9 +465,9 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
 
 ## Next steps
 
-- Renderer (NVN HLE path, Metal): make shaders translate. Compute code
-  address/header offset first (all compute fails at 0x8), then bindless
-  texture handles in fragment shaders, then the unknown instructions; then
+- Renderer (NVN HLE path, Metal): make shaders translate. Bindless
+  texture handles (fragment and compute), then SUST/SUATOM/STS/VOTE and the
+  other unknown instructions; then
   check that draws land and the presented image shows up
   (`FIFA_SCREENSHOT_EVERY`).
 - Virtual memory pools (`nvnMemoryPoolMapVirtual`): textures in them have

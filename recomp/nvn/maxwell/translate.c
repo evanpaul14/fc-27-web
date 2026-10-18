@@ -1938,8 +1938,9 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     c->glsl = key && key->glsl;
     const uint8_t *sph = blob + 0x30;
     const uint8_t *code = blob + 0x80;
-    // compute programs have neither the 0x30-byte NVN header nor an SPH: code starts at the blob
-    if (stage == STAGE_COMPUTE) code = blob;
+    // compute programs have no SPH: GLSLC output has a 0x100-byte header (magic 0x12345679, then zeros) before
+    // the code; without the magic the code starts at the blob
+    if (stage == STAGE_COMPUTE) code = *(const uint32_t *)blob == 0x12345679 ? blob + 0x100 : blob;
     if (stage == STAGE_FRAGMENT) {
         c->omap_target = *(const uint32_t *)(sph + 0x48);
         c->omap_depth = (*(const uint32_t *)(sph + 0x4C) >> 1) & 1;

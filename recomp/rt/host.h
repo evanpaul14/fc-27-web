@@ -13,6 +13,8 @@
 #define ALLOC_END          0x20000000ull
 #define HEAP_BASE          0x20000000ull  /* svcSetHeapSize */
 #define HEAP_MAX           0xC0000000ull
+#define STACK_BASE         0xC0000000ull  /* guest stack region (alias stacks via svcMapMemory) */
+#define STACK_END          0xE0000000ull
 #define MAP_BASE           0xE0000000ull  /* svcMapMemory / transfer memory / etc. */
 #define MAP_END            0x100000000ull
 

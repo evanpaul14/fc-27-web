@@ -157,7 +157,12 @@ make -C recomp -j6                                    # build/fifa (native, AArc
 
 - Layout: main at 0x08000000, nnSdk at 0x18000000, host thunks 0x07E00000,
   unresolved imports 0x07F00000, host allocations (stacks, TLRs)
-  0x1C000000, heap (svcSetHeapSize) 0x20000000, mapped memory 0xE0000000.
+  0x1C000000, heap (svcSetHeapSize) 0x20000000, stack region (GetInfo
+  14/15) 0xC0000000, mapped memory 0xE0000000.
+- `nn::os` threads map their stacks into the stack region at a random
+  address (`MapAliasStack`: QueryMemory until free, then svcMapMemory). The
+  kernel records svcMapMemory destinations so QueryMemory reports them as
+  taken (type Stack) and the rest of the region as free.
 - Startup: the host plays rtld and calls `nn::init::Start(thread, rtld_data,
   f1, f2, f3)` with host thunks; f2 runs DT_INIT of nnSdk then main. nnSdk
   itself calls `nninitStartup` and `nnMain`.
@@ -196,16 +201,34 @@ make -C recomp -j6                                    # build/fifa (native, AArc
   functions that return the next guest address to a driver loop; compile
   time is superlinear in function size otherwise.
 
+## Status (2026-10-18)
+
+`./build/fifa` gets through libc/os init into `nninitInitializeSdkModule` →
+`nn::oe::Initialize` → `InitializeApplet`, and starts the first worker
+thread (the GPU error handler from `SetupGpuErrorHandler`). It then dies:
+the worker's `WaitSynchronization` gets an invalid handle and aborts.
+
+Cause: `appletOE` is only a stub service. `OpenApplicationProxy` (cmd 0)
+must return an interface object, and the stub returns none, so the client
+reads the object id from leftover request bytes (the `[ipc] bad domain
+object 1229145683` lines: that's `SFCI`). Every later call (cmds 20, 11,
+0–4, 1000, 900, 91, 130) lands on the root stub, and commands that return
+events hand back no copy handle.
+
 ## Next steps
 
-- Recompiler prototype: ARM64 → C, run natively on macOS first with logging
-  stubs for all 832 imports; target is getting through crt0 and the 3,325
-  init_array entries to the first real SDK calls.
-- Name the primitive `T_*` types; tie vtables to reflection classes (class
-  records likely point at their vtable or create function).
+- Host `appletOE` service: `OpenApplicationProxy` → `IApplicationProxy`
+  with the sub-interfaces it asks for (ICommonStateGetter, ISelfController,
+  IWindowController, IAudioController, IDisplayController,
+  ILibraryAppletCreator, IApplicationFunctions, IDebugFunctions), with real
+  `KEvent` copy handles for the event getters (e.g. cmd 130
+  GetGpuErrorDetectedSystemEvent) and a FocusState/OperationMode message
+  queue so the app sees itself in focus. Command ids: switchbrew / yuzu
+  `hle/service/am`.
+- Make unknown commands on stub services easier to spot: log the output
+  object/handle counts the client expects, if they can be inferred.
+- Then keep pushing through init: the remaining services nnSdk opens
+  (fs, hid, vi, nvdrv, audio, …) and the 3,325 init_array entries.
+- Name the primitive `T_*` types; tie vtables to reflection classes.
 - Dump the DWARF types for the `rc2*` interface and the opcode structs from
-  the `.nrs`.
-- Recompiler design: recursive descent from the 273k starts to find the rest,
-  split the generated C by address range, and decide what to do about
-  NEON/atomics/TLS (tpidr_el0) and nn::os threads.
-- Disk now has ~24 GB free, enough for a Ghidra project if needed.
+  the `.nrs` (needed before the WebGPU RenderCore2 backend).

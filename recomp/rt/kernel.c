@@ -160,6 +160,24 @@ static void sync_notify(void) {
 /* ---- memory ---- */
 static uint64_t heap_size;
 
+/* svcMapMemory destinations, so QueryMemory shows them as taken. */
+typedef struct { uint64_t base, size; } Mapping;
+static Mapping mappings[1024];
+static unsigned mapping_count;
+
+static void mapping_add(uint64_t base, uint64_t size) {
+  pthread_mutex_lock(&klock);
+  if (mapping_count < sizeof mappings / sizeof *mappings) mappings[mapping_count++] = (Mapping){base, size};
+  else HLOG("[svc] MapMemory: mapping table full\n");
+  pthread_mutex_unlock(&klock);
+}
+static void mapping_remove(uint64_t base) {
+  pthread_mutex_lock(&klock);
+  for (unsigned i = 0; i < mapping_count; i++)
+    if (mappings[i].base == base) { mappings[i] = mappings[--mapping_count]; break; }
+  pthread_mutex_unlock(&klock);
+}
+
 static void query_memory(uint64_t info, uint64_t addr) {
   uint64_t base = 0, size = 0;
   uint32_t type = 0, perm = 0;  /* type 0 = unmapped */
@@ -169,6 +187,21 @@ static void query_memory(uint64_t info, uint64_t addr) {
   }
   if (!size && addr >= HEAP_BASE && addr < HEAP_BASE + heap_size) { base = HEAP_BASE; size = heap_size; type = 5; perm = 3; }
   if (!size && addr >= ALLOC_BASE && addr < ALLOC_END) { base = ALLOC_BASE; size = ALLOC_END - ALLOC_BASE; type = 5; perm = 3; }
+  if (!size) {
+    pthread_mutex_lock(&klock);
+    uint64_t lo = 0, hi = GUEST_SPACE;  /* free block around addr, bounded by mappings */
+    for (unsigned i = 0; i < mapping_count; i++) {
+      const Mapping *m = &mappings[i];
+      if (addr >= m->base && addr < m->base + m->size) { base = m->base; size = m->size; type = 0xB; perm = 3; }
+      else if (m->base + m->size <= addr && m->base + m->size > lo) lo = m->base + m->size;
+      else if (m->base > addr && m->base < hi) hi = m->base;
+    }
+    pthread_mutex_unlock(&klock);
+    if (!size && addr >= STACK_BASE && addr < STACK_END) {
+      base = lo > STACK_BASE ? lo : STACK_BASE;
+      size = (hi < STACK_END ? hi : STACK_END) - base;
+    }
+  }
   if (!size) { base = addr & ~0xfffull; size = 0x1000; }
   uint8_t *p = gptr(info);
   memset(p, 0, 0x28);
@@ -195,8 +228,8 @@ static uint64_t get_info(uint32_t type, uint64_t sub, uint32_t *res) {
   case 11: return (uint64_t)rand() << 32 | (uint64_t)rand();
   case 12: return 0x08000000ull;            /* ASLR region */
   case 13: return 0xF8000000ull;
-  case 14: return ALLOC_BASE;               /* stack region */
-  case 15: return ALLOC_END - ALLOC_BASE;
+  case 14: return STACK_BASE;               /* stack region */
+  case 15: return STACK_END - STACK_BASE;
   case 16: case 17: return 0;               /* system resource size */
   case 18: return 0x0100C49025D3E000ull;    /* program id */
   case 20: return 0;                        /* user exception context */
@@ -273,8 +306,8 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
     return;
   case 0x04: case 0x05: {  /* MapMemory / UnmapMemory(dst, src, size): flat space, so move the contents */
     uint64_t dst = x[0], src = x[1], size = x[2];
-    if (imm == 0x04) memmove(gptr(dst), gptr(src), size);
-    else memmove(gptr(src), gptr(dst), size);
+    if (imm == 0x04) { memmove(gptr(dst), gptr(src), size); mapping_add(dst, size); }
+    else { memmove(gptr(src), gptr(dst), size); mapping_remove(dst); }
     x[0] = RES_OK;
     return;
   }

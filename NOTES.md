@@ -87,8 +87,48 @@ python3 -I tools/mkelf.py      extracted/code/main extracted/analysis/main extra
   ready for Ghidra, but a full Ghidra analysis of 194 MB of code needs many GB
   of project space and isn't possible with ~2 GB free disk.
 
+## Instruction census
+
+```
+python3 -I tools/insn_stats.py extracted/code/main extracted/analysis/main   # ~25 s, needs main.elf
+```
+
+Linear sweep of the text segment with llvm-objdump in 4 MB chunks →
+`insn_mnemonics.tsv` and `insn_stats.json`. 48.2M instructions, 367 mnemonics.
+
+| class | share | notes |
+|---|---|---|
+| integer ALU | 40.0% | |
+| load/store (GPR) | 29.8% | |
+| branch | 17.3% | |
+| FP scalar + FP load/store | 7.2% | fmov, fcmp, fadd, fmul, fcsel, fdiv, fminnm, fsqrt, conversions |
+| NEON vector | 2.9% | mostly `4s`/`2s` float math (Vec3/Vec4), `16b` masks/shuffles |
+| system | 1.5% | 638k `nop` (alignment), 82k `udf #0` (zero words) |
+| exclusives | 1.0% | ldxr/stxr/ldaxr/stlxr/clrex, 700 ldxp/stxp pairs |
+| acquire/release, dmb | 0.3% | ldar*/stlr*, 62k dmb |
+
+What this means for the recompiler:
+- Plain ARMv8.0 (Cortex-A57): **no LSE atomics, no SVC** (all kernel
+  access goes through nnSdk, so the import boundary really is the only OS
+  seam), no SVE. A few extensions show up rarely: CRC32 (122), AES (69).
+- System registers: only `TPIDR_EL0` (6.6k reads, user TLS),
+  `TPIDRRO_EL0` (3.0k, Horizon thread-local region), `CNTPCT_EL0` (3.0k,
+  timer), plus 6 FPCR and 1 NZCV save/restore pairs. TLS needs a per-thread
+  context field, not real thread-local storage tricks.
+- Atomics are LL/SC loops. Translate whole ldxr…stxr loops into C11 atomic
+  CAS (pattern match) rather than emulating the monitor; ~235k sites.
+- NEON is small enough to translate per instruction to wasm SIMD128 (or
+  scalar C first); ~1.35M vector ops.
+- The 56 undecodable words are data (literal pools / tables) right after
+  terminators, so linear sweep is mostly but not entirely safe: decode by
+  recursive descent from the known starts.
+- `yield` (4k) appears in spin loops; map to a host yield/no-op.
+
 ## Next steps
 
+- Recompiler prototype: ARM64 → C, run natively on macOS first with logging
+  stubs for all 832 imports; target is getting through crt0 and the 3,325
+  init_array entries to the first real SDK calls.
 - Name the primitive `T_*` types; tie vtables to reflection classes (class
   records likely point at their vtable or create function).
 - Dump the DWARF types for the `rc2*` interface and the opcode structs from
@@ -96,4 +136,4 @@ python3 -I tools/mkelf.py      extracted/code/main extracted/analysis/main extra
 - Recompiler design: recursive descent from the 273k starts to find the rest,
   split the generated C by address range, and decide what to do about
   NEON/atomics/TLS (tpidr_el0) and nn::os threads.
-- Free disk space before Ghidra or asset work (need ~10–15 GB).
+- Disk now has ~24 GB free, enough for a Ghidra project if needed.

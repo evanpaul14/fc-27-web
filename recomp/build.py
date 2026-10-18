@@ -14,7 +14,7 @@ to them go to the host implementation instead.
 
 usage: python3 -I recomp/build.py build [--all] [--extra-roots FILE]
 """
-import argparse, bisect, collections, glob, json, os, re, struct, sys, time
+import argparse, bisect, collections, glob, json, multiprocessing, os, re, struct, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from a64 import translate, Unsupported, bits, sx  # noqa: E402
@@ -288,11 +288,42 @@ def cname(a):
     return f'F_{a:08x}'
 
 
+CHUNK = 4000  # functions above 1.5x this are split into chunk functions
+
+
 def emit_func(p, fn, built, hle, decls):
-    out = [f'void {cname(fn.start)}(CPU *c) {{']
+    """C for one guest function. Very large functions are split into chunks
+    `uint64_t F_x_k(CPU *c, uint64_t pc)` that run until control leaves the
+    chunk and return the next guest address (0 = return), driven by a loop."""
     nm = p.name(fn.start)
-    if nm:
-        out[0] = f'/* {nm} */\n' + out[0]
+    head = f'/* {nm} */\n' if nm else ''
+    body = sorted(fn.body)
+    if len(body) <= CHUNK * 3 // 2:
+        lines = emit_region(p, fn, body, built, hle, decls, None)
+        return head + f'void {cname(fn.start)}(CPU *c) {{\n' + '\n'.join(lines) + '\n}'
+    chunks = [body[i:i + CHUNK] for i in range(0, len(body), CHUNK)]
+    out = []
+    for k, ch in enumerate(chunks):
+        inside = set(ch)
+        entries = sorted({ch[0]} | (fn.labels & inside))
+        lines = emit_region(p, fn, ch, built, hle, decls, inside)
+        cases = ' '.join(f'case {t:#x}ull: goto L_{t:x};' for t in entries)
+        out.append(f'static uint64_t {cname(fn.start)}_{k}(CPU *c, uint64_t pc) {{\n'
+                   f'  switch (pc) {{ {cases} default: a64_bad_jump(c, {fn.start:#x}ull, pc); return 0; }}\n'
+                   + '\n'.join(lines) + '\n  return 0;\n}')
+    disp = ' else '.join(f'if (pc < {chunks[k + 1][0]:#x}ull) pc = {cname(fn.start)}_{k}(c, pc);'
+                         for k in range(len(chunks) - 1))
+    disp += f' else pc = {cname(fn.start)}_{len(chunks) - 1}(c, pc);'
+    out.append(head + f'void {cname(fn.start)}(CPU *c) {{\n  uint64_t pc = {fn.start:#x}ull;\n'
+               f'  while (pc) {{ {disp} }}\n}}')
+    return '\n\n'.join(out)
+
+
+def emit_region(p, fn, addrs, built, hle, decls, inside):
+    """Statements for the instructions at addrs. inside is None for a whole
+    function, else the chunk's address set: jumps leaving it return the target."""
+    out = []
+    ret = 'return;' if inside is None else 'return 0;'
 
     def call(t):
         if t in hle:
@@ -303,7 +334,15 @@ def emit_func(p, fn, built, hle, decls):
             return f'{cname(t)}(c);'
         return f'a64_call(c, {t:#x}ull);'
 
-    for a in sorted(fn.body):
+    def jump(t):
+        if inside is None or t in inside:
+            return f'goto L_{t:x};'
+        return f'return {t:#x}ull;'
+
+    def local(t):
+        return t in fn.labels and t in fn.body
+
+    for a in addrs:
         if a in fn.labels:
             out.append(f'L_{a:x}:;')
         ins = p.insn(a)
@@ -313,13 +352,13 @@ def emit_func(p, fn, built, hle, decls):
                 out.append('  ' + ins.c)
         elif k == 'b':
             t = ins.target
-            out.append(f'  goto L_{t:x};' if t in fn.labels and t in fn.body else f'  {call(t)} return;')
+            out.append(f'  {jump(t)}' if local(t) else f'  {call(t)} {ret}')
         elif k == 'bcond':
             t = ins.target
-            if t in fn.labels and t in fn.body:
-                out.append(f'  if ({ins.c}) goto L_{t:x};')
+            if local(t):
+                out.append(f'  if ({ins.c}) {jump(t)}')
             else:
-                out.append(f'  if ({ins.c}) {{ {call(t)} return; }}')
+                out.append(f'  if ({ins.c}) {{ {call(t)} {ret} }}')
         elif k == 'bl':
             out.append(f'  c->x[30] = {a + 4:#x}ull; {call(ins.target)}')
         elif k == 'blr':
@@ -327,23 +366,25 @@ def emit_func(p, fn, built, hle, decls):
         elif k == 'br':
             ts = fn.jt.get(a)
             if ts:
-                cases = ' '.join(f'case {t:#x}ull: goto L_{t:x};' for t in ts)
-                out.append(f'  {{ uint64_t t = {ins.c}; switch (t) {{ {cases} default: a64_bad_jump(c, {a:#x}ull, t); return; }} }}')
+                cases = ' '.join(f'case {t:#x}ull: {jump(t)}' for t in ts)
+                out.append(f'  {{ uint64_t t = {ins.c}; switch (t) {{ {cases} default: a64_bad_jump(c, {a:#x}ull, t); {ret} }} }}')
             else:
-                out.append(f'  a64_call(c, {ins.c}); return;')
+                out.append(f'  a64_call(c, {ins.c}); {ret}')
         elif k == 'ret':
-            out.append('  return;')
+            out.append(f'  {ret}')
         else:
-            out.append('  ' + ins.c)
+            out.append('  ' + ins.c.replace('return;', ret))
+        falls_through = k in ('op', 'bl', 'blr', 'bcond')
         if a in fn.falls:
             t = fn.falls[a]
-            if k in ('op', 'bl', 'blr', 'bcond'):
+            if falls_through:
                 if p.is_text(t):
-                    out.append(f'  {call(t)} return;')
+                    out.append(f'  {call(t)} {ret}')
                 else:
-                    out.append(f'  a64_trap(c, {t:#x}ull, 0); return;')
-    out.append('}')
-    return '\n'.join(out)
+                    out.append(f'  a64_trap(c, {t:#x}ull, 0); {ret}')
+        elif falls_through and inside is not None and a == addrs[-1]:
+            out.append(f'  return {a + 4:#x}ull;')
+    return out
 
 
 def load_hle(p):
@@ -356,6 +397,48 @@ def load_hle(p):
                 continue
             hle[a] = m.group(1)
     return hle
+
+
+_P = _BUILT = _HLE = _GDIR = None  # shared with forked workers
+
+
+def closure(p, roots, hle):
+    """Functions reachable from roots via calls, tail calls and code references."""
+    funcs = {}
+    work = sorted(roots)
+    seen = set(work)
+    while work:
+        f = work.pop()
+        if f in hle or not p.is_text(f):
+            continue
+        fn = discover(p, f)
+        funcs[f] = fn
+        for t in set(fn.calls) | code_refs(p, fn):
+            if t not in seen and p.is_text(t):
+                p.starts.add(t)
+                seen.add(t)
+                work.append(t)
+    return funcs
+
+
+def write_bucket(job):
+    key, fs, funcs = job
+    p = _P
+    if funcs is None:
+        funcs = {f: discover(p, f) for f in fs}
+    decls = set(f'void {cname(f)}(CPU *c);' for f in fs)
+    bodies = [emit_func(p, funcs[f], _BUILT, _HLE, decls) for f in fs]
+    name = f'f_{key << 19:08x}.c'
+    path = os.path.join(_GDIR, name)
+    text = '#include "gen.h"\n' + '\n'.join(sorted(decls)) + '\n\n' + '\n\n'.join(bodies) + '\n'
+    if not os.path.exists(path) or open(path).read() != text:
+        open(path, 'w').write(text)
+    st = collections.Counter(insns=sum(len(f.body) for f in funcs.values()),
+                             jt=sum(len(f.jt) for f in funcs.values()),
+                             jt_ok=sum(1 for f in funcs.values() for v in f.jt.values() if v))
+    uns = collections.Counter(p.cache[a].tag for f in funcs.values() for a in f.body
+                              if p.cache[a].tag.startswith('unsupported'))
+    return name, st, uns
 
 
 def main():
@@ -384,53 +467,40 @@ def main():
     for a in roots:
         p.starts.add(a)
 
-    funcs = {}
-    work = sorted(p.starts) if args.all else sorted(roots)
-    seen = set(work)
-    while work:
-        f = work.pop()
-        if f in hle or not p.is_text(f):
-            continue
-        fn = discover(p, f)
-        funcs[f] = fn
-        if args.all:
-            continue
-        nxt = set(fn.calls) | code_refs(p, fn)
-        for t in nxt:
-            if t not in seen and p.is_text(t):
-                if t not in p.starts:
-                    p.starts.add(t)
-                seen.add(t)
-                work.append(t)
-    built = set(funcs)
-    n_ins = sum(len(f.body) for f in funcs.values())
-    n_jt = sum(len(f.jt) for f in funcs.values())
-    n_jt_ok = sum(1 for f in funcs.values() for v in f.jt.values() if v)
-    print(f'{len(funcs)} functions, {n_ins} instructions, {n_jt_ok}/{n_jt} indirect jumps resolved as tables '
-          f'({time.time() - t0:.1f}s)')
-
     gdir = os.path.join(args.bdir, 'gen')
     os.makedirs(gdir, exist_ok=True)
+    global _P, _BUILT, _HLE, _GDIR
+    if args.all:
+        order = sorted(f for f in p.starts if p.is_text(f) and f not in hle)
+        funcs = None
+    else:
+        funcs = closure(p, roots, hle)
+        order = sorted(funcs)
+    _P, _BUILT, _HLE, _GDIR = p, set(order), hle, gdir
     # Translation units are fixed 512 KB address buckets, so adding functions
     # only changes the units they land in and rebuilds stay incremental.
-    order = sorted(funcs)
     buckets = collections.defaultdict(list)
     for f in order:
         buckets[f >> 19].append(f)
+    jobs = [(key, fs, None if funcs is None else {f: funcs[f] for f in fs}) for key, fs in sorted(buckets.items())]
+    stats = collections.Counter()
+    unsupported = collections.Counter()
     written = set()
-    for key, fs in sorted(buckets.items()):
-        decls = set(f'void {cname(f)}(CPU *c);' for f in fs)
-        bodies = [emit_func(p, funcs[f], built, hle, decls) for f in fs]
-        name = f'f_{key << 19:08x}.c'
-        path = os.path.join(gdir, name)
-        text = '#include "gen.h"\n' + '\n'.join(sorted(decls)) + '\n\n' + '\n\n'.join(bodies) + '\n'
-        if not os.path.exists(path) or open(path).read() != text:
-            open(path, 'w').write(text)
+    if funcs is None:
+        with multiprocessing.get_context('fork').Pool(os.cpu_count()) as pool:
+            results = list(pool.imap_unordered(write_bucket, jobs))
+    else:
+        results = [write_bucket(j) for j in jobs]
+    for name, st, uns in results:
         written.add(name)
+        stats.update(st)
+        unsupported.update(uns)
     for old in glob.glob(os.path.join(gdir, 'f_*.c')):
         if os.path.basename(old) not in written:
             os.remove(old)
     tu_i = len(written)
+    print(f'{len(order)} functions, {stats["insns"]} instructions, {stats["jt_ok"]}/{stats["jt"]} indirect jumps '
+          f'resolved as tables, {tu_i} units ({time.time() - t0:.1f}s)')
     with open(os.path.join(gdir, 'table.c'), 'w') as o:
         o.write('#include "gen.h"\n')
         for f in order:
@@ -463,11 +533,9 @@ def main():
         o.write(f'const uint64_t host_nn_init_start = {p.by_name["_ZN2nn4init5StartEmmPFvvES2_S2_"]:#x}ull;\n')
     with open(os.path.join(gdir, 'gen.h'), 'w') as o:
         o.write('#include "../../recomp/rt/runtime.h"\n')
-    stats = {'functions': len(funcs), 'instructions': n_ins, 'tus': tu_i,
-             'unsupported': collections.Counter(p.cache[a].tag for f in funcs.values() for a in f.body
-                                                if p.cache[a].tag.startswith('unsupported')).most_common(20)}
-    json.dump(stats, open(os.path.join(args.bdir, 'build_stats.json'), 'w'), indent=1)
-    print(f'{tu_i} translation units written ({time.time() - t0:.1f}s)')
+    json.dump({'functions': len(order), 'instructions': stats['insns'], 'tus': tu_i,
+               'unsupported': unsupported.most_common(20)},
+              open(os.path.join(args.bdir, 'build_stats.json'), 'w'), indent=1)
 
 
 if __name__ == '__main__':

@@ -148,6 +148,14 @@ static void load_module(const HostModule *m) {
 
 HostThread *thread_create_context(uint64_t stack_size);
 
+static void *main_thread(void *p) {
+  cur_thread = p;
+  HLOG("[host] calling nn::init::Start\n");
+  a64_call(&cur_thread->cpu, host_nn_init_start);
+  HLOG("[host] nn::init::Start returned\n");
+  return 0;
+}
+
 int main(int argc, char **argv) {
   (void)argc; (void)argv;
   host_trace = getenv("FIFA_TRACE") != 0;
@@ -157,7 +165,6 @@ int main(int argc, char **argv) {
   load_symbols("build/symbols.tsv");
 
   HostThread *t = thread_create_context(16 << 20);
-  cur_thread = t;
   CPU *c = &t->cpu;
   c->x[0] = t->handle;
   c->x[1] = guest_alloc(0x1000, 0x1000);  /* rtld's module list block */
@@ -165,8 +172,12 @@ int main(int argc, char **argv) {
   c->x[3] = host_thunk(rtld_run_inits, "rtld_run_inits");
   c->x[4] = host_thunk(rtld_run_finis, "rtld_run_finis");
   c->x[30] = 0;
-  HLOG("[host] calling nn::init::Start\n");
-  a64_call(c, host_nn_init_start);
-  HLOG("[host] nn::init::Start returned\n");
+  /* Guest calls nest as host calls, so give the main thread a deep stack. */
+  pthread_attr_t a;
+  pthread_attr_init(&a);
+  pthread_attr_setstacksize(&a, 512 << 20);
+  pthread_t pt;
+  pthread_create(&pt, &a, main_thread, t);
+  pthread_join(pt, 0);
   return 0;
 }

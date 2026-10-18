@@ -55,3 +55,17 @@ static inline void *gptr(uint64_t a) { return mem + a; }
 static inline const char *gstr(uint64_t a) { return a ? (const char *)(mem + a) : "(null)"; }
 
 void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc);
+
+/* kernel objects (kernel.c) */
+enum { H_FREE, H_THREAD, H_EVENT_R, H_EVENT_W, H_SESSION };
+uint32_t kobj_new(int kind, void *obj);
+void *kobj_get(uint32_t h, int kind);
+void kobj_close(uint32_t h);
+typedef struct KEvent KEvent;
+KEvent *kevent_create(uint32_t *readable, uint32_t *writable);  /* writable may be NULL */
+void kevent_signal(KEvent *e);
+void kevent_clear(KEvent *e);
+
+/* IPC (ipc.c) */
+uint32_t ipc_connect_port(const char *name, uint32_t *out_handle);
+uint32_t ipc_request(uint32_t session, uint64_t buf);

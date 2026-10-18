@@ -5,8 +5,8 @@ CC := cc
 CFLAGS := -O1 -w -mllvm -enable-misched=false -mllvm -global-isel -mllvm -global-isel-abort=0
 GEN := $(wildcard $(B)/gen/*.c)
 OBJ := $(GEN:$(B)/gen/%.c=$(B)/obj/%.o)
-RT := rt/host.c rt/kernel.c rt/a64_rt.c
-HDR := rt/cpu.h rt/runtime.h rt/host.h
+RT := rt/host.c rt/kernel.c rt/ipc.c rt/services.c rt/a64_rt.c
+HDR := rt/cpu.h rt/runtime.h rt/host.h rt/ipc.h
 
 $(B)/fifa: $(OBJ) $(RT) $(HDR)
 	$(CC) -O1 -g -o $@ $(OBJ) $(RT)

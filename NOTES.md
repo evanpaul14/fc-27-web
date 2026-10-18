@@ -171,6 +171,19 @@ make -C recomp -j6                                    # build/fifa (native, AArc
   plain -O1; SelectionDAG combining and the machine scheduler dominated).
   Translation units are fixed 512 KB address buckets, so rebuilds are
   incremental unless rt/cpu.h or rt/runtime.h change.
+- IPC: `recomp/rt/ipc.c` parses HIPC messages (special header, X/A/B/W/C
+  descriptors, CMIF `SFCI`/`SFCO`, domains, TIPC for `sm:`) from the TLR on
+  `svcSendSyncRequest` and routes them to host services registered in
+  `recomp/rt/services.c`. `sm:GetServiceHandle` for an unknown service
+  returns a stub session that logs each command and answers success.
+- nnSdk's start sequence (from `nn::init::Start`): `_init_libc0`,
+  `nnosInitialize(thread, rtld_data)`, rtld f1, `_init_libc1`,
+  `nninitInitializeSdkModule`, `nninitStartup` (game), `_init_libc2`,
+  rtld f2 (module inits), `nnMain`, rtld f3 (finis).
+- Very large functions (383 over 6k instructions, the biggest a 143k
+  instruction static initializer) are emitted as 4k-instruction chunk
+  functions that return the next guest address to a driver loop; compile
+  time is superlinear in function size otherwise.
 
 ## Next steps
 

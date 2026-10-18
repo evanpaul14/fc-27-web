@@ -11,7 +11,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define R_OK 0
+#define RES_OK 0
 #define R_INVALID_HANDLE 0xE401
 #define R_INVALID_ENUM 0xF001
 #define R_INVALID_STATE 0xFA01
@@ -25,8 +25,8 @@
 static pthread_mutex_t klock = PTHREAD_MUTEX_INITIALIZER;
 
 /* ---- handles ---- */
-enum { H_FREE, H_THREAD, H_EVENT_R, H_EVENT_W, H_PORT, H_SESSION };
-typedef struct { int signaled; } Event;
+struct KEvent { int signaled; };
+typedef struct KEvent Event;
 typedef struct { int kind; void *obj; } Handle;
 static Handle handles[8192];
 static uint32_t handle_new(int kind, void *obj) {
@@ -179,7 +179,7 @@ static void query_memory(uint64_t info, uint64_t addr) {
 }
 
 static uint64_t get_info(uint32_t type, uint64_t sub, uint32_t *res) {
-  *res = R_OK;
+  *res = RES_OK;
   switch (type) {
   case 0: return 0xF;                       /* core mask */
   case 1: return 0xFFFFFFFFFFFFFFFFull;     /* priority mask */
@@ -212,7 +212,45 @@ static uint64_t get_info(uint32_t type, uint64_t sub, uint32_t *res) {
   }
 }
 
-static uint64_t map_next = MAP_BASE;
+uint32_t kobj_new(int kind, void *obj) {
+  pthread_mutex_lock(&klock);
+  uint32_t h = handle_new(kind, obj);
+  pthread_mutex_unlock(&klock);
+  return h;
+}
+void *kobj_get(uint32_t h, int kind) {
+  pthread_mutex_lock(&klock);
+  Handle *e = handle_get(h);
+  void *o = e && e->kind == kind ? e->obj : 0;
+  pthread_mutex_unlock(&klock);
+  return o;
+}
+void kobj_close(uint32_t h) {
+  pthread_mutex_lock(&klock);
+  Handle *e = handle_get(h);
+  if (e && e->kind != H_THREAD) e->kind = H_FREE;
+  pthread_mutex_unlock(&klock);
+}
+KEvent *kevent_create(uint32_t *readable, uint32_t *writable) {
+  Event *ev = calloc(1, sizeof *ev);
+  pthread_mutex_lock(&klock);
+  *readable = handle_new(H_EVENT_R, ev);
+  if (writable) *writable = handle_new(H_EVENT_W, ev);
+  pthread_mutex_unlock(&klock);
+  return ev;
+}
+void kevent_signal(KEvent *e) {
+  pthread_mutex_lock(&klock);
+  e->signaled = 1;
+  sync_notify();
+  pthread_mutex_unlock(&klock);
+}
+void kevent_clear(KEvent *e) {
+  pthread_mutex_lock(&klock);
+  e->signaled = 0;
+  pthread_mutex_unlock(&klock);
+}
+
 
 void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
   uint64_t *x = c->x;
@@ -226,22 +264,22 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
     if (HEAP_BASE + size > HEAP_MAX) { x[0] = R_OUT_OF_MEMORY; return; }
     if (size > heap_size) memset(gptr(HEAP_BASE + heap_size), 0, size - heap_size);
     heap_size = size;
-    x[0] = R_OK; x[1] = HEAP_BASE;
+    x[0] = RES_OK; x[1] = HEAP_BASE;
     return;
   }
   case 0x02: case 0x03:  /* SetMemoryPermission / SetMemoryAttribute */
-    x[0] = R_OK;
+    x[0] = RES_OK;
     return;
   case 0x04: case 0x05: {  /* MapMemory / UnmapMemory(dst, src, size): flat space, so move the contents */
     uint64_t dst = x[0], src = x[1], size = x[2];
     if (imm == 0x04) memmove(gptr(dst), gptr(src), size);
     else memmove(gptr(src), gptr(dst), size);
-    x[0] = R_OK;
+    x[0] = RES_OK;
     return;
   }
   case 0x06:  /* QueryMemory(info*, pageinfo*, addr) */
     query_memory(x[0], x[2]);
-    x[0] = R_OK; x[1] = 0;
+    x[0] = RES_OK; x[1] = 0;
     return;
   case 0x07:
     HLOG("[svc] ExitProcess\n");
@@ -251,7 +289,7 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
     t->entry = x[1]; t->arg = x[2];
     t->stack_top = x[3]; t->cpu.x[31] = x[3];
     t->priority = (int)x[4];
-    x[0] = R_OK; x[1] = t->handle;
+    x[0] = RES_OK; x[1] = t->handle;
     if (host_trace) HLOG("[kernel] CreateThread %#x entry %#llx\n", t->handle, (unsigned long long)t->entry);
     return;
   }
@@ -264,7 +302,7 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
     pthread_t pt;
     pthread_create(&pt, &a, thread_main, t);
     pthread_detach(pt);
-    x[0] = R_OK;
+    x[0] = RES_OK;
     return;
   }
   case 0x0A:  /* ExitThread */
@@ -281,20 +319,20 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
   }
   case 0x0C: {  /* GetThreadPriority(handle) -> prio */
     HostThread *t = thread_of((uint32_t)x[1]);
-    x[0] = t ? R_OK : R_INVALID_HANDLE; x[1] = t ? (uint64_t)t->priority : 0;
+    x[0] = t ? RES_OK : R_INVALID_HANDLE; x[1] = t ? (uint64_t)t->priority : 0;
     return;
   }
   case 0x0D: {  /* SetThreadPriority(handle, prio) */
     HostThread *t = thread_of((uint32_t)x[0]);
     if (t) t->priority = (int)x[1];
-    x[0] = t ? R_OK : R_INVALID_HANDLE;
+    x[0] = t ? RES_OK : R_INVALID_HANDLE;
     return;
   }
   case 0x0E:  /* GetThreadCoreMask -> core, mask */
-    x[0] = R_OK; x[1] = 0; x[2] = 0xF;
+    x[0] = RES_OK; x[1] = 0; x[2] = 0xF;
     return;
   case 0x0F:  /* SetThreadCoreMask */
-    x[0] = R_OK;
+    x[0] = RES_OK;
     return;
   case 0x10:  /* GetCurrentProcessorNumber */
     x[0] = 0;
@@ -305,9 +343,9 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
     if (!e || (e->kind != H_EVENT_R && e->kind != H_EVENT_W)) { x[0] = R_INVALID_HANDLE; }
     else {
       Event *ev = e->obj;
-      if (imm == 0x11) { ev->signaled = 1; sync_notify(); x[0] = R_OK; }
+      if (imm == 0x11) { ev->signaled = 1; sync_notify(); x[0] = RES_OK; }
       else if (imm == 0x17 && !ev->signaled) x[0] = R_INVALID_STATE;
-      else { ev->signaled = 0; x[0] = R_OK; }
+      else { ev->signaled = 0; x[0] = RES_OK; }
     }
     pthread_mutex_unlock(&klock);
     return;
@@ -317,7 +355,7 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
     Handle *e = handle_get((uint32_t)x[0]);
     if (e && e->kind != H_THREAD) e->kind = H_FREE;  /* thread contexts stay alive */
     pthread_mutex_unlock(&klock);
-    x[0] = R_OK;
+    x[0] = RES_OK;
     return;
   }
   case 0x18: {  /* WaitSynchronization(_, handles*, count, timeout) -> index */
@@ -339,7 +377,7 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
       for (int i = 0; i < n; i++) {
         int s = handle_signaled(*u32p(hs + 4 * i));
         if (s < 0) { res = R_INVALID_HANDLE; idx = i; goto done; }
-        if (s) { res = R_OK; idx = i; goto done; }
+        if (s) { res = RES_OK; idx = i; goto done; }
       }
       if (timeout == 0) break;
       self->wait_kind = W_SYNC;
@@ -358,7 +396,7 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
     HostThread *t = thread_of((uint32_t)x[0]);
     if (t) { t->cancel = 1; pthread_cond_signal(t->cv); }
     pthread_mutex_unlock(&klock);
-    x[0] = t ? R_OK : R_INVALID_HANDLE;
+    x[0] = t ? RES_OK : R_INVALID_HANDLE;
     return;
   }
   case 0x1A: {  /* ArbitrateLock(owner_handle, addr, tag) */
@@ -370,14 +408,14 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
       kwait(self, -1);
     }
     pthread_mutex_unlock(&klock);
-    x[0] = R_OK;
+    x[0] = RES_OK;
     return;
   }
   case 0x1B:  /* ArbitrateUnlock(addr) */
     pthread_mutex_lock(&klock);
     mutex_release(x[0]);
     pthread_mutex_unlock(&klock);
-    x[0] = R_OK;
+    x[0] = RES_OK;
     return;
   case 0x1C: {  /* WaitProcessWideKeyAtomic(mutex, key, tag, timeout) */
     uint64_t maddr = x[0], key = x[1];
@@ -414,12 +452,24 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
     pthread_mutex_unlock(&klock);
     return;
   }
+  case 0x1F: {  /* ConnectToNamedPort(_, name) -> session */
+    uint32_t h = 0;
+    x[0] = ipc_connect_port(gstr(x[1]), &h);
+    x[1] = h;
+    return;
+  }
+  case 0x21:  /* SendSyncRequest(session): message in the TLR */
+    x[0] = ipc_request((uint32_t)x[0], self->tlr);
+    return;
+  case 0x22:  /* SendSyncRequestWithUserBuffer(buf, size, session) */
+    x[0] = ipc_request((uint32_t)x[2], x[0]);
+    return;
   case 0x1E:  /* GetSystemTick */
     x[0] = a64_cntpct();
     return;
   case 0x25: {  /* GetThreadId(handle) -> id */
     HostThread *t = thread_of((uint32_t)x[1]);
-    x[0] = t ? R_OK : R_INVALID_HANDLE; x[1] = t ? t->id : 0;
+    x[0] = t ? RES_OK : R_INVALID_HANDLE; x[1] = t ? t->id : 0;
     return;
   }
   case 0x26:  /* Break(reason, arg, size) */
@@ -427,7 +477,7 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
          (unsigned long long)x[1], (unsigned long long)x[2], (unsigned long long)pc);
   case 0x27:  /* OutputDebugString(str, size) */
     HLOG("[debug] %.*s\n", (int)x[1], gstr(x[0]));
-    x[0] = R_OK;
+    x[0] = RES_OK;
     return;
   case 0x29: {  /* GetInfo(_, type, handle, subtype) -> info */
     uint32_t r;
@@ -437,7 +487,7 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
   }
   case 0x2C: case 0x2D:  /* MapPhysicalMemory / UnmapPhysicalMemory(addr, size) */
     if (imm == 0x2C) memset(gptr(x[0]), 0, x[1]);
-    x[0] = R_OK;
+    x[0] = RES_OK;
     return;
   case 0x34: {  /* WaitForAddress(addr, type, value, timeout) */
     uint64_t addr = x[0];
@@ -446,7 +496,7 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
     int64_t timeout = (int64_t)x[3];
     pthread_mutex_lock(&klock);
     int32_t v = (int32_t)__atomic_load_n(u32p(addr), __ATOMIC_SEQ_CST);
-    uint32_t r = R_OK;
+    uint32_t r = RES_OK;
     int wait = 0;
     if (type == 0) wait = v < value;
     else if (type == 1) { wait = v < value; if (wait) __atomic_store_n(u32p(addr), (uint32_t)(v - 1), __ATOMIC_SEQ_CST); }
@@ -470,7 +520,7 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
     uint32_t type = (uint32_t)x[1];
     int32_t value = (int32_t)x[2], count = (int32_t)x[3];
     pthread_mutex_lock(&klock);
-    uint32_t r = R_OK;
+    uint32_t r = RES_OK;
     if (type == 1 || type == 2) {
       int32_t nv;
       HostThread *w0 = first_waiter(W_ADDR, addr, 0);
@@ -498,11 +548,9 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
     return;
   }
   case 0x45: {  /* CreateEvent -> writable, readable */
-    Event *ev = calloc(1, sizeof *ev);
-    pthread_mutex_lock(&klock);
-    uint32_t w = handle_new(H_EVENT_W, ev), r = handle_new(H_EVENT_R, ev);
-    pthread_mutex_unlock(&klock);
-    x[0] = R_OK; x[1] = w; x[2] = r;
+    uint32_t w, r;
+    kevent_create(&r, &w);
+    x[0] = RES_OK; x[1] = w; x[2] = r;
     return;
   }
   default:

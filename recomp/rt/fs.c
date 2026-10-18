@@ -418,6 +418,9 @@ static void fsp_srv(void *state, IpcMsg *m) {
     if (!romfs_open()) { m->result = R_FS_TARGET_NOT_FOUND; return; }
     ipc_push_object(m, &storage_svc, 0);
     return;
+  case 202:  /* OpenDataStorageByDataId(u8 storage, u64 data id): no add-on content or system data */
+    m->result = R_FS_TARGET_NOT_FOUND;
+    return;
   case 1005: SET_OUT(uint32_t, 0, 0); return;  /* GetGlobalAccessLogMode: off */
   case 1011:                                   /* GetProgramIndexForAccessLog -> index, count */
     SET_OUT(uint32_t, 0, 0);

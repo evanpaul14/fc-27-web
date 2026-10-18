@@ -14,7 +14,7 @@ static pthread_mutex_t am_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t msgs[64];
 static int nmsgs;
 static KEvent *msg_event, *gpu_error_event, *suspended_tick_event, *launchable_event, *resolution_event,
-    *friend_invitation_event, *notification_event, *health_warning_event;
+    *friend_invitation_event, *notification_event, *health_warning_event, *mode_event;
 
 static void am_init(void) {
   static int done;
@@ -22,7 +22,7 @@ static void am_init(void) {
   done = 1;
   uint32_t r;
   KEvent **evs[] = {&msg_event, &gpu_error_event, &suspended_tick_event, &launchable_event, &resolution_event,
-                    &friend_invitation_event, &notification_event, &health_warning_event};
+                    &friend_invitation_event, &notification_event, &health_warning_event, &mode_event};
   for (unsigned i = 0; i < sizeof evs / sizeof *evs; i++) *evs[i] = kevent_create(&r, 0);
   /* what a freshly launched application sees */
   msgs[nmsgs++] = MSG_FOCUS_STATE_CHANGED;
@@ -169,6 +169,8 @@ static void application_functions(void *state, IpcMsg *m) {
   case 150: copy_event(m, notification_event); return;       /* GetNotificationStorageChannelEvent */
   case 160: copy_event(m, health_warning_event); return;     /* GetHealthWarningDisappearedSystemEvent */
   case 180: SET_OUT(uint32_t, 0, 0); return;                  /* GetLaunchRequiredVersion */
+  case 210: copy_event(m, mode_event); return;  /* nn::oe's operation mode changed event: never fires (no
+                                                 * id on switchbrew; GetOperationMode spins on handle 0 without it) */
   case 200: SET_OUT(uint32_t, 0, 0); return;                  /* GetLastApplicationExitReason */
   case 22: case 30: case 31: case 32: case 33: case 60: case 66: case 67: case 90: case 100: case 101: case 102:
   case 124: case 131: case 170:

@@ -3,8 +3,8 @@
 #include "runtime.h"
 #include <stdio.h>
 
-/* Guest address space (all offsets from `mem`, 20 GB reserved, committed on touch). */
-#define GUEST_SPACE        0x500000000ull
+/* Guest address space (all offsets from `mem`, 68 GB reserved, committed on touch). */
+#define GUEST_SPACE        0x1100000000ull
 #define NULL_GUARD_END     0x07E00000ull  /* [0, here) is PROT_NONE so null accesses fault */
 #define HOST_THUNK_BASE    0x07E00000ull  /* host callbacks callable from guest code, 16 bytes each */
 #define HOST_THUNK_END     0x07F00000ull
@@ -17,11 +17,12 @@
 #define STACK_BASE         0xC0000000ull  /* guest stack region (alias stacks via svcMapMemory) */
 #define STACK_END          0xE0000000ull
 /* 0xE0000000-0x100000000 unused */
-/* Alias region: svcMapMemory, svcMapPhysicalMemory. nn::os VammManager
- * reserves ~1 GB at its start for its own bookkeeping and the game maps a few
- * GB of physical memory through it, so it can't fit below 4 GB. */
+/* Alias region: svcMapMemory, svcMapPhysicalMemory. 64 GB as in a 39-bit
+ * address space: nn::os VammManager reserves ~1 GB at its start for its own
+ * bookkeeping, and Frostbite's VirtualAlloc reserves ~55 GB of address space
+ * in one piece (it aborts with os 3-12 when that doesn't fit). */
 #define MAP_BASE           0x100000000ull
-#define MAP_END            0x500000000ull
+#define MAP_END            0x1100000000ull
 
 #define APP_PID            0x51ull  /* process id, also the applet resource user id */
 
@@ -68,7 +69,9 @@ static inline const char *gstr(uint64_t a) { return a ? (const char *)(mem + a) 
 void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc);
 
 /* kernel objects (kernel.c) */
-enum { H_FREE, H_THREAD, H_EVENT_R, H_EVENT_W, H_SESSION, H_SHMEM };
+enum { H_FREE, H_THREAD, H_EVENT_R, H_EVENT_W, H_SESSION, H_SHMEM, H_TMEM };
+/* Transfer memory (svcCreateTransferMemory): guest memory lent to a service. */
+typedef struct { uint64_t addr, size; uint32_t perm; } KTransferMemory;
 uint32_t kobj_new(int kind, void *obj);
 void *kobj_get(uint32_t h, int kind);
 void kobj_close(uint32_t h);

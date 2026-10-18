@@ -25,6 +25,48 @@ BUCKET_SHIFT = 18  # 256 KB of code per translation unit
 ROOT = os.path.dirname(HERE)
 
 
+def code_pointer_starts(img, base, t0, t1):
+    """Functions only reached through a pointer built with adr or adrp+add
+    (e.g. one placed right after a call to a noreturn function, which the
+    start analysis takes for the caller's tail, or a leaf right after another
+    function's final branch). adr targets that are jump table bases (the adr
+    register is added to a scaled table entry) are skipped; the rest are kept
+    when they begin with a prologue or follow an unconditional terminator."""
+    import numpy as np
+    w = np.frombuffer(img, dtype='<u4', count=(t1 - base) // 4).astype(np.int64)
+    pc = base + np.arange(len(w), dtype=np.int64) * 4
+    imm = (((w >> 5) & 0x7ffff) << 2) | ((w >> 29) & 3)
+    imm = np.where(imm & (1 << 20), imm - (1 << 21), imm)
+    adr = np.nonzero((w & 0x9f000000) == 0x10000000)[0]
+    jt_base = np.zeros(len(adr), dtype=bool)
+    for k in range(1, 5):  # add xD, xADR, xM, lsl/sxtw #s
+        j = np.minimum(adr + k, len(w) - 1)
+        x = w[j]
+        jt_base |= ((((x >> 21) & 0x7ff) == 0b10001011000) | (((x >> 21) & 0x7ff) == 0b10001011001)) \
+            & (((x >> 5) & 31) == (w[adr] & 31))
+    adr = adr[~jt_base]
+    targets = [pc[adr] + imm[adr]]
+    adrp = np.nonzero((w & 0x9f000000) == 0x90000000)[0]
+    page = (pc[adrp] & ~0xfff) + (imm[adrp] << 12)
+    for k in range(1, 4):  # add xD, xN, #imm using the adrp's register
+        ok = adrp + k < len(w)
+        x = w[adrp[ok] + k]
+        add = ((x & 0xffc00000) == 0x91000000) & (((x >> 5) & 31) == (w[adrp[ok]] & 31))
+        targets.append((page[ok] + ((x >> 10) & 0xfff))[add])
+    t = np.unique(np.concatenate(targets))
+    t = t[(t > t0) & (t < t1) & (t % 4 == 0)]
+    first, prev = w[(t - base) // 4], w[(t - base) // 4 - 1]
+    prologue = (((first & 0xffc07fff) == 0xa9807bfd)     # stp x29, x30, [sp, #-n]!
+                | ((first & 0xff0003ff) == 0xd10003ff)   # sub sp, sp, #n
+                | (first == 0xd503237f))                 # pacibsp
+    after_end = ((prev == 0xd65f03c0)                    # ret
+                 | ((prev & 0xfc000000) == 0x14000000)   # b
+                 | ((prev & 0xfffffc1f) == 0xd61f0000)   # br
+                 | ((prev & 0xffff0000) == 0)            # udf
+                 | ((prev & 0xffe0001f) == 0xd4200000))  # brk
+    return set(int(a) for a in t[prologue | after_end])
+
+
 class Program:
     def __init__(self, bdir):
         self.layout = json.load(open(os.path.join(bdir, 'layout.json')))
@@ -46,6 +88,7 @@ class Program:
             adir = os.path.join(ROOT, 'extracted', 'analysis', m['name'])
             for line in open(os.path.join(adir, 'functions.tsv')):
                 self.starts.add(base + int(line.split('\t', 1)[0], 16))
+            self.starts.update(code_pointer_starts(img, base, t0, t1))
             for line in open(os.path.join(adir, 'vtables.tsv')):
                 a, n, slots = line.rstrip('\n').split('\t')
                 self.vtables[base + int(a, 16)] = [base + int(s, 16) for s in slots.split(',') if s.startswith('0x')]
@@ -102,14 +145,26 @@ def reg_writes(w):
     return bits(w, 4, 0)
 
 
-def resolve_jump_table(p, br_pc, body):
-    """Return the possible targets of the `br` at br_pc, or None."""
+def resolve_jump_table(p, br_pc, body, jt=None):
+    """Return the possible targets of the `br` at br_pc, or None. jt: the
+    function's already resolved tables (br -> targets), edges for cfg_const."""
     w = p.word(br_pc)
     r = bits(w, 9, 5)
     seq = []  # (pc, word) walking backwards through straight-line code
     a = br_pc - 4
-    while len(seq) < 40 and a in body:
+    while len(seq) < 40:
+        if a not in body:
+            break
         seq.append((a, p.word(a)))
+        if a - 4 not in body or p.insn(a - 4).kind in ('b', 'br', 'ret', 'trap'):
+            # not entered by falling through: continue from a branch to it, the
+            # nearest one above if there are several
+            srcs = [s for s in body if p.insn(s).kind in ('b', 'bcond') and p.insn(s).target == a]
+            above = [s for s in srcs if s < a]
+            if not srcs:
+                break
+            a = max(above) if above else min(srcs)
+            continue
         a -= 4
     consts = {}
 
@@ -160,19 +215,67 @@ def resolve_jump_table(p, br_pc, body):
             return None if base is None else base + bits(ww, 21, 10)
         return None
 
+    preds = None
+
+    def cfg_const(reg, use_pc):
+        """reg's value at use_pc when every definition reaching it backwards through
+        the body (fall-through and direct branches) is the same adrp(+add #imm)
+        constant: a table base kept in a register set up far from the br."""
+        nonlocal preds
+        if preds is None:
+            preds = collections.defaultdict(list)
+            for s in body:
+                ins = p.insn(s)
+                if ins.kind in ('b', 'bcond') and ins.target in body:
+                    preds[ins.target].append(s)
+                if ins.kind not in ('b', 'br', 'ret', 'trap') and s + 4 in body:
+                    preds[s + 4].append(s)
+            for s, ts in (jt or {}).items():
+                for t in ts or ():
+                    preds[t].append(s)
+        vals, seen, work = set(), set(), [(use_pc, 0)]
+        while work:
+            a, off = work.pop()
+            for s in preds.get(a, ()):
+                if (s, off) in seen:
+                    continue
+                seen.add((s, off))
+                if len(seen) > 4000:
+                    return None
+                ww, ins = p.word(s), p.insn(s)
+                if ins.kind in ('bl', 'blr') and reg < 19:
+                    return None  # clobbered by the call
+                if is_branch(ww) or is_store(ww) or is_cmp(ww) or reg_writes(ww) != reg:
+                    work.append((s, off))
+                elif bits(ww, 31, 31) and bits(ww, 28, 24) == 0b10000:  # adrp
+                    vals.add((s & ~0xfff) + (sx((bits(ww, 23, 5) << 2) | bits(ww, 30, 29), 21) << 12) + off)
+                elif bits(ww, 31, 22) == 0b1001000100 and bits(ww, 9, 5) == reg:  # add xR, xR, #imm
+                    work.append((s, off + bits(ww, 21, 10)))
+                else:
+                    return None
+                if len(vals) > 1:
+                    return None
+        return vals.pop() if len(vals) == 1 else None
+
     table = const_of(rt, k_ld + 1)
+    if table is None:
+        table = cfg_const(rt, seq[k_ld][0])
     base = table if rb == rt else const_of(rb, k_add + 1)
     if table is None or base is None:
         return None
     # bound: cmp wI/xI, #N (subs with rd=31) somewhere before, followed by b.hi/b.hs
+    # on the index register or one it was copied from (mov wI, wS)
     n = None
+    idx = {ri}
     a = br_pc - 4
     for _ in range(64):
         if a not in body:
             a -= 4
             continue
         ww = p.word(a)
-        if bits(ww, 30, 23) == 0b11100010 and bits(ww, 4, 0) == 31 and bits(ww, 9, 5) == ri and not bits(ww, 22, 22):
+        if bits(ww, 30, 21) == 0b0101010000 and bits(ww, 15, 5) == 31 and bits(ww, 4, 0) in idx:  # mov (orr Rd, zr, Rm)
+            idx.add(bits(ww, 20, 16))
+        if bits(ww, 30, 23) == 0b11100010 and bits(ww, 4, 0) == 31 and bits(ww, 9, 5) in idx and not bits(ww, 22, 22):
             n = bits(ww, 21, 10) + 1
             break
         a -= 4
@@ -259,13 +362,19 @@ def discover(p, f):
     fn = Func(f)
     walk(p, fn, [f])
     # jump tables are resolved against the body found so far; their targets
-    # can add code containing further tables
-    while any(v is None for v in fn.jt.values()):
-        for a in [a for a, v in fn.jt.items() if v is None]:
-            ts = resolve_jump_table(p, a, fn.body) or []
+    # can add code containing further tables, and paths that let a failed
+    # table resolve on a later round
+    while True:
+        todo = [a for a, v in fn.jt.items() if not v]
+        progress = False
+        for a in todo:
+            ts = resolve_jump_table(p, a, fn.body, fn.jt) or []
+            progress |= fn.jt[a] is None or bool(ts)
             fn.jt[a] = ts
             fn.labels.update(ts)
             walk(p, fn, ts)
+        if not progress:
+            break
     return fn
 
 
@@ -318,6 +427,8 @@ def emit_func(p, fn, built, hle, decls):
     body = sorted(fn.body)
     if len(body) <= CHUNK * 3 // 2:
         lines = emit_region(p, fn, body, built, hle, decls, None)
+        if body[0] != fn.start:  # the body reaches code below the entry (b to a non-start)
+            lines.insert(0, f'  goto L_{fn.start:x};')
         return head + f'WEAK void {cname(fn.start)}(CPU *c) {{\n  Flags F = {{0}};\n' + '\n'.join(lines) + '\n}'
     chunks = [body[i:i + CHUNK] for i in range(0, len(body), CHUNK)]
     out = []

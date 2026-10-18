@@ -7,6 +7,7 @@
 #include "host.h"
 #include <errno.h>
 #include <pthread.h>
+#include <sys/mman.h>
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
@@ -217,6 +218,19 @@ static void query_memory(uint64_t info, uint64_t addr) {
   memcpy(p + 24, &perm, 4);
 }
 
+/* Zero guest [addr, addr + size) without committing it: whole host pages are
+ * replaced by fresh anonymous ones (also returning their memory), the
+ * unaligned edges are cleared. Frostbite maps tens of GB this way. */
+static void zero_pages(uint64_t addr, uint64_t size) {
+  uint64_t pg = (uint64_t)getpagesize(), end = addr + size;
+  uint64_t lo = (addr + pg - 1) & ~(pg - 1), hi = end & ~(pg - 1);
+  if (lo >= hi) { memset(gptr(addr), 0, size); return; }
+  memset(gptr(addr), 0, lo - addr);
+  memset(gptr(hi), 0, end - hi);
+  if (mmap(gptr(lo), hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED, -1, 0) == MAP_FAILED)
+    HDIE("zero_pages: mmap %#llx+%#llx failed: %s\n", (unsigned long long)lo, (unsigned long long)(hi - lo), strerror(errno));
+}
+
 static uint64_t get_info(uint32_t type, uint64_t sub, uint32_t *res) {
   *res = RES_OK;
   switch (type) {
@@ -241,7 +255,11 @@ static uint64_t get_info(uint32_t type, uint64_t sub, uint32_t *res) {
   case 16: return 0x2000000ull;             /* system resource size total */
   case 17: return 0;                        /* system resource size used */
   case 18: return 0x0100C49025D3E000ull;    /* program id */
-  case 20: return 0;                        /* user exception context */
+  case 20: {                                /* user exception context: a process page (nn::os keeps */
+    static uint64_t page;                   /* the dying message region at +0x1c0) */
+    if (!page) page = guest_alloc(0x1000, 0x1000);
+    return page;
+  }
   case 21: return 0xCD500000ull;            /* total non-system memory */
   case 22: return heap_size + 0x10000000ull;
   case 23: return 1;                        /* is application */
@@ -408,6 +426,13 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
     pthread_mutex_unlock(&klock);
     return;
   }
+  case 0x15: {  /* CreateTransferMemory(_, addr, size, perm) -> handle */
+    KTransferMemory *t = malloc(sizeof *t);
+    *t = (KTransferMemory){x[1], x[2], (uint32_t)x[3]};
+    x[1] = kobj_new(H_TMEM, t);
+    x[0] = RES_OK;
+    return;
+  }
   case 0x16: {  /* CloseHandle */
     pthread_mutex_lock(&klock);
     Handle *e = handle_get((uint32_t)x[0]);
@@ -420,6 +445,8 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
     uint64_t hs = x[1];
     int n = (int)x[2];
     int64_t timeout = (int64_t)x[3];
+    if (host_trace)
+      for (int i = 0; i < n && i < 8; i++) HLOG("  handle %#x\n", *u32p(hs + 4 * i));
     pthread_mutex_lock(&klock);
     struct timespec dl;
     clock_gettime(CLOCK_REALTIME, &dl);
@@ -540,7 +567,7 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
     return;
   }
   case 0x2C: case 0x2D:  /* MapPhysicalMemory / UnmapPhysicalMemory(addr, size) */
-    if (imm == 0x2C) memset(gptr(x[0]), 0, x[1]);
+    zero_pages(x[0], x[1]);  /* mapped memory reads as zero; unmapping gives the pages back */
     x[0] = RES_OK;
     return;
   case 0x34: {  /* WaitForAddress(addr, type, value, timeout) */

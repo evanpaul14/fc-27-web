@@ -170,8 +170,9 @@ from the roots (215k functions), which rewrites every unit and costs a full
   unresolved imports 0x07F00000, host allocations (stacks, TLRs)
   0x1C000000, heap (svcSetHeapSize) 0x20000000, stack region (GetInfo
   14/15) 0xC0000000, alias region (GetInfo 2/3: svcMapMemory,
-  svcMapPhysicalMemory) 0x1_0000_0000-0x5_0000_0000. The guest space is a
-  20 GB `MAP_NORESERVE` mapping, so only touched pages cost memory.
+  svcMapPhysicalMemory) 0x1_0000_0000-0x11_0000_0000 (64 GB, see below).
+  The guest space is a 68 GB `MAP_NORESERVE` mapping, so only touched
+  pages cost memory.
 - The alias region has to be big: nn::os VammManager (enabled by GetInfo 16)
   reserves 0x3fe00000 at the start of it for its own node pool before
   handing out anything, and the game sets a 1.2 GB heap out of 3.2 GB total
@@ -179,7 +180,9 @@ from the roots (215k functions), which rewrites every unit and costs a full
   `AllocateMemoryPages`. With the old 512 MB region the search found no gap
   and returned address 0 with a success result; Frostbite's "BootArena"
   then failed its first allocation and init wrote through null pointers.
-  For wasm this needs memory64 or a compacting HLE of the VAM calls.
+  Frostbite then reserves another ~55 GB in one piece, hence 64 GB.
+  For wasm this needs a compacting HLE of the VAM calls (reserve lazily,
+  commit what's touched); memory64 alone won't cover it.
 - `nn::os` threads map their stacks into the stack region at a random
   address (`MapAliasStack`: QueryMemory until free, then svcMapMemory). The
   kernel records svcMapMemory destinations so QueryMemory reports them as
@@ -212,8 +215,9 @@ from the roots (215k functions), which rewrites every unit and costs a full
     same compile time).
   - A full rebuild is ~43 min (50.5M instructions, 768 units). Only C
     files whose text changed are rewritten, so a generator fix that touches
-    few functions recompiles in minutes; new function starts touch every
-    bucket. Things measured on a median unit (3.9 MB C, 18 s) that don't
+    few functions recompiles in minutes. New function starts only touch
+    the buckets that contain them or call them (180 new starts: 97 units,
+    ~6 min). Things measured on a median unit (3.9 MB C, 18 s) that don't
     pay off: `-fno-inline` (functions are WEAK, nothing inlines anyway),
     no unwind tables (no change); `-O0` 1.6x faster but 3.5x the code;
     emitting LLVM IR (parsing `.ll` costs as much as parsing the C, `.bc`
@@ -239,12 +243,28 @@ from the roots (215k functions), which rewrites every unit and costs a full
 ## Status (2026-10-18)
 
 `./build/fifa` gets through nnSdk init, `nninitStartup`, all 3,325 of
-main's `init_array` entries and into `nnMain`: it mounts the RomFS, opens
-two save data filesystems (types 4 and 5), asks `ldr:ro` for the NRO, sets
-the apm performance configuration, opens `nifm:u` (still a stub) and then
-faults in stripped game code under `nnMain` (lr 0x116aea10, called from
-0x119e9990): an FNV-1a hash over a name ("CraniumSecondary...") followed by
-a load through a garbage pointer (0x8bc10010ffff).
+main's `init_array` entries and into `nnMain`, then through Frostbite's
+boot: RomFS and save data, config parsing, memory setup (the 64 GB alias
+region), network (offline), DLC (none), operation mode, audio
+(`nn::audio::OpenDefaultAudioOut` on `audout:u`) and the start of graphics:
+it opens `nvdrv` (still a stub: commands 3, 8, 13 answer success) and calls
+`nn::ro::LoadModule` for `Engine.Render.Core2.PlatformNvn.nro`, which aborts
+(`svcBreak 0x80000003`) because `ldr:ro` is a stub. Footprint ~1.6 GB,
+about 14 s to get there.
+
+The NRO gets NVN through `nvnBootstrapLoader` (in nnSdk), by name: it
+contains 1,065 `nvn*` names. Renderer options at this point:
+1. Recompile the NRO as a third module, HLE `nn::ro::LoadModule`, and
+   implement NVN on the host by HLE'ing `nvnBootstrapLoader` (the LAS
+   Recomp approach; its NVN objects, Tegra deswizzle, ASTC and Maxwell
+   translator are reusable). Fastest to a first frame, and the game hands
+   us every shader at program creation.
+2. Don't load the NRO: implement the `rc2*` interface it exposes directly
+   on WebGPU. Coarser calls and pipelines built up front, so less CPU per
+   draw and no NVN state reconstruction (better for the web, where CPU is
+   the likely bottleneck). Shaders and textures are the same work either
+   way: both get Maxwell binaries and block-linear/ASTC data.
+Undecided; a quick (1) as a reference and shader dump, then (2), is one way.
 
 - `recomp/rt/apm.c`: `apm` → `ISession` (Set/GetPerformanceConfiguration,
   per-mode configs; reports boost mode to match am's docked state).
@@ -305,6 +325,67 @@ a load through a garbage pointer (0x8bc10010ffff).
   0 there, every lock looked unlocked), and a non-zero system resource
   size (GetInfo 16) to enable `nn::os` virtual address memory
   (VammManager over the alias region, backed by svcMapPhysicalMemory).
+- A function whose body reaches code *below* its entry (a `b` into code
+  that isn't a known start) was entered at its lowest address, because the
+  body is emitted sorted: 1,285 functions in 295 units ran the wrong code.
+  `emit_func` now starts with `goto L_<entry>`. This was the "garbage
+  pointer after an FNV hash of CraniumSecondary" fault.
+- Functions reached only through a pointer made with `adr`/`adrp+add` (one
+  placed right after a call to a noreturn function looks like the caller's
+  tail to the start analysis, or a leaf placed after another function's
+  final `br`) were never translated. `build.py` adds such targets as starts
+  when they begin with a prologue or follow a terminator, skipping `adr`s
+  that are jump table bases (260 of them). A wrong start is harmless here:
+  falling or branching into it becomes a call followed by a return.
+- Jump tables whose base register is set far from the `br` (a callee-saved
+  register loaded once at the top, or a path through another table's
+  target) were left unresolved, and the `a64_call` fallback died on a
+  non-start target. The backward walk now follows branches into a block,
+  and `cfg_const` searches predecessors (fall-through, direct branches,
+  resolved tables) for the definitions that reach the load; `discover`
+  retries failed tables when others add code. 1,216 -> 1,409 tables; of the
+  1,224 table-shaped `br`s in main 8 are still unresolved
+  (`python3 -I tools/jtcheck.py`). Without a bound (`cmp` on the index or a
+  register it was copied from) tables are read until an entry leaves the
+  text or hits another start, which both cut tables short and over-read
+  them into junk code.
+- Address space: Frostbite's `VirtualAlloc_Posix` reserves ~55 GB
+  (0xdbc9e0000) of address space in one piece and aborts with os 3-12
+  otherwise, so the alias region is now 64 GB as in a 39-bit space
+  (`MAP_END` 0x11_0000_0000, 68 GB reserved). svcMapPhysicalMemory used to
+  `memset` what it mapped, which committed everything (49 GB footprint and
+  the process got killed); it now replaces the range with fresh anonymous
+  pages (`zero_pages`), and Unmap does the same to give pages back. Running
+  footprint is ~1.6 GB. For wasm this makes the address-space problem
+  bigger: the VAM calls will have to be compacted (reserve lazily), memory64
+  alone won't cover 64 GB.
+- `aoc:u` (`recomp/rt/aoc.c`): no add-on content; fsp-srv 202
+  (OpenDataStorageByDataId) returns TargetNotFound instead of a missing object.
+- `audout:u` (`recomp/rt/audout.c`): a null sink that releases each
+  appended buffer after its duration at 48 kHz on a host thread and signals
+  the buffer event; samples are dropped (a CoreAudio/WebAudio backend goes
+  in `sink_thread`).
+- `svcCreateTransferMemory` makes an `H_TMEM` handle (`KTransferMemory`:
+  address, size, permission) for services to read; the memory stays
+  accessible to the guest. nv:: creates one for `nvdrv`.
+- GetInfo 20 (user exception context) must be a real page: nn::os keeps the
+  dying message region at +0x1c0 of it.
+- `IApplicationFunctions` 210 returns an event that nn::oe::GetOperationMode
+  caches and TryWaits on every call; with the stub's handle 0 TryWait spun
+  forever (it retries anything but TimedOut). A stubbed command that should
+  return a handle can hang as well as crash.
+- `FIFA_TRACE=1` also prints the handles passed to WaitSynchronization.
+  For a hang, `lldb -p <pid> --batch -o 'thread backtrace all -c 30'`: the
+  `F_<addr>` frames are guest functions.
+- `nifm:u/a/s` (`recomp/rt/nifm.c`): `IGeneralService` always offline;
+  requests stay NotSubmitted and `GetResult` is 2110-1111 (communication
+  disabled).
+- Shaders: the RenderCore2 NRO embeds a single compute shader (GLSLC `VNVN`
+  container); the game's shaders are inside the CAS archives, whose
+  Frostbite 2025 container isn't the documented one. LAS Recomp's Maxwell
+  translator (github.com/peiikai/LASRecomp, MIT, `runtime/nvn/maxwell`)
+  builds standalone but fails on that shader at `SUST` (image store). Plan:
+  dump shaders as the game loads them, then decide NVN HLE vs RenderCore2.
 - Jump tables with sign-extended offsets (`ldrsw`/`ldrsb`/`ldrsh`) were
   never resolved: `is_store` read only bit 22, which is 0 for those loads.
   Unresolved `br`s fall back to `a64_call`, which only works when the
@@ -312,14 +393,16 @@ a load through a garbage pointer (0x8bc10010ffff).
 
 ## Next steps
 
-- Find out where the garbage pointer behind the fault under `nnMain` comes from.
-- `nifm:u` → `IGeneralService` (offline: no internet connection).
-- `ldr:ro` / `nn::ro`: load the RenderCore2 NRO (or hand back our own
-  WebGPU backend in its place).
-- Then keep pushing through `nnMain` and the services it reaches (hid, vi,
-  nvdrv, audio, …).
-- Avoid full rebuilds when starts change: make bucket contents stable so a
-  new start only touches its own bucket.
+- Choose the renderer path (see Status) and load or replace the
+  RenderCore2 NRO (`ldr:ro` / `nn::ro::LoadModule`).
+- `nvdrv`: real responses for Open/Initialize/ioctls the driver init needs
+  (only if the NVN HLE path doesn't bypass it).
+- Dump shaders as the game creates them; extend the Maxwell translator
+  (`SUST` first) and measure coverage.
+- Then keep pushing: hid, vi, the rest of graphics, and an audio backend
+  for `audout.c`'s sink thread.
+- The 8 table-shaped `br`s in main the resolver still misses (a register
+  reused along some path); fix when one is hit.
 - Name the primitive `T_*` types; tie vtables to reflection classes.
 - Dump the DWARF types for the `rc2*` interface and the opcode structs from
-  the `.nrs` (needed before the WebGPU RenderCore2 backend).
+  the `.nrs` (needed for option 2).

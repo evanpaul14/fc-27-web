@@ -332,7 +332,7 @@ static uint64_t fnv_sample(const uint8_t *p, uint64_t n) {
 
 // Upload all levels/layers from block-linear guest memory.
 static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncoder> blit) {
-    if (!t->addr || t->target == 10) return;
+    if (!t->pool || t->target == 10) return;
     if (b->uploaded && b->checked_frame == g_frame_counter) return;
     // Textures that have never changed since upload (almost all: loaded from files) are re-checked every 8th
     // frame, staggered per texture; ones seen changing (glyph caches, video...) every frame.
@@ -346,14 +346,16 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
     b->checked_frame = g_frame_counter;
     if (t->flags & 0x10) b->dynamic = true;  // linear textures are the CPU-written kind
     if (full_hash_budget_frame != g_frame_counter) { full_hash_budget_frame = g_frame_counter; full_hash_budget = 4 << 20; }
-    const uint8_t *mem = gptr(t->addr);
+    uint8_t *tmp;
+    const uint8_t *mem = nvn_texture_data(t, total, &tmp);  // (virtual pools: NULL until mapped)
+    if (!mem) return;
     bool full = b->dynamic || !b->uploaded || ENV("FIFA_TEX_FULLHASH");
     if (!full && g_frame_counter - b->full_frame >= 120 && full_hash_budget >= total) { full = true; full_hash_budget -= total; }
-    if (!full && fnv_sample(mem, total) == b->sample_hash) return;
+    if (!full && fnv_sample(mem, total) == b->sample_hash) { free(tmp); return; }
     uint64_t h = hash_full(mem, total);
     b->full_frame = g_frame_counter;
     b->sample_hash = fnv_sample(mem, total);
-    if (b->uploaded && h == b->data_hash) return;
+    if (b->uploaded && h == b->data_hash) { free(tmp); return; }
     if (b->uploaded) b->dynamic = true;
     b->data_hash = h;
     b->uploaded = true;
@@ -399,6 +401,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
         }
     }
     if (own_cb) { [blit endEncoding]; [own_cb commit]; }
+    free(tmp);
 }
 
 id<MTLTexture> renderer_texture(NvnTexture *t, id<MTLBlitCommandEncoder> blit, bool for_render) {

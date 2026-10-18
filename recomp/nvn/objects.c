@@ -194,6 +194,7 @@ NVN(nvnMemoryPoolInitialize) {
 }
 NVN(nvnMemoryPoolFinalize) {
     backend_pool_destroyed(HOST(NvnPool, A(0)));
+    free(HOST(NvnPool, A(0))->map);
     free(HOST(NvnPool, A(0)));
     SET_HOST(A(0), 0);
 }
@@ -207,7 +208,74 @@ NVN(nvnMemoryPoolFlushMappedRange) {
     backend_pool_written(p->storage + A(1), A(2));
 }
 NVN(nvnMemoryPoolInvalidateMappedRange) { (void)c; }
-NVN(nvnMemoryPoolMapVirtual) { RET(1); }
+// Virtual pools (Frostbite's texture streaming heaps) are filled with whole physical pools, in ~2 MB pieces,
+// after textures are placed in them. Keep the mappings and resolve texture memory through them on use.
+static void vmap_remove(NvnPool *p, uint64_t lo, uint64_t hi) {
+    // each mapping overlapping [lo, hi) leaves at most two pieces
+    NvnPoolMapping *out = malloc((p->nmap * 2 + 1) * sizeof *out);
+    int n = 0;
+    for (int i = 0; i < p->nmap; i++) {
+        NvnPoolMapping m = p->map[i];
+        uint64_t mlo = m.voff, mhi = m.voff + m.size;
+        if (mhi <= lo || mlo >= hi) { out[n++] = m; continue; }
+        if (mlo < lo) out[n++] = (NvnPoolMapping){mlo, lo - mlo, m.phys};
+        if (mhi > hi) out[n++] = (NvnPoolMapping){hi, mhi - hi, m.phys + (hi - mlo)};
+    }
+    free(p->map);
+    p->map = out;
+    p->nmap = n;
+    p->cap_map = p->nmap * 2 + 1;
+}
+
+NVN(nvnMemoryPoolMapVirtual) {
+    NvnPool *p = HOST(NvnPool, A(0));
+    const uint8_t *rq = AP(2);  // NVNmappingRequest[n] = {pool, physicalOffset, virtualOffset, size, storageClass}
+    for (int i = 0; i < (int)A(1); i++, rq += 0x28) {
+        uint64_t phys_pool = *(const uint64_t *)rq, poff = *(const uint64_t *)(rq + 8);
+        uint64_t voff = *(const uint64_t *)(rq + 16), size = *(const uint64_t *)(rq + 24);
+        if (!size) continue;
+        vmap_remove(p, voff, voff + size);
+        if (!phys_pool) continue;  // unmap
+        if (p->nmap == p->cap_map) p->map = realloc(p->map, (p->cap_map = p->cap_map ? p->cap_map * 2 : 64) * sizeof *p->map);
+        int k = p->nmap;
+        while (k > 0 && p->map[k - 1].voff > voff) { p->map[k] = p->map[k - 1]; k--; }
+        p->map[k] = (NvnPoolMapping){voff, size, HOST(NvnPool, phys_pool)->storage + poff};
+        p->nmap++;
+    }
+    RET(1);
+}
+
+const uint8_t *nvn_texture_data(NvnTexture *t, uint64_t size, uint8_t **tmp) {
+    *tmp = NULL;
+    NvnPool *p = t->pool;
+    if (!p) return NULL;
+    if (p->storage) return GP(p->storage + t->pool_offset);
+    uint64_t lo = t->pool_offset, hi = lo + size;
+    int i = 0;
+    while (i < p->nmap && p->map[i].voff + p->map[i].size <= lo) i++;
+    // one physically contiguous run of mappings: use the memory in place
+    uint64_t at = lo;
+    int j = i;
+    for (; j < p->nmap && at < hi; j++) {
+        NvnPoolMapping *m = &p->map[j];
+        if (m->voff > at) return NULL;  // hole
+        if (j > i && m->phys != p->map[j - 1].phys + p->map[j - 1].size) break;
+        at = m->voff + m->size;
+    }
+    if (at >= hi) return GP(p->map[i].phys + (lo - p->map[i].voff));
+    if (j < p->nmap && at < hi && p->map[j].voff > at) return NULL;
+    // separate physical ranges: gather
+    uint8_t *buf = malloc(size);
+    for (at = lo; at < hi; i++) {
+        if (i >= p->nmap || p->map[i].voff > at) { free(buf); return NULL; }
+        NvnPoolMapping *m = &p->map[i];
+        uint64_t end = m->voff + m->size < hi ? m->voff + m->size : hi;
+        memcpy(buf + (at - lo), GP(m->phys + (at - m->voff)), end - at);
+        at = end;
+    }
+    *tmp = buf;
+    return buf;
+}
 
 // ================================================================== buffers
 // Builder: device@0 pool@8 offset@0x10 size@0x18. Buffer: address@0 pool@8 offset@0x10 size@0x18 id@0x20
@@ -356,7 +424,7 @@ static NvnTexture *texture_from_builder(uint64_t b) {
     uint64_t pool = FLD(uint64_t, b, 0x38);
     t->pool = pool ? HOST(NvnPool, pool) : NULL;
     t->pool_offset = FLD(uint64_t, b, 0x40);
-    t->addr = t->pool ? t->pool->storage + t->pool_offset : 0;
+    t->addr = t->pool && t->pool->storage ? t->pool->storage + t->pool_offset : 0;  // (virtual: nvn_texture_data)
     builder_layout(b, &t->layout);
     t->debug_id = next_debug_id++;
     return t;
@@ -447,7 +515,9 @@ NVN(nvnTextureWriteTexels) {
     NvnTexture *t = HOST(NvnTexture, A(0));
     const int32_t *r = GP(A(2));  // xoffset, yoffset, zoffset, width, height, depth
     LevelLayout l = tegra_level(&t->layout, 0);
-    if (r && r[0] == 0 && r[1] == 0 && (uint32_t)r[3] == t->width && (uint32_t)r[4] == t->height) {
+    if (!t->addr) {
+        LOG("[nvn] WriteTexels into a virtual pool texture not implemented\n");
+    } else if (r && r[0] == 0 && r[1] == 0 && (uint32_t)r[3] == t->width && (uint32_t)r[4] == t->height) {
         tegra_swizzle(AP(3), (uint8_t *)GP(t->addr) + l.offset, l.wb, l.hb, r[5] > 0 ? (uint32_t)r[5] : 1,
                       t->layout.fmt->bpb, l.block_height_log2, l.block_depth_log2);
         backend_pool_written(t->addr, tegra_total_size(&t->layout));

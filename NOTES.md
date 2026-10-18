@@ -350,9 +350,18 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     they now have their own commands and tables. Fragment programs: 1 ->
     14 of 16 translate; the frame loop went from 0 to ~9,000 draws per
     2 s, and the FC 27 title screen renders (`FIFA_SCREENSHOT_EVERY`).
-    After it the presented image goes black and the renderer crashes in
-    `renderer_texture` on a guest null-region address (from
-    `fb::DeviceNvn::enqueueProcessFrame`).
+    After it the presented image goes black.
+  - Virtual memory pools (flag 0x200, no storage): two 512 MB pools,
+    Frostbite's texture streaming heaps, filled by
+    `nvnMemoryPoolMapVirtual` with whole ~2 MB physical pools after the
+    textures are placed in them. The stub left texture addresses at the
+    pool offset, and the first upload after the title read guest
+    0x16xxxxx (null-region crash in `renderer_texture`). Pools now keep
+    their mapping table; `nvn_texture_data` resolves a texture through it
+    on each upload (in place when the range is physically contiguous,
+    gathered otherwise, skipped while unmapped). Virtual-pool textures
+    have `addr` 0. Runs 3+ min at 30 fps, ~11,500 draws and ~120
+    skipped per 2 s; still black after the title.
 
 - `recomp/rt/apm.c`: `apm` → `ISession` (Set/GetPerformanceConfiguration,
   per-mode configs; reports boost mode to match am's docked state).
@@ -481,11 +490,9 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
 
 ## Next steps
 
-- Renderer (NVN HLE path, Metal): the `renderer_texture` crash after the
-  title screen and the black frames after it. Then SUST/SUATOM/STS/VOTE
+- Renderer (NVN HLE path, Metal): the black frames after the title
+  screen. Then SUST/SUATOM/STS/VOTE
   and the other unknown instructions (FS `3b34…`, VS `1887…`).
-- Virtual memory pools (`nvnMemoryPoolMapVirtual`): textures in them have
-  no backing buffer yet.
 - Later: the WebGPU RenderCore2 backend (option 2 in Status).
 - `nvdrv`: real responses for Open/Initialize/ioctls the driver init needs
   (only if the NVN HLE path doesn't bypass it).

@@ -53,9 +53,14 @@ static inline void guest_call(CPU *c, uint64_t fn) {
 static inline uint64_t plat_now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 
 /* ---- host objects */
+typedef struct { uint64_t voff, size, phys; } NvnPoolMapping;  /* virtual range -> guest address */
+
 typedef struct NvnPool {
-  uint64_t storage, size;  /* guest address of the pool's memory */
+  uint64_t storage, size;  /* guest address of the pool's memory (0 for a virtual pool) */
   uint32_t flags;
+  /* virtual pools (flag 0x200): ranges mapped by nvnMemoryPoolMapVirtual, sorted by voff */
+  NvnPoolMapping *map;
+  int nmap, cap_map;
 } NvnPool;
 
 typedef struct NvnTexture {
@@ -168,6 +173,10 @@ void backend_present(NvnTexture *tex);  /* show a texture in the window */
 void backend_texture_destroyed(NvnTexture *tex);
 void backend_pool_written(uint64_t addr, uint64_t size);
 void backend_pool_created(NvnPool *p);    /* wrap its storage for the GPU */
+/* A texture's texels in guest memory: storage of a physical pool, or for a virtual pool the mapped memory
+   (gathered into a malloc'd *tmp the caller frees when it spans separate physical ranges). NULL while
+   any part is unmapped. */
+const uint8_t *nvn_texture_data(NvnTexture *t, uint64_t size, uint8_t **tmp);
 void backend_pool_destroyed(NvnPool *p);
 void renderer_sync(void);   /* wait for all submitted GPU work */
 void renderer_flush(void);  /* finish all recorded GPU work */

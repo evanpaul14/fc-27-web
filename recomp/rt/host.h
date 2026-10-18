@@ -38,6 +38,15 @@ typedef struct HostThread {
   uint64_t stack_top;
   uint32_t handle;
   uint64_t id;
+  uint64_t entry, arg;
+  int priority, exited, cancel;
+  /* kernel wait state, guarded by the kernel lock */
+  int wait_kind;
+  uint64_t wait_addr, wait_mutex, wait_seq;
+  uint32_t wait_tag;
+  int woken;
+  void *cv;              /* pthread_cond_t */
+  struct HostThread *next;
 } HostThread;
 extern __thread HostThread *cur_thread;
 

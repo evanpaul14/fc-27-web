@@ -266,6 +266,10 @@ def code_refs(p, fn):
         elif bits(w, 31, 22) == 0b1001000100 and bits(w, 9, 5) in regs:
             v = regs[bits(w, 9, 5)] + bits(w, 21, 10)
             out.add(v)
+        elif bits(w, 31, 22) == 0b1111100101 and bits(w, 9, 5) in regs:  # ldr xT, [xN, #imm]: GOT/PLT slot
+            raw = p.read(regs[bits(w, 9, 5)] + (bits(w, 21, 10) << 3), 8)
+            if raw:
+                out.add(int.from_bytes(raw, 'little'))
     res = set()
     for v in out:
         if v in p.starts:

@@ -2,7 +2,7 @@
 # (run recomp/image.py and recomp/build.py first).
 B := ../build
 CC := cc
-CFLAGS := -O1 -w
+CFLAGS := -O1 -w -mllvm -enable-misched=false -mllvm -global-isel -mllvm -global-isel-abort=0
 GEN := $(wildcard $(B)/gen/*.c)
 OBJ := $(GEN:$(B)/gen/%.c=$(B)/obj/%.o)
 RT := rt/host.c rt/kernel.c rt/a64_rt.c

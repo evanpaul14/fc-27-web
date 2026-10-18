@@ -116,6 +116,7 @@ static int compare(const Test *t, const NState *in, const NState *nat, const CPU
   }
   /* The native stub pushes x0 just below the final SP; ignore those 16 bytes. */
   uint8_t *push = (uint8_t *)nat->sp - 16;
+  if (!memcmp(buf, tr_buf, BUF_SIZE)) return bad;
   for (size_t k = 0; k < BUF_SIZE; k++) {
     uint8_t *p = buf + k;
     if (p >= push && p < push + 16) continue;

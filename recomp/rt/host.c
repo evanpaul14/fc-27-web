@@ -1,6 +1,7 @@
 /* Loader and dispatcher for the recompiled program (stands in for rtld). */
 #include "host.h"
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -11,10 +12,13 @@ __thread HostThread *cur_thread;
 
 /* ---- guest allocations made by the host ---- */
 static uint64_t alloc_next = ALLOC_BASE;
+static pthread_mutex_t alloc_lock = PTHREAD_MUTEX_INITIALIZER;
 uint64_t guest_alloc(uint64_t size, uint64_t align) {
+  pthread_mutex_lock(&alloc_lock);
   uint64_t a = (alloc_next + align - 1) & ~(align - 1);
   if (a + size > ALLOC_END) HDIE("guest_alloc: out of host allocation space\n");
   alloc_next = a + size;
+  pthread_mutex_unlock(&alloc_lock);
   memset(gptr(a), 0, size);
   return a;
 }

@@ -146,6 +146,32 @@ memory is `mem + addr`; with `mem = 0` guest pointers are host pointers.
   FP operands; wasm won't preserve payloads anyway).
   Status: 0 failures on 32,798 distinct instructions x 32 states (seeds 2, 3).
 
+## Recompiled program (build/)
+
+```
+python3 -I recomp/image.py extracted/code build      # relocated main.img + sdk.img, layout.json, symbols.tsv
+python3 -I recomp/build.py build --all                # ~14 min: C for all 310k functions -> build/gen (2.6 GB)
+make -C recomp -j6                                    # build/fifa (native, AArch64 host)
+./build/fifa                                          # FIFA_TRACE=1 logs svcs
+```
+
+- Layout: main at 0x08000000, nnSdk at 0x18000000, host thunks 0x07E00000,
+  unresolved imports 0x07F00000, host allocations (stacks, TLRs)
+  0x1C000000, heap (svcSetHeapSize) 0x20000000, mapped memory 0xE0000000.
+- Startup: the host plays rtld and calls `nn::init::Start(thread, rtld_data,
+  f1, f2, f3)` with host thunks; f2 runs DT_INIT of nnSdk then main. nnSdk
+  itself calls `nninitStartup` and `nnMain`.
+- Both main and nnSdk are recompiled; libc, libc++ and nn::os come from
+  nnSdk's own code. The OS boundary is the svc layer in
+  `recomp/rt/kernel.c` (threads are host pthreads; mutex/condvar/address
+  arbiter semantics follow Atmosphère). `HLE(symbol)` in `recomp/hle/*.c`
+  replaces any function by a host implementation.
+- Compile cost: ~0.58 MB/s of generated C per core with
+  `-O1 -mllvm -enable-misched=false -mllvm -global-isel` (2.5x faster than
+  plain -O1; SelectionDAG combining and the machine scheduler dominated).
+  Translation units are fixed 512 KB address buckets, so rebuilds are
+  incremental unless rt/cpu.h or rt/runtime.h change.
+
 ## Next steps
 
 - Recompiler prototype: ARM64 → C, run natively on macOS first with logging

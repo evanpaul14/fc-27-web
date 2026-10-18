@@ -54,12 +54,46 @@ Texture is in use; expect Oodle (Kraken/etc.) compressed chunks.
    and the DWARF gives us its exact types. `main` itself only uses 14 NVN
    entry points directly (texture/memory-pool setup and readback).
 
+## Static analysis of main
+
+```
+python3 -I tools/analyze.py    extracted/code/main extracted/analysis/main   # ~2 s
+python3 -I tools/reflection.py extracted/code/main extracted/analysis/main   # ~2 s
+python3 -I tools/mkelf.py      extracted/code/main extracted/analysis/main extracted/analysis/main/main.elf
+~/emsdk/upstream/bin/llvm-objdump -d --start-address=0x791d60 --stop-address=0x791e40 extracted/analysis/main/main.elf
+```
+
+- Relocations: 1.23M RELR relative + 12k RELA (ABS64/GLOB_DAT) + 770 JUMP_SLOT.
+  No R_AARCH64_RELATIVE in RELA; the relative ones are all in DT_RELR.
+  Imports get fake addresses at `0x1_0000_0000 + symidx*16`.
+- No C++ RTTI (`-fno-rtti`), and eh_frame only covers 405 functions, so it is
+  no help for function discovery.
+- Function starts: 272,915 from BL targets (64k), text pointers in data (216k)
+  and vtables (42k vtables, 577k slots, recognised by a run of text pointers
+  after two zero qwords). 99.75% of starts directly follow a terminator. The
+  whole 194 MB is real code (~1,500 RETs per MB everywhere).
+- Frostbite reflection survives: 19,188 TypeInfoData records (names, size,
+  GUID, super, fields), 7,697 classes with 52,488 fields → `fb_types.h`,
+  `types.tsv`, `fields.tsv`. Record layout is in `tools/reflection.py`.
+  Kinds seen: 4 (value types), 6 (classes, 12k), 16 (enums), 22 (interfaces),
+  25 (delegates).
+- Not yet resolved: primitive types and a few core bases (`DataContainer`,
+  `Asset`, ...) have no static record with a runtime pointer (they're
+  registered from init code), so they show up as `T_<runtime addr>`. Most common:
+  `T_de8a2a0` (10.7k fields, likely Float32), `T_de8a2c0` (Boolean),
+  `T_de82cc0`/`T_de82df0` (Int32/Uint32), `T_de5beb8` (array/pointer).
+  Infer them from field size/name statistics, or trace the init code.
+- `main.elf` (233 MB, 312k symbols: sub_*, ti_*/rt_* reflection, imports) is
+  ready for Ghidra, but a full Ghidra analysis of 194 MB of code needs many GB
+  of project space and isn't possible with ~2 GB free disk.
+
 ## Next steps
 
-- Load `main.bin` with symbols/relocs into Ghidra (11.2.1 is in
-  LibertyRecomp-web-test/tools); recover RTTI class names and Frostbite asserts.
-- Dump the DWARF types for the `rc2*` interface and the opcode structs.
-- Measure the recompile scale: 194 MB of text is ~48M instructions, roughly
-  10x driver-web. Plan function discovery (eh_frame covers most functions)
-  and how to split the generated code.
-- Disk is nearly full (2 GB free); asset extraction needs about 15 GB more.
+- Name the primitive `T_*` types; tie vtables to reflection classes (class
+  records likely point at their vtable or create function).
+- Dump the DWARF types for the `rc2*` interface and the opcode structs from
+  the `.nrs`.
+- Recompiler design: recursive descent from the 273k starts to find the rest,
+  split the generated C by address range, and decide what to do about
+  NEON/atomics/TLS (tpidr_el0) and nn::os threads.
+- Free disk space before Ghidra or asset work (need ~10–15 GB).

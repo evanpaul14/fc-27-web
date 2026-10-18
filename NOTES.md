@@ -124,6 +124,28 @@ What this means for the recompiler:
   recursive descent from the known starts.
 - `yield` (4k) appears in spin loops; map to a host yield/no-op.
 
+## Translator (recomp/)
+
+`recomp/a64.py` + `recomp/a64_simd.py` decode one A64 word into C against the
+runtime in `recomp/rt/` (`cpu.h`: CPU struct, memory and flag helpers;
+`a64_rt.c`: FRECPE/FRSQRTE tables, AES, 128-bit exclusives, traps). Guest
+memory is `mem + addr`; with `mem = 0` guest pointers are host pointers.
+
+- Coverage: `python3 -I recomp/coverage.py extracted/code/main extracted/analysis/main`
+  (~3 s over 3.8M unique words). Everything in main's text translates except
+  56 words that are data (`0xe7ffdefe` etc.).
+- Exclusives are modelled as CAS against the value the ldxr saw (`LDX`/`STX`
+  in cpu.h), so no monitor emulation or loop pattern matching is needed.
+- **Difftest** (needs an AArch64 host; this Mac is an M1):
+  `DIFFTEST_OUT=/some/dir recomp/difftest/run.sh [per-tag] [seed] [rounds]`
+  samples words from main per decoder tag, runs each one natively inside an
+  asm stub that loads/stores the whole register file, runs the translation
+  from the same random state, and compares GPRs, SP, NZCV, all V registers
+  and a 192 KB memory window. Not covered: branches, PC-relative, exclusives,
+  system registers. NaN payload differences are ignored (clang may commute
+  FP operands; wasm won't preserve payloads anyway).
+  Status: 0 failures on 32,798 distinct instructions x 32 states (seeds 2, 3).
+
 ## Next steps
 
 - Recompiler prototype: ARM64 → C, run natively on macOS first with logging

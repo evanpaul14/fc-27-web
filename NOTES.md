@@ -337,6 +337,22 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     bindless tex (3), SUST `eb20…` (5), SUATOM `ea70…` (2), STS `ef5c…`
     (2) and VOTE `50d9…` (1). (Opcode names are from the encoding
     patterns, not checked against the translator's tables.)
+  - Bindless textures (TEX.B): every handle in the game's shaders (135 in
+    the first 16 fragment programs, plus compute) is `c[2][tex] |
+    c[2][smp]`, NVN separate textures and samplers combined in the
+    shader. Layout of c2 per stage: combined handles at 0x20 + 8 * slot,
+    separate textures at 0x168 + 8 * slot (128), separate samplers at
+    0x568 + 8 * slot. The translator traces the handle register back
+    through MOV / LOP.OR to the two cbuf words (`trace_handle`,
+    straight-line, ignoring branches) and gives each pair a slot; the
+    renderer ORs the two words (`shader_tex_handle`). Separate samplers
+    used to be dropped and separate textures shared the combined table;
+    they now have their own commands and tables. Fragment programs: 1 ->
+    14 of 16 translate; the frame loop went from 0 to ~9,000 draws per
+    2 s, and the FC 27 title screen renders (`FIFA_SCREENSHOT_EVERY`).
+    After it the presented image goes black and the renderer crashes in
+    `renderer_texture` on a guest null-region address (from
+    `fb::DeviceNvn::enqueueProcessFrame`).
 
 - `recomp/rt/apm.c`: `apm` → `ISession` (Set/GetPerformanceConfiguration,
   per-mode configs; reports boost mode to match am's docked state).
@@ -465,11 +481,9 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
 
 ## Next steps
 
-- Renderer (NVN HLE path, Metal): make shaders translate. Bindless
-  texture handles (fragment and compute), then SUST/SUATOM/STS/VOTE and the
-  other unknown instructions; then
-  check that draws land and the presented image shows up
-  (`FIFA_SCREENSHOT_EVERY`).
+- Renderer (NVN HLE path, Metal): the `renderer_texture` crash after the
+  title screen and the black frames after it. Then SUST/SUATOM/STS/VOTE
+  and the other unknown instructions (FS `3b34…`, VS `1887…`).
 - Virtual memory pools (`nvnMemoryPoolMapVirtual`): textures in them have
   no backing buffer yet.
 - Later: the WebGPU RenderCore2 backend (option 2 in Status).

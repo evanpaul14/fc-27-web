@@ -64,6 +64,7 @@ static struct {
     int nstream;
     Range vbuf[16], ubuf[6][18], sbuf[6][16];
     uint64_t tex[6][32], img[6][8];
+    uint64_t septex[6][128], sepsmp[6][32];  // separate texture / sampler handles
     NvnDescPool *tpool, *spool;
     float viewport[16][4];
     int32_t scissor[16][4];
@@ -1083,9 +1084,22 @@ static void snapshots_invalidate(NvnTexture *t) {  // NULL = all
     for (int i = 0; i < 8; i++) if ((!t || snap_tex[i] == t) && snap_ok[i]) { snap_ok[i] = false; snap_why[i] = snap_reason; }
 }
 
+// NVN's texture binding cbuf (c2, per stage): combined handles at 0x20 + 8 * slot, separate textures at
+// 0x168 + 8 * slot, separate samplers at 0x568 + 8 * slot. Bindless shaders OR a separate texture and sampler.
+static uint64_t tex_cbuf_word(int stage, uint32_t off) {
+    if (off >= 0x20 && off < 0x20 + 8 * 32) return st.tex[stage][(off - 0x20) / 8];
+    if (off >= 0x168 && off < 0x168 + 8 * 128) return st.septex[stage][(off - 0x168) / 8];
+    if (off >= 0x568 && off < 0x568 + 8 * 32) return st.sepsmp[stage][(off - 0x568) / 8];
+    return 0;
+}
+
+static uint64_t shader_tex_handle(int stage, const ShaderTexture *t) {
+    if (t->bindless) return (uint32_t)(tex_cbuf_word(stage, t->handle_offset) | tex_cbuf_word(stage, t->bindless_offset));
+    return tex_cbuf_word(stage, t->handle_offset);
+}
+
 static NvnTexture *shader_texture_object(int stage, ShaderTexture *st_) {
-    int slot = ((int)st_->handle_offset - 0x20) / 8;
-    uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
+    uint64_t h = shader_tex_handle(stage, st_);
     uint32_t tic = h & 0xFFFFF;
     if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) return NULL;
     return ((NvnTexEntry *)st.tpool->entries)[tic].tex;
@@ -1164,8 +1178,7 @@ static void resolve_feedback(Prog *pr) {
 static void bind_textures(int stage, ShaderInfo *si) {
     for (int i = 0; i < si->ntex; i++) {
         ShaderTexture *st_ = &si->tex[i];
-        int slot = ((int)st_->handle_offset - 0x20) / 8;  // 64-bit handles from offset 0x20
-        uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
+        uint64_t h = shader_tex_handle(stage, st_);
         id<MTLTexture> tex = nil;
         id<MTLSamplerState> smp = nil;
         uint32_t tic = h & 0xFFFFF, tsc = (uint32_t)(h >> 20) & 0xFFF;
@@ -1362,8 +1375,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     CST("textures");
     for (int i = 0; i < si->ntex; i++) {
         ShaderTexture *st_ = &si->tex[i];
-        int slot = ((int)st_->handle_offset - 0x20) / 8;
-        uint64_t h = (slot >= 0 && slot < 32) ? st.tex[5][slot] : 0;
+        uint64_t h = shader_tex_handle(5, st_);
         id<MTLTexture> tex = nil;
         id<MTLSamplerState> smp = nil;
         uint32_t tic = h & 0xFFFFF, tsc = (uint32_t)(h >> 20) & 0xFFF;
@@ -2201,6 +2213,14 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_BIND_TEXTURES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++)
                 memcpy(&st.tex[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+            break;
+        case CMD_BIND_SEPARATE_TEXTURES:
+            for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 128 && r->x[0] < 6; i++)
+                memcpy(&st.septex[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+            break;
+        case CMD_BIND_SEPARATE_SAMPLERS:
+            for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++)
+                memcpy(&st.sepsmp[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
             break;
         case CMD_BIND_IMAGES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 8 && r->x[0] < 6; i++)

@@ -70,6 +70,10 @@ typedef struct {
     uint32_t omap_target, omap_depth;
     int tex_slot[8192];           // texture index -> Metal slot + 1
     bool tex_weak[64];            // slot type only guessed (from a size query): the next sample decides
+    uint32_t bl_key[64];          // bindless handle cbuf offsets (a << 16 | b), slot + 1 in bl_slot
+    int bl_slot[64], nbl;
+    const uint64_t *words;        // instruction words, and the index of the one being translated
+    size_t cur;
     bool fail;
     bool branchy;  // program uses the pc state machine
     int ipa_mode;  // interpolation mode of the IPA being translated (-1 for plain loads)
@@ -448,10 +452,10 @@ static bool emit_half(Ctx *c, uint64_t w) {
 }
 
 // ------------------------------------------------------------------ textures
-static int tex_slot(Ctx *c, uint32_t index, int type, bool shadow, bool array) {
-    if (index >= 8192) return 0;
-    if (c->tex_slot[index]) {
-        int s = c->tex_slot[index] - 1;
+// `ref` holds the slot + 1 for this texture (0: not allocated yet); a new slot reads its handle at `off`
+static int tex_slot_at(Ctx *c, int *ref, uint32_t off, int type, bool shadow, bool array) {
+    if (*ref) {
+        int s = *ref - 1;
         if (type >= 0 && c->tex_weak[s]) {
             ShaderTexture *t = &c->info->tex[s];
             t->type = (uint8_t)type;
@@ -459,7 +463,7 @@ static int tex_slot(Ctx *c, uint32_t index, int type, bool shadow, bool array) {
             t->is_array = array;
             c->tex_weak[s] = false;
         } else if (c->glsl && type >= 0 && (c->info->tex[s].type != type || c->info->tex[s].shadow != shadow)) {
-            fail(c, "texture %u used as two types", index);  // one GLSL sampler type per binding
+            fail(c, "texture %#x used as two types", off);  // one GLSL sampler type per binding
         }
         return s;
     }
@@ -467,13 +471,83 @@ static int tex_slot(Ctx *c, uint32_t index, int type, bool shadow, bool array) {
     if (weak) type = TEXTYPE_2D;
     int s = c->info->ntex++;
     if (s >= 31) { fail(c, "too many textures"); return 0; }
-    c->tex_slot[index] = s + 1;
+    *ref = s + 1;
     c->tex_weak[s] = weak;
     ShaderTexture *t = &c->info->tex[s];
-    t->handle_offset = index * 4;
+    t->handle_offset = off;
     t->type = (uint8_t)type;
     t->shadow = shadow;
     t->is_array = array;
+    return s;
+}
+
+static int tex_slot(Ctx *c, uint32_t index, int type, bool shadow, bool array) {
+    if (index >= 8192) return 0;
+    return tex_slot_at(c, &c->tex_slot[index], index * 4, type, shadow, array);
+}
+
+// Bindless handles (TEX.B). NVN's separate textures and samplers are combined in the shader: the handle is
+// c[2][texture] | c[2][sampler], read with MOV or as LOP operands and passed through MOV copies. Walk back
+// from instruction `at` to the writes of `r` (straight-line, ignoring branches: in the shaders seen the reads
+// sit in the same block or at the top of the program) and collect the cbuf offsets; -1 if the handle is
+// built any other way.
+static bool writes_reg(uint64_t w, int r) {
+    uint8_t top = (uint8_t)(w >> 56);
+    if (top == 0xe2 || top == 0xe3) return false;  // flow control
+    int d = (int)bits(w, 0, 8);
+    if (d == r) return true;
+    // multi-register results: TEX / TEX.B one register per mask component, TEXS / TLDS two pairs
+    if ((w & 0xfc38000000000000ull) == 0xc038000000000000ull || (w & 0xfff8000000000000ull) == 0xdeb8000000000000ull)
+        return r > d && r < d + __builtin_popcount((unsigned)bits(w, 31, 4));
+    if ((w & 0xf400000000000000ull) == 0xd000000000000000ull) {
+        int d1 = (int)bits(w, 28, 8);
+        return r == d + 1 || (d1 != RZ && (r == d1 || r == d1 + 1));
+    }
+    // other texture fetches, wide loads: up to four
+    return r > d && r <= d + 3 && ((top >= 0xc0 && top < 0xe0) || top == 0xee || top == 0xef || (top & 0xe0) == 0x80);
+}
+
+static int trace_handle(Ctx *c, size_t at, int r, uint32_t *offs, int n, int depth) {
+    if (r == RZ || depth > 6 || n < 0) return -1;
+    for (size_t j = at; j-- > 0;) {
+        if (j % 4 == 0) continue;
+        uint64_t w = c->words[j];
+        if (!writes_reg(w, r)) continue;
+        if (bits(w, 16, 4) != PT) return -1;  // predicated write: the value depends on the path
+        uint64_t op = w & 0xfff8000000000000ull;
+        bool lop_or = bits(w, 41, 2) == 1 && !bits(w, 39, 2);  // LOP.OR, neither operand inverted
+        if (op == 0x5c98000000000000ull) return trace_handle(c, j, (int)bits(w, 20, 8), offs, n, depth + 1);  // MOV
+        if (op == 0x4c98000000000000ull || (op == 0x4c40000000000000ull && lop_or)) {  // MOV / LOP.OR with c[]
+            if (bits(w, 34, 5) != 2 || n >= 2) return -1;
+            offs[n++] = (uint32_t)bits(w, 20, 14) * 4;
+            return op == 0x4c98000000000000ull ? n : trace_handle(c, j, (int)bits(w, 8, 8), offs, n, depth + 1);
+        }
+        if (op == 0x5c40000000000000ull && lop_or) {  // LOP.OR with two registers
+            n = trace_handle(c, j, (int)bits(w, 8, 8), offs, n, depth + 1);
+            return trace_handle(c, j, (int)bits(w, 20, 8), offs, n, depth + 1);
+        }
+        return -1;
+    }
+    return -1;  // read before any write
+}
+
+static int tex_slot_bindless(Ctx *c, uint32_t a, uint32_t b, int type, bool shadow, bool array) {
+    if (a > b) { uint32_t t = a; a = b; b = t; }
+    uint32_t key = a << 16 | b;
+    int i = 0;
+    while (i < c->nbl && c->bl_key[i] != key) i++;
+    if (i == c->nbl) {
+        if (i == 64) { fail(c, "too many textures"); return 0; }
+        c->bl_key[c->nbl++] = key;
+    }
+    bool fresh = !c->bl_slot[i];
+    int s = tex_slot_at(c, &c->bl_slot[i], a, type, shadow, array);
+    if (fresh && !c->fail) {
+        ShaderTexture *t = &c->info->tex[s];
+        t->bindless = true;
+        t->bindless_cbuf = 2;
+        t->bindless_offset = b;
+    }
     return s;
 }
 
@@ -757,13 +831,20 @@ static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
     bool array = bits(w, 28, 1), dc = bits(w, 50, 1), aoffi = bindless ? bits(w, 36, 1) : bits(w, 54, 1);
     uint32_t mask = (uint32_t)bits(w, 31, 4);
     int lod_mode = bindless ? (int)bits(w, 37, 3) : (int)bits(w, 55, 3);  // 0 none, 1 lz, 2 lb, 3 ll, 6 lba, 7 lla
-    if (bindless) { fail(c, "bindless tex"); return; }
     int type = target == 0 ? (array ? TEXTYPE_1D_ARRAY : TEXTYPE_1D)
              : target == 1 ? (array ? TEXTYPE_2D_ARRAY : TEXTYPE_2D)
              : target == 2 ? TEXTYPE_3D
                            : (array ? TEXTYPE_CUBE_ARRAY : TEXTYPE_CUBE);
     int ncoord = target == 0 ? 1 : target == 1 ? 2 : 3;
-    int slot = tex_slot(c, index, type, dc, array);
+    int slot;
+    if (bindless) {
+        uint32_t ho[2];
+        if (trace_handle(c, c->cur, b, ho, 0, 0) != 2) { fail(c, "bindless tex at %#zx: handle r%d not from c[2]", c->cur * 8, b); return; }
+        slot = tex_slot_bindless(c, ho[0], ho[1], type, dc, array);
+        b++;  // the handle is the first meta register; LOD, offset and reference follow it
+    } else {
+        slot = tex_slot(c, index, type, dc, array);
+    }
     if (c->glsl) {  // same register layout as below
         char cs[3][40], lay[96], lodv[48], offv[96], drv[48], gcall[4096];
         const char *co[3], *layp = NULL, *lodp = NULL, *offp = NULL, *drp = NULL;
@@ -1987,8 +2068,10 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     static int annotate = -1;
     if (annotate < 0) annotate = getenv("LARECOMP_SAVE_MSL") != NULL;
     c->branchy = any_branch;
+    c->words = (const uint64_t *)code;
     for (size_t i = 0; i < end && !c->fail; i++) {
         if (i % 4 == 0) continue;
+        c->cur = i;
         uint32_t pc = (uint32_t)(i * 8);
         if (any_branch && label[i]) sp(&c->body, "  case %uu:\n", pc);
         if (annotate) sp(&c->body, "    // pc %x: %016llx\n", pc, (unsigned long long)((const uint64_t *)code)[i]);

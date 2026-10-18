@@ -51,6 +51,8 @@ typedef struct {
     uint32_t handle_offset;  // byte offset of the texture handle in the bound texture cbuf
     uint8_t type;            // TEXTYPE_*
     bool shadow, is_array, is_image, bindless;
+    // bindless (TEX.B): the handle is c[bindless_cbuf][handle_offset] | c[bindless_cbuf][bindless_offset]
+    // (NVN separate texture and sampler handles)
     uint32_t bindless_cbuf, bindless_offset;
 } ShaderTexture;
 

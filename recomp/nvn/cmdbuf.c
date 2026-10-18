@@ -165,15 +165,20 @@ NVN(nvnCommandBufferBindImage) {
     r->x[0] = s.x[1]; r->x[1] = s.x[2]; r->x[2] = 1;
     memcpy(r->extra, &s.x[3], 8);
 }
-NVN(nvnCommandBufferBindSeparateTextures) { record_copy(c, CMD_BIND_TEXTURES, 4, (uint32_t)A(3) * 8); }
+NVN(nvnCommandBufferBindSeparateTextures) { record_copy(c, CMD_BIND_SEPARATE_TEXTURES, 4, (uint32_t)A(3) * 8); }
 NVN(nvnCommandBufferBindSeparateTexture) {
     Snap s = snap(c);
-    CmdRec *r = record(c, CMD_BIND_TEXTURES, 8, &s);
+    CmdRec *r = record(c, CMD_BIND_SEPARATE_TEXTURES, 8, &s);
     r->x[0] = s.x[1]; r->x[1] = s.x[2]; r->x[2] = 1;
     memcpy(r->extra, &s.x[3], 8);
 }
-NVN(nvnCommandBufferBindSeparateSamplers) { (void)c; }
-NVN(nvnCommandBufferBindSeparateSampler) { (void)c; }
+NVN(nvnCommandBufferBindSeparateSamplers) { record_copy(c, CMD_BIND_SEPARATE_SAMPLERS, 4, (uint32_t)A(3) * 8); }
+NVN(nvnCommandBufferBindSeparateSampler) {
+    Snap s = snap(c);
+    CmdRec *r = record(c, CMD_BIND_SEPARATE_SAMPLERS, 8, &s);
+    r->x[0] = s.x[1]; r->x[1] = s.x[2]; r->x[2] = 1;
+    memcpy(r->extra, &s.x[3], 8);
+}
 NVN(nvnCommandBufferBindTransformFeedbackBuffers) { (void)c; }
 NVN(nvnCommandBufferBindTransformFeedbackBuffer) { (void)c; }
 NVN(nvnCommandBufferBindCoverageModulationTable) { (void)c; }

@@ -205,6 +205,7 @@ static uint64_t get_info(uint32_t type, uint64_t sub, uint32_t *res) {
   case 23: return 1;                        /* is application */
   case 24: return 64;                       /* free thread count */
   case 25: return 0;                        /* thread tick count */
+  case 28: return 0;                        /* alias region extra size (18.0.0+) */
   default:
     HLOG("[svc] GetInfo type %u sub %#llx unimplemented\n", type, (unsigned long long)sub);
     *res = R_INVALID_ENUM;

@@ -587,6 +587,29 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   - LEA / LEA.HI (reg, cbuf, imm) in the Maxwell translator: 211 vertex
     programs in the match used LEA.HI.
   - Crash reports print host frames (fp chain) before the guest ones.
+- Match shaders (2026-10-19): skipped draws in the match went from ~7,000
+  to ~230 per 2 s (the 3D scene is still black, see Next steps).
+  - Offline check: `build/shtool [-c] [-o dir] build/shaders/*_code.bin`
+    (build line in `recomp/nvn/maxwell/shtool.m`) translates every dump
+    from `FIFA_DUMP_SHADERS` and counts failures by error/opcode; `-c` also
+    compiles the MSL through Metal (no offline `metal` without Xcode). It
+    scans 0x10000 bytes instead of up to the program's constants, so a
+    few "unknown instructions" (`3b03`, `bf52`, ...) are constant data that
+    the game never reaches. Compute programs are dumped too now (`_s5_`).
+  - TLD (`dc38`, texel fetch, all `.LZ` 2D so far, handles in the separate
+    texture range of c[2]) and TLD4.B (`defa`/`defe`/`defc`, bindless
+    gather: handle first at Rb, offset type bits 36-37 with 6-bit AOFFI
+    offsets, component bits 38-39, `.DC` bit 50 -> `gather_compare`).
+  - Bindless handle tracing gave up on most of the "not from c[2]" cases
+    because `writes_reg` took FSETP/ISETP (bits 0-5 are predicates: P0, PT
+    reads as r7), DEPBAR, stores and LDG.32 (counted as 4 registers) for
+    writes to the handle register. 44 -> 7 failures; the rest are an
+    indexed `LDC c[2][r + 0x168]` texture array and handles written under a
+    predicate.
+  - Metal allows 16 samplers per stage; some fragment programs sample 20
+    textures. Bindless textures with the same sampler word share one
+    `[[sampler(n)]]` (`ShaderTexture.sampler`), the renderer binds by it.
+  - `FIFA_CONTROL`'s `shot <path>` silently truncated paths over 63 chars.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -732,14 +755,16 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   To Watch" with streamed portraits) and the line-up graphics render, then a
   black screen with the PL logo, and then the match itself runs: HUD
   (BOU 0-0 BHA, clock running, radar with moving players, player names,
-  "Difficulty changed to Beginner"), but the 3D scene is black while
-  10-20k draws/s are still skipped
-  (`skipped (a/b/c/d/e/f)` in the stats line: no program / program not
-  translated / pipeline compiling / compile started / pipeline failed /
-  draw mode). Next: the remaining untranslated shaders (VS `5bdf` was LEA
-  and is done; compute `eb20`/`eb10`/`ef5c` (SUST/SULD/ATOM?), FS
-  `defa`/`dc38`, bindless handles not from c[2]) and the ~120 failing
-  pipelines.
+  "Difficulty changed to Beginner"), but the 3D scene is black. Skips are
+  down to ~230 per 2 s (`skipped (a/b/c/d/e/f)` in the stats line: no
+  program / program not translated / pipeline compiling / compile started
+  / pipeline failed / draw mode) and the frame rate fell to ~11 fps with
+  the extra draws. Most likely cause of the black scene: compute programs
+  that don't translate (lighting/post in Frostbite is compute): SUST
+  `eb20` (24 programs), SULD `eb10` (4), `ef5c`/`ef5d`/`ef5e` (5+1+2,
+  ATOMS/LDS-family?), VOTE `50d9` (3). Also FS SUST (3), TXD.B `de7a`
+  (2), 7 bindless handles (indexed / predicated), and dual-source blending
+  pipelines ("does not write to color(0), index(1)").
 - Try the keyboard and a gamepad in the visible window;
   audio output for `audout.c`'s sink thread; the dark Continue button on
   the accessibility screen (seen before the threading fix; check if it

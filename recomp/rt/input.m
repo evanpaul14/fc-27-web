@@ -185,7 +185,7 @@ static uint64_t button_named(const char *name) {
 }
 
 static void control_command(char *cmd) {
-    char a[64] = {0}, b[64] = {0};
+    char a[64] = {0}, b[256] = {0};
     double x = 0, y = 0;
     long n = 0;
     int k = sscanf(cmd, "%63s", a);
@@ -200,7 +200,7 @@ static void control_command(char *cmd) {
         add_press((Press){now + 1, now + 1 + n, 0, (int32_t)(x * STICK_MAX), (int32_t)(y * STICK_MAX), *b == 'l' ? 1 : 2});
         wait_frame(now + 1 + n + 2);
     } else if (!strcmp(a, "shot")) {
-        if (sscanf(cmd, "%*s %63s", b) != 1) strcpy(b, "build/live.png");
+        if (sscanf(cmd, "%*s %255s", b) != 1) strcpy(b, "build/live.png");
         uint64_t done = atomic_load(&shots_done);
         free(atomic_exchange(&shot_path, strdup(b)));
         while (atomic_load(&shots_done) == done) usleep(2000);

@@ -1230,8 +1230,8 @@ static void bind_textures(int stage, ShaderInfo *si) {
             if (vt) LOG("target %u fmt %#x %ux%u addr %llx", vt->target, vt->format, vt->width, vt->height, (unsigned long long)vt->addr);
             LOG(" mtl type %lu %lux%lu\n", (unsigned long)tex.textureType, (unsigned long)tex.width, (unsigned long)tex.height);
         }
-        if (stage == 0) { [enc setVertexTexture:tex atIndex:i]; [enc setVertexSamplerState:smp atIndex:i]; }
-        else { [enc setFragmentTexture:tex atIndex:i]; [enc setFragmentSamplerState:smp atIndex:i]; }
+        if (stage == 0) { [enc setVertexTexture:tex atIndex:i]; [enc setVertexSamplerState:smp atIndex:st_->sampler]; }
+        else { [enc setFragmentTexture:tex atIndex:i]; [enc setFragmentSamplerState:smp atIndex:st_->sampler]; }
     }
 }
 
@@ -1301,6 +1301,7 @@ static CsProg *compute_program(NvnProgram *p) {
     if (v) { CsProg *cp = v.pointerValue; return cp->failed ? NULL : cp; }
     CsProg *cp = calloc(1, sizeof *cp);
     progs[key] = [NSValue valueWithPointer:cp];
+    dump_program(p);
     ShaderKey k = {0};
     cp->si = maxwell_translate(gptr(ss->code_addr), ss->const_offset ? ss->const_offset : 0x10000, STAGE_COMPUTE, &k);
     if (!cp->si->msl) { LOG("[compute] translate failed: %s (code %llx)\n", cp->si->error, ss->code_addr); cp->failed = true; return NULL; }
@@ -1414,7 +1415,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         }
         if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = sampler_for(&((NvnSamplerDesc *)st.spool->entries)[tsc]);
         [ce setTexture:tex ? tex : dummy_texture(st_->type) atIndex:i];
-        [ce setSamplerState:smp ? smp : default_sampler() atIndex:i];
+        [ce setSamplerState:smp ? smp : default_sampler() atIndex:st_->sampler];
     }
     if (si->uses_rscale) {
         float rs[65][4] = {{1, 1, 0, 0}};

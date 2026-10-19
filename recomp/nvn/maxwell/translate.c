@@ -494,6 +494,18 @@ static int tex_slot(Ctx *c, uint32_t index, int type, bool shadow, bool array) {
 static bool writes_reg(uint64_t w, int r) {
     uint8_t top = (uint8_t)(w >> 56);
     if (top == 0xe2 || top == 0xe3) return false;  // flow control
+    // no register result: set-predicate ops (bits 0-5 are predicates: FSETP P0, PT reads as r7), stores
+    // (bits 0-7 are the data), barriers
+    uint16_t op = (uint16_t)(w >> 48);
+    uint16_t o8 = op & 0xfff8;
+    if ((op & 0xfff0) == 0x5bb0 || (op & 0xfff0) == 0x4bb0 || (op & 0xfef0) == 0x36b0 ||  // FSETP
+        (op & 0xfff0) == 0x5b60 || (op & 0xfff0) == 0x4b60 || (op & 0xfef0) == 0x3660 ||  // ISETP
+        (op & 0xfff0) == 0x5b80 || (op & 0xfff0) == 0x4b80 || (op & 0xfef0) == 0x3680 ||  // DSETP
+        o8 == 0x5d20 || (op & 0xfe80) == 0x7e80 || (op & 0xfe80) == 0x7e00 ||              // HSETP2
+        o8 == 0x5090 || o8 == 0x50a0 || (op & 0xfef8) == 0x38c0 ||                         // PSETP, CSETP, R2P
+        o8 == 0xeff0 || o8 == 0xeed8 || o8 == 0xef58 || o8 == 0xef50 || (op & 0xe000) == 0xa000 ||  // ST a[], STG, STS, STL, ST
+        o8 == 0xebf8 || o8 == 0xeb20 || o8 == 0xf0f0 || o8 == 0xf0a8 || o8 == 0xef98 || o8 == 0x50b0 || o8 == 0xf0f8)
+        return false;  // RED, SUST, DEPBAR, BAR, MEMBAR, NOP, SYNC
     int d = (int)bits(w, 0, 8);
     if (d == r) return true;
     // multi-register results: TEX / TEX.B one register per mask component, TEXS / TLDS two pairs
@@ -503,7 +515,12 @@ static bool writes_reg(uint64_t w, int r) {
         int d1 = (int)bits(w, 28, 8);
         return r == d + 1 || (d1 != RZ && (r == d1 || r == d1 + 1));
     }
-    // other texture fetches, wide loads: up to four
+    // loads: LDG / LDL / LDS / LDC size in bits 48-50, LD in 53-55 (5 = .64, 6 = .128)
+    if (o8 == 0xeed0 || o8 == 0xef40 || o8 == 0xef48 || o8 == 0xef90 || (op & 0xe000) == 0x8000) {
+        int sz = (op & 0xe000) == 0x8000 ? (int)bits(w, 53, 3) : (int)bits(w, 48, 3);
+        return r > d && r < d + (sz == 5 ? 2 : sz == 6 ? 4 : 1);
+    }
+    // other texture fetches: up to four
     return r > d && r <= d + 3 && ((top >= 0xc0 && top < 0xe0) || top == 0xee || top == 0xef || (top & 0xe0) == 0x80);
 }
 
@@ -901,6 +918,84 @@ static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
     write_tex_result(c, slot, call, mask, d, RZ, false, false);
 }
 
+// TLD (texel fetch, full form): coordinates at gpr8 (array layer first), then at gpr20 the LOD (.LL), the
+// offset (.AOFFI) and the sample (.MS). Bits as TEX: 28-30 target, 31-34 mask, 36-48 handle, 55 .LL (else .LZ).
+static void emit_tld(Ctx *c, uint64_t w) {
+    int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), b = (int)bits(w, 20, 8);
+    uint32_t index = (uint32_t)bits(w, 36, 13);
+    int target = (int)bits(w, 29, 2);
+    bool array = bits(w, 28, 1), aoffi = bits(w, 35, 1), ms = bits(w, 50, 1), ll = bits(w, 55, 1);
+    uint32_t mask = (uint32_t)bits(w, 31, 4);
+    if (c->glsl) { fail(c, "tld (GLSL)"); return; }
+    if (ms || bits(w, 54, 1)) { fail(c, "tld .ms/.cl"); return; }
+    if (target == 3 || (target == 2 && array)) { fail(c, "tld target %d%s", target, array ? " array" : ""); return; }
+    int type = target == 0 ? (array ? TEXTYPE_1D_ARRAY : TEXTYPE_1D) : target == 1 ? (array ? TEXTYPE_2D_ARRAY : TEXTYPE_2D)
+                                                                                 : TEXTYPE_3D;
+    int slot = tex_slot(c, index, type, false, array);
+    int ar = a, pr = b;
+    char layer[32] = "", lod[32] = "0u", off[96] = "", co[512], call[1024];
+    if (array) { sprintf(layer, ", uint(r%d)", a); c->reg_used[a] = 1; ar = a + 1; }
+    for (int i = 0; i < (target == 0 ? 1 : target == 1 ? 2 : 3); i++) c->reg_used[ar + i] = 1;
+    if (ll) { sprintf(lod, "r%d", pr); c->reg_used[pr++] = 1; }
+    if (aoffi) {
+        c->reg_used[pr] = 1;
+        sprintf(off, " + int2(int(r%d << 28) >> 28, int(r%d << 24) >> 28)", pr, pr);
+        pr++;
+    }
+    if (target == 0) {
+        if (aoffi) sprintf(co, "uint(int(r%d) + (int(r%d << 28) >> 28))", ar, pr - 1);
+        else sprintf(co, "r%d", ar);
+        sprintf(call, "t%d.read(%s%s)", slot, co, layer);  // Metal's 1D reads take no LOD
+    } else if (target == 1) {
+        sprintf(co, "%s", RSC2(c, slot, "uint2(int2(r%d, r%d)%s)", ar, ar + 1, off));
+        sprintf(call, "t%d.read(%s%s, %s)", slot, co, layer, lod);
+    } else {
+        if (aoffi) { fail(c, "tld 3d offset"); return; }
+        sprintf(call, "t%d.read(uint3(r%d, r%d, r%d), %s)", slot, ar, ar + 1, ar + 2, lod);
+    }
+    write_tex_result(c, slot, call, mask, d, RZ, false, false);
+}
+
+// TLD4.B (bindless gather): coordinates at gpr8 (array layer first); at gpr20 the handle, then the offset
+// (bits 36-37: 0 none, 1 .AOFFI, 2 .PTP) and the depth reference (.DC, bit 50). Bits 38-39 pick the component.
+static void emit_tld4_bindless(Ctx *c, uint64_t w) {
+    int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), b = (int)bits(w, 20, 8);
+    int target = (int)bits(w, 29, 2), offmode = (int)bits(w, 36, 2), comp = (int)bits(w, 38, 2);
+    bool array = bits(w, 28, 1), dc = bits(w, 50, 1);
+    uint32_t mask = (uint32_t)bits(w, 31, 4);
+    if (c->glsl) { fail(c, "tld4 (GLSL)"); return; }
+    if (target == 0 || target == 2 || offmode > 1) { fail(c, "tld4 target %d offset %d", target, offmode); return; }
+    int type = target == 1 ? (array ? TEXTYPE_2D_ARRAY : TEXTYPE_2D) : (array ? TEXTYPE_CUBE_ARRAY : TEXTYPE_CUBE);
+    uint32_t ho[2];
+    if (trace_handle(c, c->cur, b, ho, 0, 0) != 2) { fail(c, "bindless tex at %#zx: handle r%d not from c[2]", c->cur * 8, b); return; }
+    int slot = tex_slot_bindless(c, ho[0], ho[1], type, dc, array);
+    int ar = a, pr = b + 1;
+    char coords[160] = "", layer[64] = "", off[96] = "", dref[48] = "", tmp[48], call[1024];
+    if (array) { sprintf(layer, ", min(uint(r%d), t%d.get_array_size() - 1u)", a, slot); c->reg_used[a] = 1; ar = a + 1; }
+    int ncoord = target == 1 ? 2 : 3;
+    for (int i = 0; i < ncoord; i++) {
+        sprintf(tmp, "%sas_type<float>(r%d)", i ? ", " : "", ar + i);
+        c->reg_used[ar + i] = 1;
+        strcat(coords, tmp);
+    }
+    if (offmode == 1) {
+        if (target != 1) { fail(c, "tld4 cube offset"); return; }
+        c->reg_used[pr] = 1;
+        sprintf(off, ", int2(int(r%d << 26) >> 26, int(r%d << 18) >> 26)", pr, pr);  // 6-bit offsets for gathers
+        pr++;
+    } else if (target == 1) {
+        strcpy(off, ", int2(0)");
+    }
+    if (dc) { c->reg_used[pr] = 1; sprintf(dref, ", as_type<float>(r%d)", pr); pr++; }
+    const char *vec = ncoord == 2 ? "float2" : "float3";
+    static const char *const comps[] = {"x", "y", "z", "w"};
+    if (dc)
+        sprintf(call, "t%d.gather_compare(s%d, %s(%s)%s%s%s)", slot, slot, vec, coords, layer, dref, off);
+    else
+        sprintf(call, "t%d.gather(s%d, %s(%s)%s%s, component::%s)", slot, slot, vec, coords, layer, off, comps[comp]);
+    write_tex_result(c, slot, call, mask, d, RZ, false, false);
+}
+
 // ------------------------------------------------------------------ instruction translation
 static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     char t[2048], u[2048];
@@ -998,6 +1093,10 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         emit_tex(c, w, false);
     } else if (OPM(0xdeb8000000000000ull, 0xfff8000000000000ull)) {  // TEX.B (bindless)
         emit_tex(c, w, true);
+    } else if (OPM(0xdc38000000000000ull, 0xff38000000000000ull)) {  // TLD
+        emit_tld(c, w);
+    } else if (OPM(0xdef8000000000000ull, 0xfff8000000000000ull)) {  // TLD4.B (bindless gather)
+        emit_tld4_bindless(c, w);
     } else if (OPM(0xdf48000000000000ull, 0xfff8000000000000ull)) {  // TXQ
         uint32_t index = (uint32_t)bits(w, 36, 13);
         int qt = (int)bits(w, 22, 6);
@@ -2176,12 +2275,24 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         sp(&args, ", constant float4 *ltint [[buffer(19)]]");
         info->uses_tint = true;
     }
+    Str salias = {0};  // samplers shared with an earlier texture
+    int nsamplers = 0;
     for (int i = 0; i < info->ntex; i++) {
         ShaderTexture *t = &info->tex[i];
         const char *tn = tex_type_name(t->type);
-        if (t->shadow) sp(&args, ", depth%s<float> t%d [[texture(%d)]], sampler s%d [[sampler(%d)]]", tn, i, i, i, i);
-        else sp(&args, ", texture%s<float> t%d [[texture(%d)]], sampler s%d [[sampler(%d)]]", tn, i, i, i, i);
+        int same = -1;
+        for (int j = 0; j < i && t->bindless && same < 0; j++)
+            if (info->tex[j].bindless && info->tex[j].bindless_offset == t->bindless_offset) same = j;
+        sp(&args, t->shadow ? ", depth%s<float> t%d [[texture(%d)]]" : ", texture%s<float> t%d [[texture(%d)]]", tn, i, i);
+        if (same >= 0) {
+            t->sampler = info->tex[same].sampler;
+            sp(&salias, "  sampler s%d = s%d;\n", i, same);
+        } else {
+            t->sampler = (uint8_t)nsamplers++;
+            sp(&args, ", sampler s%d [[sampler(%d)]]", i, t->sampler);
+        }
     }
+    if (nsamplers > 16) fail(c, "%d samplers", nsamplers);
     if (stage == STAGE_VERTEX) {
         sp(&s, "vertex VOut main0(VIn in [[stage_in]], uint vid [[vertex_id]], uint iid [[instance_id]]%s%s) {\n",
            (maxwell_dbg_vs && blob == maxwell_dbg_vs) ? ", device float4 *dbgout [[buffer(29)]]" : "",
@@ -2198,6 +2309,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     }
     free(args.buf);
     if (info->uses_gmem && !c->glsl) sp(&s, "  device uchar *gmem = (device uchar *)gmem_win.x;\n");
+    if (salias.buf) { sp(&s, "%s", salias.buf); free(salias.buf); }
     for (int i = 0; i < 256; i++)
         if (c->reg_used[i]) sp(&s, "  uint r%d = 0;\n", i);
     for (int i = 0; i < 7; i++)
@@ -2251,6 +2363,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     } else {
         sp(&s, "  return;\n}\n");
     }
+    if (c->fail) { free(s.buf); free(c->body.buf); free(c); return info; }  // (failures in the declarations)
     info->msl = s.buf;
     info->attr_mask = c->in_attr_mask;
     info->out_mask = stage == STAGE_FRAGMENT ? c->omap_target : c->out_attr_mask;

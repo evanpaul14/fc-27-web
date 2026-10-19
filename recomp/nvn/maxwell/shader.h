@@ -54,6 +54,7 @@ typedef struct {
     // bindless (TEX.B): the handle is c[bindless_cbuf][handle_offset] | c[bindless_cbuf][bindless_offset]
     // (NVN separate texture and sampler handles)
     uint32_t bindless_cbuf, bindless_offset;
+    uint8_t sampler;         // MSL sampler binding: bindless textures with the same sampler word share one (Metal has 16)
 } ShaderTexture;
 
 typedef struct {

@@ -308,7 +308,12 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   colour target to `build/pass_*.png` and sampled 2D textures to
   `build/dtex_*.png`), `FIFA_DUMP_SHADERS=1` (code and control sections to
   `build/shaders/<addr>_s<stage>_*.bin`), `FIFA_DBG_FS=addr:pc:reg`
-  (register probe; pc `ffffffff` = solid white), `FIFA_LOG_POOLS=1`; LAS's
+  (register probe; pc `ffffffff` = solid white), `FIFA_DUMP_VB=1` (first
+  6 raw vertices of stream 0 per debug-frame draw; also calls
+  `dbg_vb_hook(host, guest)` for lldb), `FIFA_DUMP_VSUBO=1`,
+  `FIFA_LOG_POOLS=1`; the debug frame's `[dtex]` lines give each sampled
+  texture's tic, format, guest address and how many of its guest bytes are
+  nonzero (CPU-written data vs GPU-only contents); LAS's
   `LARECOMP_*` switches are `FIFA_*`. Compute programs are also written to
   `build/cs_<n>.bin` as they're first dispatched.
   - GPU memory: the game's ~200 memory pools (671 MB) lie spread over
@@ -388,10 +393,57 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     alpha 0, i.e. hidden), so nothing visible lands in the UI target. It
     looks like the game legitimately shows nothing - a fade or a screen
     waiting on something (input: hid is a stub; a movie; a load) - but
-    that isn't confirmed. Open check: `FIFA_DBG_FS=16ebcaf00:ffffffff:0`
-    (force white) still gave an all-zero image even on title frames, so
-    either the probe doesn't work for that program or its draw doesn't
-    run; settle that before trusting probe results.
+    that isn't confirmed.
+    Findings (2026-10-18, second pass):
+    - The white probe works: `FIFA_DBG_FS=16ebcaf00:ffffffff:0` makes
+      every presented frame white, black ones included, so the composite
+      runs every frame and its inputs are black. (The earlier all-zero
+      result was stale.)
+    - The 135 quads are text. Format: a0 = (x, y, 0, -1) with w = -1
+      meaning "alpha from the texture's red channel", a1 = uv, a2 = add
+      colour 0, a3 = multiply colour (0,0,0,1). They sample tic 472, a
+      1364x1364 R8 glyph atlas (flags 0) whose *guest* bytes are all zero,
+      and all six vertices of every quad are byte-identical in guest
+      memory (`FIFA_DUMP_VB`). The UVs step by exactly one texel per glyph
+      (1/1364, 2/1364, ...): the glyph cache hands out 0x0 slots plus
+      1 px padding. So glyphs come out empty in the game's own data, not
+      in our renderer. The screen is the press-start screen
+      (`FONT_DEMO_PRESS_START_SCREEN` is one of the styles).
+    - UI is EA Twinkle (JS) with EAText/FreeType fonts and GPU SDF glyph
+      generation (`Twinkle/GlyphGenSdf_Inside/_Outside`, programs set up
+      in `sub_921cfd0`).
+    - Font lookup: the font server's vtable slot 2 (`sub_5d20540`) walks
+      its list of registered fonts (`[this+8]`, next `+0x18`, names
+      `+0x28`/`+0x48`), then falls back to the file
+      `"%s/%s.ttf"` under `data/ui/fonts` through Frostbite's VFS. Only
+      `EABold` (from the file) is ever registered. `EACondBlackItalic`,
+      used by most styles (`FONT_HEADER_*`, `FONT_LABEL_*_BOLD`,
+      `FONT_TILE_*`), fails every frame ("Error: font %s does not exist!"
+      at 0x5d20c58). It ships as an asset (`Fonts/EACondBlackItalic`,
+      `Fonts/EACondBlackItalicCollection`, `TrueTypeFontAsset` /
+      `UITtfFontFile`), not as a loose `.ttf`, so the asset-side font
+      provider never gets it. Why is open.
+    - VFS lookup (`sub_1b95f00` -> `sub_1b95ff0`): a list of mounted
+      layers (vector at 0x15426f40 at run time, 0x58-byte records; per
+      layer `P=[L+0x10]`, `T=[P+8]`, count `u32 [T+0xc]`, entries
+      `[T+0x10]` of 0x1c bytes starting with the u64 FNV-1 hash of the
+      ASCII-lowercased path, sorted, binary search). 11 layers: initfs
+      (85 files), 11,373 files, and nine single-file layers. Fonts in them:
+      `data/ui/fonts/{EABold,EAMedium,EAExpandedHeavy}.ttf` plus Japanese/
+      SChinese variants; no `EACond*` at all, on hardware either.
+    - Substituting EABold for every missing font (all fonts then load)
+      changes nothing: same zero-size quads, same empty atlas. So the
+      missing font is real but not sufficient. Glyph generation itself
+      fails. Next: find who writes the quads (an lldb watchpoint on the
+      first quad's vertices via `dbg_vb_hook`; the vertex ring sits at
+      the same guest address, 0x201b1b200, in every run without lldb),
+      then the glyph metrics and GPU SDF path.
+    - RomFS reads (`FIFA_LOG_ROMFS=1`): every superbundle TOC except
+      `storyingamesba` and the unused `loc/*.toc` gets read; no fs errors.
+  - Seen once (no debug options, ~frame 200): Frostbite small-block
+    allocator trap `udf #0x8002` at 0x18172fc, reached from `sub_181b310`
+    when a freelist's next pointer lies outside its arena, i.e. heap
+    corruption. Not investigated.
   - Seen once (with heavy debug logging, ~frame 144): guest null read
     (0x18) in `F_116768b0`; a 3-minute run without logging didn't hit it.
 
@@ -428,6 +480,11 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   unit around a call (`c->x[30] = 0x<ret>ull; F_<target>(c);`), `make`
   rebuilds just that unit, then restore it (`build.py build --all` leaves
   it alone because only inputs are hashed, so copy the original back).
+  Probes can read guest memory with `G(addr)` (cpu.h) and call the helpers
+  in `recomp/hle/debug.c`: `dbg_memscan(str, ctx, max)` (find a string in
+  resident guest memory; this is how the font asset names and UI style
+  data were found), `dbg_strings(addr, len, minlen)`. A guest address A in
+  `main` is A - 0x08000000 in `main.elf`.
 
 - `recomp/rt/am.c`: `appletOE` → `IApplicationProxy` and its
   sub-interfaces. Each interface is its own `Service`, so unknown commands
@@ -523,9 +580,11 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
 
 ## Next steps
 
-- Black frames after the title screen (see Status for what's ruled
-  out): check the white-probe result first, then whether the game is
-  waiting for input (hid) or a movie. Then SUST/SUATOM/STS/VOTE
+- Black frames after the title screen (see Status, "Findings"): the
+  press-start screen's text renders as zero-size glyphs from an empty
+  atlas. Find the quad writer, then why glyphs are empty (GPU SDF glyph
+  generation, FreeType metrics) and why the `Fonts/EACondBlackItalic`
+  asset never registers. Then SUST/SUATOM/STS/VOTE
   and the other unknown instructions (FS `3b34…`, VS `1887…`).
 - Later: the WebGPU RenderCore2 backend (option 2 in Status).
 - `nvdrv`: real responses for Open/Initialize/ioctls the driver init needs

@@ -1207,6 +1207,14 @@ static void bind_textures(int stage, ShaderInfo *si) {
             static int dn;
             char path[128];
             snprintf(path, sizeof path, "build/dtex_%03d_%d.png", dn++, i);
+            NvnTexture *dt = h && st.tpool && tic < (uint32_t)st.tpool->count ? ((NvnTexEntry *)st.tpool->entries)[tic].tex : NULL;
+            if (dt) {
+                size_t nz = 0, n = dt->addr ? (size_t)dt->width * dt->height : 0;  // >= 1 byte per texel
+                const uint8_t *g = n ? gptr(dt->addr) : NULL;
+                for (size_t k = 0; k < n; k++) nz += g[k] != 0;
+                LOG("[dtex] %03d tic %u %ux%u fmt %#x fl %#x addr %llx pool %p+%llx nonzero %zu/%zu '%s'\n", dn - 1, tic, dt->width,
+                    dt->height, dt->format, dt->flags, dt->addr, (void *)dt->pool, dt->pool_offset, nz, n, dt->label);
+            }
             renderer_save_texture(tex, path);
             snprintf(path, sizeof path, "build/dtex_%03d_%d_a.png", dn - 1, i);
             renderer_save_texture_alpha(tex, path);
@@ -1471,6 +1479,19 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         LOG("[vsubo] v%d (%llu):", i, st.ubuf[0][i].size);
         for (uint64_t k = 0; k < st.ubuf[0][i].size / 4 && k < 48; k++) LOG(" %g", f[k]);
         LOG("\n");
+    }
+    static int dump_vb = -1;  // FIFA_DUMP_VB: the first 6 vertices of stream 0 (raw words) of debug-frame draws
+    if (dump_vb < 0) dump_vb = getenv("FIFA_DUMP_VB") != NULL;
+    if (dump_vb && st.vbuf[0].addr && st.stream[0][0]) {
+        const uint32_t *u = gptr(st.vbuf[0].addr);
+        extern void dbg_vb_hook(const void *host, uint64_t guest);
+        dbg_vb_hook(u, st.vbuf[0].addr);
+        uint32_t words = st.stream[0][0] / 4;
+        for (uint32_t v = 0; v < 6 && (v + 1) * st.stream[0][0] <= st.vbuf[0].size; v++) {
+            LOG("[vb] v%u:", v);
+            for (uint32_t k = 0; k < words && k < 16; k++) LOG(" %08x", u[v * words + k]);
+            LOG("\n");
+        }
     }
     if (st.sbuf[0][0].addr && st.sbuf[0][0].size >= 64 && st.sbuf[0][0].size <= 8192) {
         int recw = (st.sbuf[0][0].size % 96 == 0 && st.sbuf[0][0].size % 64 != 0) ? 24 : 16;

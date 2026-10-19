@@ -421,7 +421,17 @@ NVN(nvnCommandBufferCopyTextureToTexture) {  // (cmd, src, srcView, srcRegion, d
     CmdRec *r = record(c, CMD_COPY_TEXTURE_TO_TEXTURE, sizeof t, &s);
     memcpy(r->extra, t, sizeof t);
 }
-PLAIN(nvnCommandBufferCopyBufferToBuffer, CMD_COPY_BUFFER_TO_BUFFER)
+NVN(nvnCommandBufferCopyBufferToBuffer) {  // (src, dst, size, flags)
+    Snap s = snap(c);
+    if (s.x[1] < 0x07E00000ull || s.x[2] < 0x07E00000ull) {  // null-region address: log the caller, drop the copy
+        static int nlog;
+        if (nlog++ < 20)
+            LOG("[nvn] CopyBufferToBuffer src %#llx dst %#llx size %#llx (lr %#llx) dropped\n", (unsigned long long)s.x[1],
+                (unsigned long long)s.x[2], (unsigned long long)s.x[3], (unsigned long long)c->x[30]);
+        return;
+    }
+    record(c, CMD_COPY_BUFFER_TO_BUFFER, 0, &s);
+}
 NVN(nvnCommandBufferDownsample) {
     Snap s = snap(c);
     TexRef t[2] = {{0}};

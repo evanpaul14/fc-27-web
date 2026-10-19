@@ -1300,6 +1300,23 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         if (op == 3) sprintf(t, "%s", y);
         else sprintf(t, "(%s %s %s)", x, ops[op], y);
         set_reg(c, d, t);
+    } else if (OPM(0x5bd8000000000000ull, 0xfff8000000000000ull) || OPM(0x1800000000000000ull, 0xfc00000000000000ull)) {
+        // LEA.HI (reg / cbuf): d = base + (({hi, lo} or its negation) >> (32 - scale)), lo = a, hi = r39
+        bool cbuf = (w >> 58) == (0x18 >> 2);
+        int scale = cbuf ? (int)bits(w, 51, 5) : (int)bits(w, 28, 5);
+        bool neg = cbuf ? bits(w, 56, 1) : bits(w, 37, 1), x = cbuf ? bits(w, 57, 1) : bits(w, 38, 1);
+        if (x || bits(w, 47, 1) || bits(w, 48, 3) != 7) fail(c, "lea.hi x/cc/pred");
+        char bb[256];
+        const char *base = cbuf ? cbuf_ref(c, (int)bits(w, 34, 5), bits(w, 20, 14) * 4, NULL, bb) : R((int)bits(w, 20, 8));
+        char off[512];
+        sprintf(off, "%s((ulong(%s) << 32) | ulong(%s))", neg ? "-" : "", R((int)bits(w, 39, 8)), R(a));
+        sprintf(t, "(%s + uint(ulong(%s) >> %du))", base, off, 32 - scale);
+        set_reg(c, d, t);
+    } else if (OPM(0x5bd0000000000000ull, 0xfff8000000000000ull) || OPM(0x4bd0000000000000ull, 0xfff0000000000000ull) ||
+               OPM(0x36d0000000000000ull, 0xfef8000000000000ull)) {  // LEA (lo; reg / cbuf / imm): d = base + (a << scale)
+        if (bits(w, 46, 1) || bits(w, 47, 1) || bits(w, 48, 3) != 7) fail(c, "lea x/cc/pred");
+        sprintf(t, "(%s %s (%s << %du))", B(false), bits(w, 45, 1) ? "-" : "+", R(a), (int)bits(w, 39, 5));
+        set_reg(c, d, t);
     } else if (OPM(0x5be0000000000000ull, 0xfff8000000000000ull) || OPM(0x3c00000000000000ull, 0xfc00000000000000ull) ||
                OPM(0x0200000000000000ull, 0xfe00000000000000ull)) {  // LOP3
         uint32_t lut;

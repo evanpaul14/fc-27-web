@@ -56,12 +56,14 @@ static inline uint64_t plat_now_ns(void) { return clock_gettime_nsec_np(CLOCK_UP
 typedef struct { uint64_t voff, size, phys; } NvnPoolMapping;  /* virtual range -> guest address */
 
 typedef struct NvnPool {
-  uint64_t storage, size;  /* guest address of the pool's memory (0 for a virtual pool) */
+  uint64_t storage, size;  /* guest address of the pool's memory */
+  bool virt;               /* virtual pool: storage is a VPOOL range that MapVirtual aliases physical pages into */
   uint32_t flags;
   /* virtual pools (flag 0x200): ranges mapped by nvnMemoryPoolMapVirtual, sorted by voff */
   NvnPoolMapping *map;
   int nmap, cap_map;
 } NvnPool;
+uint64_t nvn_virtual_phys(uint64_t addr, uint64_t size);  /* physical-pool address behind a virtual-pool range, or 0 */
 
 typedef struct NvnTexture {
   TexLayout layout;

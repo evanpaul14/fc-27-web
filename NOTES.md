@@ -569,6 +569,24 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     changed; most shrank (the old scan read past ~40 tables' ends), and the
     rest are now unbounded scans where no bound is on the path, which only
     adds labels.
+  - Copies to null: RenderCore2 computes copy addresses as
+    `BufferGetAddress + data - BufferMap`, with `data` an offset for
+    buffers it knows aren't CPU-visible. `nvnBufferMap` / `nvnMemoryPoolMap`
+    must return NULL for `CPU_NO_ACCESS` (flag 1) and virtual pools.
+  - Virtual pools (flag 0x200, the texture streaming heaps) get a range in
+    [VPOOL_BASE, VPOOL_END) = 0x11_0000_0000..0x14_0000_0000, above what the
+    guest is told about; `nvnMemoryPoolMapVirtual` aliases the physical pool
+    pages there with `mach_vm_remap(copy=FALSE)` (zero pages on unmap), so
+    their buffer/texture addresses are ordinary guest addresses. Metal
+    wraps memory at buffer creation and wouldn't see remapped pages, so
+    virtual pools aren't wrapped: `renderer_pool_buffer` / `_window` go
+    through `nvn_virtual_phys` to the physical pool's buffer.
+  - BC targets: a CopyTextureToTexture from a uint texture (one texel per
+    block) into a BC texture goes through a buffer (Metal only copies equal
+    formats); compressed render targets are dropped (logged `[rt]`).
+  - LEA / LEA.HI (reg, cbuf, imm) in the Maxwell translator: 211 vertex
+    programs in the match used LEA.HI.
+  - Crash reports print host frames (fp chain) before the guest ones.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -710,9 +728,15 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
 
 ## Next steps
 
-- Kick Off reaches the match load, then a host memmove from guest null
-  inside `nvnQueueSubmitCommands` (from `DeviceNvn::enqueueProcessFrame`).
-  Next: find which replayed command (host frames in the crash report now).
+- Kick Off now loads the match: the Premier League loading cards ("Player
+  To Watch" with streamed portraits) and the line-up graphics render, then a
+  black screen with the PL logo while ~6k draws/s are still skipped
+  (`skipped (a/b/c/d/e/f)` in the stats line: no program / program not
+  translated / pipeline compiling / compile started / pipeline failed /
+  draw mode). Next: the remaining untranslated shaders (VS `5bdf` was LEA
+  and is done; compute `eb20`/`eb10`/`ef5c` (SUST/SULD/ATOM?), FS
+  `defa`/`dc38`, bindless handles not from c[2]) and the ~120 failing
+  pipelines; then whether the match itself starts.
 - Try the keyboard and a gamepad in the visible window;
   audio output for `audout.c`'s sink thread; the dark Continue button on
   the accessibility screen (seen before the threading fix; check if it

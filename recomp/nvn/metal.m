@@ -36,7 +36,7 @@ static int npools, cap_pools;
 static pthread_mutex_t pools_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void backend_pool_created(NvnPool *p) {
-    if (!p->storage || !p->size || !dev) return;  // virtual pools have no storage of their own
+    if (p->virt || !p->size || !dev) return;  // virtual pools: through nvn_virtual_phys
     uint64_t lo = p->storage & ~(HOST_PAGE - 1), hi = (p->storage + p->size + HOST_PAGE - 1) & ~(HOST_PAGE - 1);
     id<MTLBuffer> b = [dev newBufferWithBytesNoCopy:gptr(lo) length:hi - lo options:MTLResourceStorageModeShared
                                         deallocator:nil];
@@ -68,6 +68,7 @@ static PoolBuf *pool_find(uint64_t addr, uint64_t size) {
 }
 
 id<MTLBuffer> renderer_pool_buffer(uint64_t addr, uint64_t size, uint64_t *offset) {
+    if (addr >= VPOOL_BASE && addr < VPOOL_END && !(addr = nvn_virtual_phys(addr, size))) return nil;
     pthread_mutex_lock(&pools_lock);
     PoolBuf *pb = pool_find(addr, size);
     id<MTLBuffer> b = pb ? (__bridge id<MTLBuffer>)pb->buf : nil;
@@ -77,10 +78,12 @@ id<MTLBuffer> renderer_pool_buffer(uint64_t addr, uint64_t size, uint64_t *offse
 }
 
 id<MTLBuffer> renderer_pool_window(uint64_t addr, uint64_t *guest_base) {
+    uint64_t phys = addr;  // virtual: the physical pool, based so that addr lands on its page (one mapping's worth)
+    if (addr >= VPOOL_BASE && addr < VPOOL_END && !(phys = nvn_virtual_phys(addr, 1))) return nil;
     pthread_mutex_lock(&pools_lock);
-    PoolBuf *pb = pool_find(addr, 1);
+    PoolBuf *pb = pool_find(phys, 1);
     id<MTLBuffer> b = pb ? (__bridge id<MTLBuffer>)pb->buf : nil;
-    if (pb) *guest_base = pb->lo;
+    if (pb) *guest_base = pb->lo + (addr - phys);
     pthread_mutex_unlock(&pools_lock);
     return b;
 }

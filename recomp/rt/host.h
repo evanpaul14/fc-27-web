@@ -24,6 +24,10 @@
  * in one piece (it aborts with os 3-12 when that doesn't fit). */
 #define MAP_BASE           0x100000000ull
 #define MAP_END            0x1100000000ull
+/* NVN virtual memory pools, above what the guest is told about: physical pool pages are aliased in
+ * (nvnMemoryPoolMapVirtual), so their GPU addresses are guest addresses like any other pool's. */
+#define VPOOL_BASE         0x1100000000ull
+#define VPOOL_END          0x1400000000ull
 
 #define APP_PID            0x51ull  /* process id, also the applet resource user id */
 

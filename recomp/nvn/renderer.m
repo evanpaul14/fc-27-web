@@ -24,6 +24,8 @@ static id<MTLRenderPipelineState> clear_pipes[64];
 static NSMutableDictionary<NSString *, id> *cache;
 // (stats) GPU wait time by cause: 0 = guest fence (nvnSyncWait), 1 = full flush (CPU reads GPU results / ring), 2 = sync all
 static uint64_t stat_wait_by[3], stat_wait_n[3];
+static uint64_t skip_why[6];  // no program, program not ready, pipeline compiling, compile started, pipeline failed, draw mode
+#define SKIP(n) (stat_skipped++, skip_why[n]++)
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
 static double stat_gpu_s;
 static uint64_t g_gpu_total_ns;  // GPU time of all completed command buffers
@@ -96,12 +98,14 @@ const char *renderer_stats(void) {
     struct task_vm_info vmi;
     mach_msg_type_number_t vn = TASK_VM_INFO_COUNT;
     uint64_t foot = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &vn) == KERN_SUCCESS ? vmi.phys_footprint : 0;
-    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms, fbcopy %llu | tex %d (%.0f MB) views %d snaps %lu mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu", stat_draws, stat_skipped,
+    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped (%llu/%llu/%llu/%llu/%llu/%llu), %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms, fbcopy %llu | tex %d (%.0f MB) views %d snaps %lu mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu", stat_draws, stat_skipped,
+             skip_why[0], skip_why[1], skip_why[2], skip_why[3], skip_why[4], skip_why[5],
              stat_passes, stat_dispatches, stat_flushes, stat_gpu_s * 1000.0, (double)stat_wait_ns / 1e6 * 125.0 / 3.0, stat_compiles, stat_compile_ms, stat_feedback_copies,
              g_tex_live, g_tex_live_bytes / 1048576.0, g_views_live, (unsigned long)(g_snap_copies ? g_snap_copies.count : 0), foot / 1048576.0, stat_wait_by[0] / 24e3, (unsigned long long)stat_wait_n[0], stat_wait_by[1] / 24e3, (unsigned long long)stat_wait_n[1], stat_wait_by[2] / 24e3, (unsigned long long)stat_wait_n[2]);
     stat_compiles = 0;
     stat_feedback_copies = 0;
     stat_compile_ms = 0;
+    memset(skip_why, 0, sizeof skip_why);
     stat_draws = stat_skipped = stat_passes = stat_dispatches = stat_flushes = stat_wait_ns = 0;
     memset(stat_wait_by, 0, sizeof stat_wait_by); memset(stat_wait_n, 0, sizeof stat_wait_n);
     stat_gpu_s = 0;
@@ -1590,7 +1594,7 @@ static uint64_t pipeline_state_hash(Prog *pr) {
 }
 
 static void draw(CmdRec *r, bool indexed) {
-    if (!st.program) { stat_skipped++; return; }
+    if (!st.program) { SKIP(0); return; }
     static bool logged_modes;
     if (!logged_modes) {
         logged_modes = true;
@@ -1604,7 +1608,7 @@ static void draw(CmdRec *r, bool indexed) {
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
     Prog *pr = get_program(st.program, &vkey, &fkey);
-    if (!pr || !pr->ready) { stat_skipped++; return; }
+    if (!pr || !pr->ready) { SKIP(1); return; }
     static int log_rt_w = -1, log_rt_h;
     if (log_rt_w < 0) { const char *e = getenv("FIFA_LOG_RT"); log_rt_w = 0; if (e) sscanf(e, "%dx%d", &log_rt_w, &log_rt_h); }
     static uint64_t log_rt_addr = 1;
@@ -1718,7 +1722,7 @@ static void draw(CmdRec *r, bool indexed) {
             id done = ready_pipes[pk];
             if (done) { [ready_pipes removeObjectForKey:pk]; cache[pk] = done; pobj = done; }
         }
-        if (pobj == pending) { stat_skipped++; return; }
+        if (pobj == pending) { SKIP(2); return; }
     }
     if (!pobj) {
         if (sync_shaders()) {
@@ -1740,11 +1744,11 @@ static void draw(CmdRec *r, bool indexed) {
                 @synchronized(cache) { stat_compile_ms += now_ms() - t0; }
                 __atomic_fetch_add(&stat_compiles, 1, __ATOMIC_RELAXED);
             }];
-            stat_skipped++;
+            SKIP(3);
             return;
         }
     }
-    if (pobj == [NSNull null]) { stat_skipped++; return; }
+    if (pobj == [NSNull null]) { SKIP(4); return; }
     pipe = pobj;
     pipe_tab[pslot].key = phash;
     pipe_tab[pslot].pipe = (__bridge void *)pipe;  // retained by the cache dictionary
@@ -1865,7 +1869,7 @@ static void draw(CmdRec *r, bool indexed) {
             id<MTLBuffer> ib = expand_indices(mode, count, NULL, 0, first, &n);
             [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:n indexType:MTLIndexTypeUInt32 indexBuffer:ib
                      indexBufferOffset:0 instanceCount:inst baseVertex:0 baseInstance:base_inst];
-        } else { stat_skipped++; return; }
+        } else { SKIP(5); return; }
     } else {
         uint32_t itype = (uint32_t)r->x[1], count = (uint32_t)r->x[2];
         uint64_t iaddr = r->x[3];
@@ -2186,6 +2190,38 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
         }
         return;
     }
+#define COMPRESSED_FMT(f) (((f) >= MTLPixelFormatBC1_RGBA && (f) <= MTLPixelFormatBC7_RGBAUnorm_sRGB) || \
+                           ((f) >= MTLPixelFormatPVRTC_RGB_2BPP && (f) <= MTLPixelFormatASTC_12x12_HDR))
+    if (COMPRESSED_FMT(d.pixelFormat) && s.pixelFormat != d.pixelFormat) {
+        // GPU texture compression: one source texel per 4x4 block (RG32/RGBA32 uint), or another compressed
+        // format with the same blocks. Metal only copies between equal formats, so go through a buffer.
+        MTLPixelFormat f = d.pixelFormat;
+        NSUInteger bpb = (f == MTLPixelFormatBC1_RGBA || f == MTLPixelFormatBC1_RGBA_sRGB || f == MTLPixelFormatBC4_RUnorm ||
+                          f == MTLPixelFormatBC4_RSnorm) ? 8 : 16;
+        bool scompressed = COMPRESSED_FMT(s.pixelFormat);
+        NSUInteger bw = ((NSUInteger)dw + 3) / 4, bh = ((NSUInteger)dh + 3) / 4;
+        NSUInteger sx = (NSUInteger)sx0, sy = (NSUInteger)sy0;
+        NSUInteger cw = scompressed ? bw * 4 : bw, ch = scompressed ? bh * 4 : bh;  // source extent, its own texels
+        if (sx + cw > s.width) cw = s.width - sx;
+        if (sy + ch > s.height) ch = s.height - sy;
+        NSUInteger ow = scompressed ? (cw + 3) / 4 : cw, oh = scompressed ? (ch + 3) / 4 : ch;  // blocks actually copied
+        NSUInteger dxw = MIN(ow * 4, d.width - (NSUInteger)dx0), dxh = MIN(oh * 4, d.height - (NSUInteger)dy0);
+        if (!ow || !oh || (NSUInteger)dx0 >= d.width || (NSUInteger)dy0 >= d.height) return;
+        id<MTLBuffer> tmp = [dev newBufferWithLength:ow * oh * bpb options:MTLResourceStorageModePrivate];
+        id<MTLBlitCommandEncoder> b = [cb() blitCommandEncoder];
+        [b copyFromTexture:s sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(sx, sy, 0) sourceSize:MTLSizeMake(cw, ch, 1)
+                  toBuffer:tmp destinationOffset:0 destinationBytesPerRow:ow * bpb destinationBytesPerImage:ow * oh * bpb];
+        [b copyFromBuffer:tmp sourceOffset:0 sourceBytesPerRow:ow * bpb sourceBytesPerImage:ow * oh * bpb
+               sourceSize:MTLSizeMake(dxw, dxh, 1) toTexture:d destinationSlice:0 destinationLevel:0
+        destinationOrigin:MTLOriginMake(dx0, dy0, 0)];
+        [b endEncoding];
+        static int nlog;
+        if (nlog++ < 4)
+            LOG("[copytex] %lu (%lux%lu) -> compressed %lu (%lux%lu) at %d,%d: %lux%lu blocks\n", (unsigned long)s.pixelFormat,
+                (unsigned long)s.width, (unsigned long)s.height, (unsigned long)f, (unsigned long)d.width,
+                (unsigned long)d.height, dx0, dy0, (unsigned long)ow, (unsigned long)oh);
+        return;
+    }
     if (renderer_format_is_depth(dt->format) || (s.pixelFormat == d.pixelFormat && sw == dw && sh == dh && s.sampleCount == d.sampleCount)) {
         id<MTLBlitCommandEncoder> b = [cb() blitCommandEncoder];
         [b copyFromTexture:s sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(sx0, sy0, 0)
@@ -2198,6 +2234,29 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
 }
 
 // ------------------------------------------------------------------ executor
+// Compressed formats can't be Metal render targets. Frostbite's GPU texture compression renders BC blocks
+// into a BC texture (through a uint view, on NVN); until that's emulated, such targets are left unbound.
+static bool drop_unrenderable_targets(void) {
+    bool dropped = false;
+    for (int i = 0; i < st.rt.ncolor && i < 8; i++) {
+        NvnTexture *t = st.rt.color[i];
+        if (!t) continue;
+        uint32_t f = st.rt.has_cview[i] && (st.rt.cview[i].setmask & 4) ? st.rt.cview[i].format : t->format;
+        MTLPixelFormat base = renderer_pixel_format(t->format), pf = renderer_pixel_format(f);
+#define COMPRESSED(f) (((f) >= MTLPixelFormatBC1_RGBA && (f) <= MTLPixelFormatBC7_RGBAUnorm_sRGB) || \
+                       ((f) >= MTLPixelFormatPVRTC_RGB_2BPP && (f) <= MTLPixelFormatASTC_12x12_HDR))
+        bool compressed = COMPRESSED(base) || COMPRESSED(pf);
+        if (!compressed) continue;
+        static int nlog;
+        if (nlog++ < 10)
+            LOG("[rt] compressed render target dropped: %ux%u fmt %#x (mtl %lu) view %d fmt %#x (mtl %lu) levels %u\n",
+                t->width, t->height, t->format, (unsigned long)base, st.rt.has_cview[i], f, (unsigned long)pf, t->levels);
+        st.rt.color[i] = NULL;
+        dropped = true;
+    }
+    return dropped;
+}
+
 static void exec_list(uint64_t handle, int depth) {
     uint64_t p = handle;
     for (int guard = 0; guard < 10000000; guard++) {
@@ -2277,6 +2336,7 @@ static void exec_list(uint64_t handle, int depth) {
             st.rt.depth = (NvnTexture *)(uintptr_t)rt->depth;
             st.rt.dview = rt->dview;
             st.rt.has_dview = rt->has_dview;
+            drop_unrenderable_targets();
             st.rt_dirty = true;
             break;
         }
@@ -2333,6 +2393,7 @@ static void exec_list(uint64_t handle, int depth) {
             st.rt.ncolor = 1;
             st.rt.color[0] = t;
             if (ct->has_view) { st.rt.cview[0] = ct->view; st.rt.has_cview[0] = 1; }
+            if (drop_unrenderable_targets()) { st.rt = saved; st.rt_dirty = true; break; }
             st.rt_dirty = true;
             const int32_t *rg = ct->region;
             if (rg[3] > 0 && rg[4] > 0) { st.scissor[0][0] = rg[0]; st.scissor[0][1] = rg[1]; st.scissor[0][2] = rg[3]; st.scissor[0][3] = rg[4]; }

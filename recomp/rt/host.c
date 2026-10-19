@@ -228,7 +228,7 @@ int main(int argc, char **argv) {
   (void)argc; (void)argv;
   host_trace = getenv("FIFA_TRACE") != 0;
   install_crash_handler();
-  mem = mmap(0, GUEST_SPACE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+  mem = mmap(0, VPOOL_END, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
   if (mem == MAP_FAILED) HDIE("cannot reserve guest space\n");
   /* Nothing is mapped below 0x07E00000 on the Switch: make null-pointer
    * accesses fault instead of silently hitting zeroed memory. */

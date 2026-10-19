@@ -3,6 +3,10 @@
 #include <string.h>
 
 
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <sys/mman.h>
+
 #include "nvn.h"
 
 void renderer_sync(void);
@@ -204,24 +208,51 @@ NVN(nvnMemoryPoolBuilderGetFlags) { RET(FLD(uint32_t, A(0), 8)); }
 NVN(nvnMemoryPoolBuilderGetMemory) { RET(FLD(uint64_t, A(0), 0x10)); }
 NVN(nvnMemoryPoolBuilderGetSize) { RET(FLD(uint64_t, A(0), 0x18)); }
 
+// Virtual pools (flag 0x200) have no memory of their own: each gets a range in [VPOOL_BASE, VPOOL_END), and
+// nvnMemoryPoolMapVirtual aliases the physical pools' pages into it, so CPU-side reads through buffer and
+// texture addresses see the mapped memory. Metal can't follow remapped pages under a wrapped buffer, so GPU
+// lookups go through nvn_virtual_phys to the physical pool's buffer instead.
+static NvnPool *vpools[256];
+static int nvpools;
+static uint64_t next_vpool = VPOOL_BASE;
+static void alias_pages(uint64_t dst, uint64_t src, uint64_t size);
+
 NVN(nvnMemoryPoolInitialize) {
     NvnPool *p = calloc(1, sizeof *p);
     p->storage = FLD(uint64_t, A(1), 0x10);
     p->size = FLD(uint64_t, A(1), 0x18);
     p->flags = FLD(uint32_t, A(1), 8);
+    if (!p->storage) {
+        uint64_t size = (p->size + 0x1fffffull) & ~0x1fffffull;
+        if (next_vpool + size > VPOOL_END || nvpools == (int)(sizeof vpools / sizeof *vpools))
+            FATAL("[nvn] out of virtual pool space (%#llx more)\n", (unsigned long long)size);
+        p->virt = true;
+        p->storage = next_vpool;
+        next_vpool += size;
+        vpools[nvpools++] = p;
+    }
     if (getenv("FIFA_LOG_POOLS")) LOG("[nvn] pool %#llx+%#llx flags %#x\n", (unsigned long long)p->storage, (unsigned long long)p->size, p->flags);
     backend_pool_created(p);
     SET_HOST(A(0), p);
     RET(1);
 }
 NVN(nvnMemoryPoolFinalize) {
+    for (int i = 0; i < nvpools; i++)
+        if (vpools[i] == HOST(NvnPool, A(0))) {
+            alias_pages(vpools[i]->storage, 0, (vpools[i]->size + 0x3fff) & ~0x3fffull);
+            vpools[i] = vpools[--nvpools];
+            break;
+        }
     backend_pool_destroyed(HOST(NvnPool, A(0)));
     free(HOST(NvnPool, A(0))->map);
     free(HOST(NvnPool, A(0)));
     SET_HOST(A(0), 0);
 }
 NVN(nvnMemoryPoolSetDebugLabel) { (void)c; }
-NVN(nvnMemoryPoolMap) { RET(HOST(NvnPool, A(0))->storage); }
+NVN(nvnMemoryPoolMap) {  // NULL for CPU_NO_ACCESS (flag 1) and virtual pools, as on hardware
+    NvnPool *p = HOST(NvnPool, A(0));
+    RET(p->virt || (p->flags & 1) ? 0 : p->storage);
+}
 NVN(nvnMemoryPoolGetBufferAddress) { RET(HOST(NvnPool, A(0))->storage); }  // GPU address == CPU address
 NVN(nvnMemoryPoolGetSize) { RET(HOST(NvnPool, A(0))->size); }
 NVN(nvnMemoryPoolGetFlags) { RET(HOST(NvnPool, A(0))->flags); }
@@ -249,6 +280,27 @@ static void vmap_remove(NvnPool *p, uint64_t lo, uint64_t hi) {
     p->cap_map = p->nmap * 2 + 1;
 }
 
+// Point guest [dst, dst+size) at the pages of [src, src+size), or at fresh zero pages (src 0).
+static void alias_pages(uint64_t dst, uint64_t src, uint64_t size) {
+    if ((dst | src | size) & 0x3fff) {
+        LOG("[nvn] virtual mapping %#llx <- %#llx +%#llx not 16K-aligned\n", (unsigned long long)dst,
+            (unsigned long long)src, (unsigned long long)size);
+        return;
+    }
+    if (!src) {
+        if (mmap(GP(dst), size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED, -1, 0) == MAP_FAILED)
+            LOG("[nvn] virtual unmap %#llx +%#llx failed\n", (unsigned long long)dst, (unsigned long long)size);
+        return;
+    }
+    mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)GP(dst);
+    vm_prot_t cur, max;
+    kern_return_t kr = mach_vm_remap(mach_task_self(), &a, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
+                                     (mach_vm_address_t)(uintptr_t)GP(src), FALSE, &cur, &max, VM_INHERIT_NONE);
+    if (kr != KERN_SUCCESS)
+        LOG("[nvn] virtual map %#llx <- %#llx +%#llx failed (%d)\n", (unsigned long long)dst, (unsigned long long)src,
+            (unsigned long long)size, kr);
+}
+
 NVN(nvnMemoryPoolMapVirtual) {
     NvnPool *p = HOST(NvnPool, A(0));
     const uint8_t *rq = AP(2);  // NVNmappingRequest[n] = {pool, physicalOffset, virtualOffset, size, storageClass}
@@ -257,6 +309,7 @@ NVN(nvnMemoryPoolMapVirtual) {
         uint64_t voff = *(const uint64_t *)(rq + 16), size = *(const uint64_t *)(rq + 24);
         if (!size) continue;
         vmap_remove(p, voff, voff + size);
+        alias_pages(p->storage + voff, phys_pool ? HOST(NvnPool, phys_pool)->storage + poff : 0, size);
         if (!phys_pool) continue;  // unmap
         if (p->nmap == p->cap_map) p->map = realloc(p->map, (p->cap_map = p->cap_map ? p->cap_map * 2 : 64) * sizeof *p->map);
         int k = p->nmap;
@@ -265,6 +318,26 @@ NVN(nvnMemoryPoolMapVirtual) {
         p->nmap++;
     }
     RET(1);
+}
+
+uint64_t nvn_virtual_phys(uint64_t addr, uint64_t size) {
+    for (int k = 0; k < nvpools; k++) {
+        NvnPool *p = vpools[k];
+        if (addr < p->storage || addr >= p->storage + p->size) continue;
+        uint64_t voff = addr - p->storage;
+        for (int i = 0; i < p->nmap; i++) {
+            NvnPoolMapping *m = &p->map[i];
+            if (voff < m->voff || voff >= m->voff + m->size) continue;
+            // the range must stay in physically contiguous mappings
+            uint64_t phys = m->phys + (voff - m->voff), end = voff + size;
+            for (int j = i; m->voff + m->size < end; m = &p->map[++j])
+                if (j + 1 >= p->nmap || p->map[j + 1].voff != m->voff + m->size || p->map[j + 1].phys != m->phys + m->size)
+                    return 0;
+            return phys;
+        }
+        return 0;
+    }
+    return 0;
 }
 
 const uint8_t *nvn_texture_data(NvnTexture *t, uint64_t size, uint8_t **tmp) {
@@ -321,7 +394,11 @@ NVN(nvnBufferInitialize) {
 }
 NVN(nvnBufferFinalize) { (void)c; }
 NVN(nvnBufferSetDebugLabel) { (void)c; }
-NVN(nvnBufferMap) { RET(FLD(uint64_t, A(0), 0)); }
+NVN(nvnBufferMap) {  // NULL when its pool has no CPU access (RenderCore2 copies to GetAddress + data - Map)
+    uint64_t pool = FLD(uint64_t, A(0), 8);
+    NvnPool *p = pool ? HOST(NvnPool, pool) : NULL;
+    RET(p && (p->virt || (p->flags & 1)) ? 0 : FLD(uint64_t, A(0), 0));
+}
 NVN(nvnBufferGetAddress) { RET(FLD(uint64_t, A(0), 0)); }
 NVN(nvnBufferGetMemoryPool) { RET(FLD(uint64_t, A(0), 8)); }
 NVN(nvnBufferGetMemoryOffset) { RET(FLD(uint64_t, A(0), 0x10)); }

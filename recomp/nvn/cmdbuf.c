@@ -165,10 +165,23 @@ NVN(nvnCommandBufferBindImage) {
     r->x[0] = s.x[1]; r->x[1] = s.x[2]; r->x[2] = 1;
     memcpy(r->extra, &s.x[3], 8);
 }
-NVN(nvnCommandBufferBindSeparateTextures) { record_copy(c, CMD_BIND_SEPARATE_TEXTURES, 4, (uint32_t)A(3) * 8); }
+NVN(nvnCommandBufferBindSeparateTextures) {
+    static int log = -1;
+    if (log < 0) log = getenv("FIFA_LOG_SEPTEX") != NULL;
+    if (log && (uint32_t)A(1) == 0) {
+        static int n;
+        const uint64_t *h = GP(A(4));
+        if (n++ < 40) LOG("[septex] vs first %u n %u h0 %llx lr %llx\n", (unsigned)A(2), (unsigned)A(3), (unsigned long long)(A(3) ? h[0] : 0), (unsigned long long)c->x[30]);
+    }
+    record_copy(c, CMD_BIND_SEPARATE_TEXTURES, 4, (uint32_t)A(3) * 8);
+}
 NVN(nvnCommandBufferBindSeparateTexture) {
     Snap s = snap(c);
     CmdRec *r = record(c, CMD_BIND_SEPARATE_TEXTURES, 8, &s);
+    if (getenv("FIFA_LOG_SEPTEX") && s.x[1] == 0) {
+        static int n;
+        if (n++ < 40) LOG("[septex1] vs slot %llu h %llx lr %llx\n", (unsigned long long)s.x[2], (unsigned long long)s.x[3], (unsigned long long)c->x[30]);
+    }
     r->x[0] = s.x[1]; r->x[1] = s.x[2]; r->x[2] = 1;
     memcpy(r->extra, &s.x[3], 8);
 }

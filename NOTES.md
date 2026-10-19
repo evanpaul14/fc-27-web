@@ -509,15 +509,31 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
       same host NvnTexture the UI draws into, yet forcing the panel shader
       white (`FIFA_DBG_FS=16f536a00:ffffffff:0`) still leaves it black: the
       panels have no coverage.
-    - Likely cause: the panel VS `16eaa0900` has no vertex attributes. It
+    - Cause, fixed: the panel VS `16eaa0900` has no vertex attributes. It
       pulls per-draw data by LDG through c0[17] (the SSBO pointer) and its
-      vertices by `t0.read()` from a buffer texture. The handle the
-      renderer reads for t0 is 0x100000000 (tic 0, no texture), so it binds
-      a 1x1 dummy and every vertex collapses. Also, buffer textures
-      (target 10) are never uploaded (`upload_texture` returns early) and
-      get a 2D Metal texture. Next: where the VS's buffer-texture handle
-      really lives (`[vtex]` lines log it), then real buffer-texture
-      support.
+      vertices by `t0.read()` from a buffer texture (RGBA32F). Its handle
+      was 0x100000000: RenderCore2 builds separate-texture handles itself
+      as `1 << 32 | descriptor id` (`cacheShaderResources`), and the id was
+      0 because the resource view was null. `AutoViewCacheHelper` rejects a
+      buffer view whose element count exceeds the device's
+      MAX_BUFFER_TEXTURE_SIZE, and `nvnDeviceGetInteger` answered 1:
+      `device_integer` was LAS Recomp's table from an older SDK and
+      drifted from index 50 on (MAX_TEXTURE_SIZE 1, MEMORY_POOL_PAGE_SIZE
+      1, 0 for everything past 64). The table now follows SDK 22's
+      `nvn::DeviceInfo` (enums.tsv) with Tegra X1 values. Buffer textures
+      (target 10) also get a 1D Metal texture (shaders fetch them as
+      texture1d; clamped to 16384 texels) uploaded from guest memory when
+      their hash changes, at most once per frame
+      (`upload_buffer_texture`). With both, the Accessibility Settings
+      screen renders (frame ~560 on). Still wrong: the Continue button's
+      contents are dark.
+    - Debugging aids from this: `FIFA_LOG_SEPTEX=1` (vertex-stage separate
+      texture binds with the NRO caller), `FIFA_LOG_HANDLES=1` (texture
+      pool registrations of buffer textures and ids 0-3). The NRO's
+      `.nrs` has full symbols: `nro.elfsyms.tsv` maps an `lr` 0x1a0xxxxx
+      to `fb::` functions (address - 0x1a000000), and objdump of the
+      `.nrs` itself gives demangled disassembly. Identical functions are
+      folded (getAsSrv and getAsUav share 0x67430).
     - Debug switches added: `FIFA_LOG_GAME=1` (a printf-style logger the
       retail build compiles out, `HLE(sub_ffd0744)` in `recomp/hle/log.c`;
       `HLE(sub_<addr>)` now works for stripped functions), write/access
@@ -671,10 +687,9 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
 
 ## Next steps
 
-- Black frames after the title screen (see Status, "third pass"): the
-  accessibility screen's panels pull vertices from a buffer texture whose
-  handle resolves to nothing. Fix the VS buffer-texture binding and
-  upload buffer textures (target 10), then the GPU SDF glyph path. Then
+- The accessibility screen renders (see Status, "third pass"). Next: the
+  dark Continue button, input to get past the screen (hid/npad), and the
+  frequent worker-thread null reads in the update build. Then
   SUST/SUATOM/STS/VOTE
   and the other unknown instructions (FS `3b34…`, VS `1887…`).
 - Later: the WebGPU RenderCore2 backend (option 2 in Status).

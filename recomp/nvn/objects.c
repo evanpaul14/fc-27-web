@@ -10,23 +10,45 @@ void renderer_sync(void);
 static uint64_t next_debug_id = 1;
 
 // ================================================================== device
-// NVNdeviceInfo -> value
+// NVNdeviceInfo -> value. Indices are SDK 22's nvn::DeviceInfo (extracted/analysis/nro/enums.tsv), values the
+// Tegra X1's. (The table from LAS Recomp's older SDK drifted from 50 on: MAX_BUFFER_TEXTURE_SIZE read 1, so
+// RenderCore2 rejected every buffer SRV over one element and bound a null view - the UI's vertex data.)
 static uint32_t device_integer(uint32_t which) {
     static const uint32_t v[] = {
-        [0] = 53, [1] = 207,           // API version
-        [2] = 14, [3] = 65536, [4] = 256, [5] = 8, [6] = 16, [7] = 4, [8] = 16, [9] = 32,
-        [10] = 16, [11] = 4, [12] = 4, [13] = 4, [14] = 16, [15] = 32, [16] = 32,
-        [17] = 256, [18] = 256,        // reserved texture / sampler descriptors
-        [19] = 4, [20] = 8, [21] = 0x10000, [22] = 0x1000,
-        [23] = 256, [24] = 256, [25] = 4096, [26] = 0x20000, [27] = 16,
-        [28] = 1536, [29] = 1024, [30] = 64, [31] = 1536,
-        [32] = 0x7FFFFFFF, [33] = 65535, [34] = 65535,
-        [35] = 8, [36] = 1048576, [37] = 4096, [38] = 16, [39] = 0x10000,
-        [40] = 1, [41] = 1, [42] = 1,  // min/max filtering, stencil8, ASTC
-        [43] = 0x40000, [44] = 15, [45] = 2048,
-        [46] = 1, [47] = 5, [48] = 1, [49] = 15,
-        [50] = 256, [51] = 1, [52] = 0, [53] = 0, [54] = 0, [55] = 256, [56] = 1, [57] = 0x1000,
-        [58] = 1, [59] = 1, [60] = 1, [61] = 1, [62] = 1, [63] = 1, [64] = 1,
+        [0] = 53, [1] = 207,                  // API_MAJOR/MINOR_VERSION
+        [2] = 14, [3] = 65536, [4] = 256,     // UNIFORM_BUFFER_BINDINGS_PER_STAGE, MAX_UNIFORM_BUFFER_SIZE, ALIGNMENT
+        [5] = 8, [6] = 16, [7] = 4,           // COLOR_BUFFER, VERTEX_BUFFER, TRANSFORM_FEEDBACK_BUFFER_BINDINGS
+        [8] = 16, [9] = 32,                   // SHADER_STORAGE_BUFFER / TEXTURE_BINDINGS_PER_STAGE
+        [10] = 16, [11] = 4, [12] = 4, [13] = 4,  // COUNTER, TRANSFORM_FEEDBACK_BUFFER/CONTROL, INDIRECT_DRAW_ALIGNMENT
+        [14] = 16, [15] = 32, [16] = 32,      // VERTEX_ATTRIBUTES, TEXTURE/SAMPLER_DESCRIPTOR_SIZE
+        [17] = 256, [18] = 256,               // RESERVED_TEXTURE/SAMPLER_DESCRIPTORS
+        [19] = 4, [20] = 8, [21] = 0x10000, [22] = 0x1000,  // COMMAND_BUFFER_COMMAND/CONTROL_ALIGNMENT, MIN_*_SIZE
+        [23] = 256, [24] = 256, [25] = 4096, [26] = 0x20000,  // SHADER_SCRATCH_MEMORY_*
+        [27] = 16,                            // MAX_TEXTURE_ANISOTROPY
+        [28] = 1536, [29] = 1024, [30] = 64, [31] = 1536,  // MAX_COMPUTE_WORK_GROUP_SIZE_X/Y/Z/THREADS
+        [32] = 0x7FFFFFFF, [33] = 65535, [34] = 65535,     // MAX_COMPUTE_DISPATCH_WORK_GROUPS_X/Y/Z
+        [35] = 8, [36] = 1048576, [37] = 4096, [38] = 16,  // IMAGE_BINDINGS, MAX_TEXTURE/SAMPLER_POOL_SIZE, MAX_VIEWPORTS
+        [39] = 0x10000,                       // MEMPOOL_TEXTURE_OBJECT_PAGE_ALIGNMENT
+        [40] = 1, [41] = 1, [42] = 1,         // SUPPORTS_MIN_MAX_FILTERING, STENCIL8_FORMAT, ASTC_FORMATS
+        [43] = 0x40000, [44] = 15, [45] = 2048,  // L2_SIZE, MAX_TEXTURE_LEVELS, MAX_TEXTURE_LAYERS
+        [46] = 1, [47] = 5, [48] = 1, [49] = 15,  // GLSLC_MAX/MIN_SUPPORTED_GPU_CODE_MAJOR/MINOR_VERSION
+        [50] = 1, [51] = 8, [52] = 8,         // SUPPORTS_CONSERVATIVE_RASTER, SUBPIXEL_BITS, MAX_SUBPIXEL_BIAS_BITS
+        [53] = 4, [54] = 32, [55] = 256,      // INDIRECT_DISPATCH_ALIGNMENT, ZCULL_SAVE_RESTORE_ALIGNMENT, scratch compute
+        [56] = 32, [57] = 128,                // LINEAR_TEXTURE / LINEAR_RENDER_TARGET_STRIDE_ALIGNMENT
+        [58] = 4096, [59] = 1, [60] = 4,      // MEMORY_POOL_PAGE_SIZE, ZERO_FROM_UNMAPPED_VIRTUAL_POOL_PAGES, UBO update
+        [61] = 16384, [62] = 1 << 27,         // MAX_TEXTURE_SIZE, MAX_BUFFER_TEXTURE_SIZE
+        [63] = 2048, [64] = 16384, [65] = 16384,  // MAX_3D / CUBE_MAP / RECTANGLE_TEXTURE_SIZE
+        [66] = 1, [67] = 1, [68] = 1, [69] = 1,   // passthrough GS, viewport swizzle, sparse packaged, advanced blend
+        [70] = 5, [71] = 1, [72] = 1, [73] = 1, [74] = 1, [75] = 1, [76] = 1,  // MAX_PRESENT_INTERVAL, SUPPORTS_*
+        [77] = 16, [78] = 1024, [79] = 32,    // MAX_SAMPLE_LOCATION_TABLE_ENTRIES, SHADER_CODE_..._PADDING_SIZE, MAX_PATCH_SIZE
+        [80] = 0x4000, [81] = 0x10000, [82] = 0x10000,  // QUEUE_COMMAND_MEMORY_GRANULARITY / MIN / DEFAULT_SIZE
+        [83] = 0x4000, [84] = 0x40000, [85] = 0x40000,  // QUEUE_COMPUTE_MEMORY_GRANULARITY / MIN / DEFAULT_SIZE
+        [86] = 0x4000, [87] = 1,              // QUEUE_COMMAND_MEMORY_MIN_FLUSH_THRESHOLD, FRAGMENT_SHADER_INTERLOCK
+        [88] = 4, [89] = 2, [90] = 0,         // MAX/MIN_TEXTURES_PER_WINDOW, SUPPORTS_DEBUG_LAYER
+        [91] = 0x4000, [92] = 0x4000, [93] = 0x1000,  // QUEUE_CONTROL_MEMORY_MIN / DEFAULT_SIZE / GRANULARITY
+        [94] = 128, [95] = 32,                // SEPARATE_TEXTURE / SAMPLER_BINDINGS_PER_STAGE
+        [96] = 0xFFFF, [97] = 1, [98] = 32,   // DEBUG_GROUPS_MAX_DOMAIN_ID, EVENTS_..._REDUCTION, SHADER_SUBGROUP_SIZE
+        [103] = 256, [104] = 2047,            // SHADER_CODE_ALIGNMENT, VERTEX_ATTRIBUTE_STATE_MAXIMUM_RELATIVE_OFFSET
     };
     return which < sizeof v / sizeof *v ? v[which] : 0;
 }
@@ -629,6 +651,14 @@ static void register_texture(CPU *c) {
     if (id < 0 || id >= d->count) return;
     NvnTexEntry *e = &((NvnTexEntry *)d->entries)[id];
     e->tex = HOST(NvnTexture, A(2));
+    if (getenv("FIFA_LOG_HANDLES") && id < 4) {
+        static int n0;
+        if (n0++ < 30) LOG("[handle] register id %d pool %p tex %p target %u fmt %#x %ux%u view %d lr %llx\n", id, (void *)d, (void *)e->tex, e->tex ? e->tex->target : 0, e->tex ? e->tex->format : 0, e->tex ? e->tex->width : 0, e->tex ? e->tex->height : 0, e->has_view, (unsigned long long)c->x[30]);
+    }
+    if (getenv("FIFA_LOG_HANDLES") && e->tex && e->tex->target == 10) {
+        static int n;
+        if (n++ < 30) LOG("[handle] register buffer texture id %d fmt %#x w %u addr %llx lr %llx\n", id, e->tex->format, e->tex->width, (unsigned long long)e->tex->addr, (unsigned long long)c->x[30]);
+    }
     e->has_view = A(3) != 0;
     if (e->has_view) nvn_view_read(A(3), &e->view);
 }

@@ -1221,7 +1221,8 @@ static void bind_textures(int stage, ShaderInfo *si) {
         }
         if (g_debug_frame && stage == 0) {
             NvnTexture *vt = h && st.tpool && tic < (uint32_t)st.tpool->count ? ((NvnTexEntry *)st.tpool->entries)[tic].tex : NULL;
-            LOG("[vtex] %d type %d handle %llx tic %u -> %s", i, st_->type, (unsigned long long)h, tic, vt ? "" : "none");
+            LOG("[vtex] %d type %d off %#x bindless %d/%#x handle %llx tic %u -> %s", i, st_->type, st_->handle_offset, st_->bindless, st_->bindless_offset, (unsigned long long)h, tic, vt ? "" : "none");
+            static int once; if (!once++) { LOG("[vtex] tex0:"); for (int k = 0; k < 32; k++) if (st.tex[0][k]) LOG(" %d=%llx", k, (unsigned long long)st.tex[0][k]); LOG(" septex0:"); for (int k = 0; k < 128; k++) if (st.septex[0][k]) LOG(" %d=%llx", k, (unsigned long long)st.septex[0][k]); LOG(" sepsmp0:"); for (int k = 0; k < 32; k++) if (st.sepsmp[0][k]) LOG(" %d=%llx", k, (unsigned long long)st.sepsmp[0][k]); LOG("\n"); }
             if (vt) LOG("target %u fmt %#x %ux%u addr %llx", vt->target, vt->format, vt->width, vt->height, (unsigned long long)vt->addr);
             LOG(" mtl type %lu %lux%lu\n", (unsigned long)tex.textureType, (unsigned long)tex.width, (unsigned long)tex.height);
         }

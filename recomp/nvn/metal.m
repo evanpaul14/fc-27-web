@@ -237,6 +237,7 @@ static MTLTextureType mtl_tex_type(uint32_t target, uint32_t samples) {
     case 6: return MTLTextureType2DMultisampleArray;
     case 8: return MTLTextureTypeCube;
     case 9: return MTLTextureTypeCubeArray;
+    case 10: return MTLTextureType1D;  // buffer texture (shaders fetch it as texture1d; see upload_buffer_texture)
     default: return samples > 1 ? MTLTextureType2DMultisample : MTLTextureType2D;
     }
 }
@@ -247,6 +248,10 @@ static void create_backend_texture(NvnTexture *t, TexBackend *b) {
     d.textureType = mtl_tex_type(t->target, t->samples);
     d.pixelFormat = mf.pf;
     d.width = t->width ? t->width : 1;
+    if (t->target == 10 && d.width > 16384) {  // Apple GPUs: 1D textures up to 16384 texels
+        LOG("[metal] buffer texture of %u texels clamped to 16384\n", t->width);
+        d.width = 16384;
+    }
     d.height = (t->target == 0 || t->target == 3) ? 1 : (t->height ? t->height : 1);
     d.depth = t->target == 2 ? (t->depth ? t->depth : 1) : 1;
     if (t->target == 3) d.arrayLength = t->height ? t->height : 1;
@@ -330,9 +335,33 @@ static uint64_t fnv_sample(const uint8_t *p, uint64_t n) {
     return h ^ n;
 }
 
+// Buffer textures: linear texels straight from guest memory, re-checked every frame (the UI rewrites its
+// vertex data in them).
+static void upload_buffer_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncoder> blit) {
+    if (b->uploaded && b->checked_frame == g_frame_counter) return;
+    b->checked_frame = g_frame_counter;
+    uint64_t n = MIN((uint64_t)t->width, (uint64_t)b->tex.width) * nvn_format_info(t->format)->bpb;
+    uint8_t *tmp;
+    const uint8_t *mem = nvn_texture_data(t, n, &tmp);
+    if (!mem || !n) return;
+    uint64_t h = hash_full(mem, n);
+    if (b->uploaded && h == b->data_hash) { free(tmp); return; }
+    b->data_hash = h;
+    b->uploaded = true;
+    id<MTLCommandBuffer> own_cb = nil;
+    if (!blit) { own_cb = [queue commandBuffer]; blit = [own_cb blitCommandEncoder]; }
+    id<MTLBuffer> staging = [dev newBufferWithBytes:mem length:n options:MTLResourceStorageModeShared];
+    [blit copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:n sourceBytesPerImage:n
+              sourceSize:MTLSizeMake(n / nvn_format_info(t->format)->bpb, 1, 1) toTexture:b->tex
+        destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    if (own_cb) { [blit endEncoding]; [own_cb commit]; }
+    free(tmp);
+}
+
 // Upload all levels/layers from block-linear guest memory.
 static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncoder> blit) {
-    if (!t->pool || t->target == 10) return;
+    if (t->target == 10) { if (t->pool) upload_buffer_texture(t, b, blit); return; }
+    if (!t->pool) return;
     if (b->uploaded && b->checked_frame == g_frame_counter) return;
     // Textures that have never changed since upload (almost all: loaded from files) are re-checked every 8th
     // frame, staggered per texture; ones seen changing (glyph caches, video...) every frame.

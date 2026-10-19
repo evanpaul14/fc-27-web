@@ -253,7 +253,7 @@ static void storage(void *state, IpcMsg *m) {
     if (m->nb && m->b[0].size < size) size = m->b[0].size;
     if (off > romfs.size) { m->result = R_FS_OUT_OF_RANGE; return; }
     if (size > romfs.size - off) size = romfs.size - off;
-    static int log_reads = -1;  /* FIFA_LOG_ROMFS: every RomFS read (image offsets; romfs_program.tsv offsets are these + 0x1A14000) */
+    static int log_reads = -1;  /* FIFA_LOG_ROMFS: every RomFS read (image offsets; romfs_program.tsv offsets are these + 0x1A14000 for the base, + 0x3f9c000 for the update) */
     if (log_reads < 0) log_reads = getenv("FIFA_LOG_ROMFS") != NULL;
     if (host_trace || log_reads) HLOG("[fs] RomFS read %#llx +%#llx\n", (unsigned long long)off, (unsigned long long)size);
     romfs_read(gptr(m->b[0].addr), off, size);

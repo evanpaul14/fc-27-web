@@ -280,6 +280,14 @@ from the roots (215k functions), which rewrites every unit and costs a full
 
 ## Status (2026-10-18)
 
+Current state: with the update (`FIFA_ROMFS=extracted/update/romfs_program.json`)
+the game shows the FC 27 title at frame ~93 and then the first-boot
+Accessibility Settings screen (frame ~560), at 30 fps on the Metal
+executor. Known problems: the Continue button's contents are dark, input
+is stubbed so the screen can't be left, and worker threads hit guest
+null reads in about half the runs (see the third pass below). The rest of
+this section is the history that led here, oldest first.
+
 `./build/fifa` gets through nnSdk init, `nninitStartup`, all 3,325 of
 main's `init_array` entries and into `nnMain`, then through Frostbite's
 boot: RomFS and save data, config parsing, memory setup (the 64 GB alias
@@ -397,7 +405,7 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     they now have their own commands and tables. Fragment programs: 1 ->
     14 of 16 translate; the frame loop went from 0 to ~9,000 draws per
     2 s, and the FC 27 title screen renders (`FIFA_SCREENSHOT_EVERY`).
-    After it the presented image goes black.
+    (The screen after it was black until the device-info fix below.)
   - Virtual memory pools (flag 0x200, no storage): two 512 MB pools,
     Frostbite's texture streaming heaps, filled by
     `nvnMemoryPoolMapVirtual` with whole ~2 MB physical pools after the
@@ -408,83 +416,34 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     on each upload (in place when the range is physically contiguous,
     gathered otherwise, skipped while unmapped). Virtual-pool textures
     have `addr` 0. Runs 3+ min at 30 fps, ~11,500 draws and ~120
-    skipped per 2 s; still black after the title.
-  - Black after the title (frame ~100 on), on all three window buffers.
-    Not found yet; ruled out so far:
-    - present/acquire: indices rotate 0,1,2 and the composite
-      (`fs=16ebcaf00`) renders into the buffer that is presented.
-      `FIFA_SCREENSHOT_EVERY` with a multiple of 3 only ever sees
-      buffer 0 - use e.g. 31.
-    - depth (`FIFA_NO_DEPTH_TEST` changes nothing), blend factor mapping,
-      vertex format 0x25/0x2E mapping.
-    - bindless resolution: the handles OR to valid tic/tsc ids; the 1x1
-      textures some passes bind are the game's own black/white defaults
+    skipped per 2 s.
+  - Black after the title, first two passes (superseded by the third
+    pass below; the conclusion that glyphs come out empty was wrong, the
+    collapsed quads were only spaces). Facts from them that still hold:
+    - present/acquire rotate buffers 0,1,2; `FIFA_SCREENSHOT_EVERY` with a
+      multiple of 3 only ever sees buffer 0, so use e.g. 31. The final
+      composite is `fs=16ebcaf00`; `FIFA_DBG_FS=16ebcaf00:ffffffff:0`
+      turns every presented frame white.
+    - The 1x1 textures many passes bind are the game's own defaults
       (tic 260/301/302 black, 299 white), not unresolved handles.
-    - skipped draws: besides one-off async compiles, only the programs
-      that fail to translate (FS 16f50ba00 SUST, FS 16e8db200 `3b34…`,
-      16dea1200 with VS `1887…`), ~2 per frame.
-    What the frame does instead: the title background is only drawn into
-    a 320x180 downsample; 135 UI quads (`vs=16e001500 fs=16ea35100`)
-    have all four vertices identical and colour attribute 0 (collapsed /
-    alpha 0, i.e. hidden), so nothing visible lands in the UI target. It
-    looks like the game legitimately shows nothing - a fade or a screen
-    waiting on something (input: hid is a stub; a movie; a load) - but
-    that isn't confirmed.
-    Findings (2026-10-18, second pass):
-    - The white probe works: `FIFA_DBG_FS=16ebcaf00:ffffffff:0` makes
-      every presented frame white, black ones included, so the composite
-      runs every frame and its inputs are black. (The earlier all-zero
-      result was stale.)
-    - The 135 quads are text. Format: a0 = (x, y, 0, -1) with w = -1
-      meaning "alpha from the texture's red channel", a1 = uv, a2 = add
-      colour 0, a3 = multiply colour (0,0,0,1). They sample tic 472, a
-      1364x1364 R8 glyph atlas (flags 0) whose *guest* bytes are all zero,
-      and all six vertices of every quad are byte-identical in guest
-      memory (`FIFA_DUMP_VB`). The UVs step by exactly one texel per glyph
-      (1/1364, 2/1364, ...): the glyph cache hands out 0x0 slots plus
-      1 px padding. So glyphs come out empty in the game's own data, not
-      in our renderer. The screen is the press-start screen
-      (`FONT_DEMO_PRESS_START_SCREEN` is one of the styles).
-    - UI is EA Twinkle (JS) with EAText/FreeType fonts and GPU SDF glyph
-      generation (`Twinkle/GlyphGenSdf_Inside/_Outside`, programs set up
-      in `sub_921cfd0`).
-    - Font lookup: the font server's vtable slot 2 (`sub_5d20540`) walks
-      its list of registered fonts (`[this+8]`, next `+0x18`, names
-      `+0x28`/`+0x48`), then falls back to the file
-      `"%s/%s.ttf"` under `data/ui/fonts` through Frostbite's VFS. Only
-      `EABold` (from the file) is ever registered. `EACondBlackItalic`,
-      used by most styles (`FONT_HEADER_*`, `FONT_LABEL_*_BOLD`,
-      `FONT_TILE_*`), fails every frame ("Error: font %s does not exist!"
-      at 0x5d20c58). It ships as an asset (`Fonts/EACondBlackItalic`,
-      `Fonts/EACondBlackItalicCollection`, `TrueTypeFontAsset` /
-      `UITtfFontFile`), not as a loose `.ttf`, so the asset-side font
-      provider never gets it. Why is open.
-    - VFS lookup (`sub_1b95f00` -> `sub_1b95ff0`): a list of mounted
-      layers (vector at 0x15426f40 at run time, 0x58-byte records; per
-      layer `P=[L+0x10]`, `T=[P+8]`, count `u32 [T+0xc]`, entries
-      `[T+0x10]` of 0x1c bytes starting with the u64 FNV-1 hash of the
-      ASCII-lowercased path, sorted, binary search). 11 layers: initfs
-      (85 files), 11,373 files, and nine single-file layers. Fonts in them:
-      `data/ui/fonts/{EABold,EAMedium,EAExpandedHeavy}.ttf` plus Japanese/
-      SChinese variants; no `EACond*` at all, on hardware either.
-    - Substituting EABold for every missing font (all fonts then load)
-      changes nothing: same zero-size quads, same empty atlas. So the
-      missing font is real but not sufficient. Glyph generation itself
-      fails. Next: find who writes the quads, then the glyph metrics and
-      GPU SDF path. Without lldb the first quad's vertices sit at guest
-      0x201b1b200 in every run; under lldb (~15 fps) they land elsewhere
-      (0x1e9c14000) and the screen appears much later than frame 150.
-      Breaking on `dbg_vb_hit` (FIFA_DUMP_VB + FIFA_DEBUG_FRAME=1200) finds
-      them, but lldb then refuses a watchpoint on that address ("Watchpoint
-      creation failed"), probably because the pool's pages are wrapped by
-      a no-copy MTLBuffer by then. A watchpoint set at startup on a fixed
-      address did get created. Untried alternative: mprotect the page and
-      report the first faulting guest pc.
-    - RomFS reads (`FIFA_LOG_ROMFS=1`): every superbundle TOC except
-      `storyingamesba` and the unused `loc/*.toc` gets read; no fs errors.
+    - Glyph quads (`vs=16e001500 fs=16ea35100`): a0 = (x, y, 0, -1) with
+      w = -1 meaning "alpha from the texture's red channel", a1 = uv,
+      a2 = add colour, a3 = multiply colour; one 6-vertex draw per glyph.
+    - Font lookup (update `main`: font server vtable 0x1489d5f0, slot 2
+      `sub_dd38dd0`; base build `sub_5d20540`) walks the registered fonts,
+      then `"%s/%s.ttf"` under `data/ui/fonts` through Frostbite's VFS, and
+      falls back to the server's default font (`[this+8]`, EABold).
+      EABold, EAMedium, EAExpandedHeavy and EAExpandedLight load;
+      `EACondBlackItalic` exists nowhere in the VFS (an asset,
+      `Fonts/EACondBlackItalic`) and resolves to EABold. Harmless so far.
+    - VFS lookup (`sub_1b95f00` -> `sub_1b95ff0`, base build): mounted
+      layers, each a sorted table of 0x1c-byte entries keyed by the u64
+      FNV-1 hash of the lower-cased path, binary search.
+    - lldb refuses watchpoints on pages wrapped by a no-copy MTLBuffer;
+      the mprotect watch in `recomp/hle/debug.c` works instead.
   - With the update (2026-10-18; `build/` is now the update's `main` on
     the patched RomFS, `FIFA_ROMFS=extracted/update/romfs_program.json`):
-    same picture. Title at frame ~93, black from ~150 on, 30 fps and
+    same picture then. Title at frame ~93, black from ~150 on, 30 fps and
     ~11,800 draws / ~120 skipped per 2 s through frame 7,100 (4 min). So
     the base cart's missing superbundles are not the cause, or not the
     only one. Function addresses in this section are the base build's;
@@ -545,8 +504,12 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     - The update build now crashes often on worker threads (guest
       null reads around frames 120-560, a different function each time:
       F_10232510, F_12460cc0, F_13698650, F_118b0720, F_12440280,
-      F_1243f4b0), about 1 run in 3. Not caused by the logger HLE (crashes
-      with it removed too).
+      F_1243f4b0, F_136b0720), in about half the 30-60 s runs, often
+      before frame 300. Not caused by the logger HLE (crashes with it
+      removed too).
+    - RomFS reads (`FIFA_LOG_ROMFS=1`; image offsets + 0x3f9c000 are
+      `romfs_program.tsv` offsets for the update): the `en/loc/en.toc`
+      of installpackage_00/02/05 are read; no fs errors.
   - Seen once (no debug options, ~frame 200): Frostbite small-block
     allocator trap `udf #0x8002` at 0x18172fc, reached from `sub_181b310`
     when a freelist's next pointer lies outside its arena, i.e. heap

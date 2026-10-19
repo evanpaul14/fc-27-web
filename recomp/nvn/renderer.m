@@ -147,11 +147,29 @@ static float tex_sc[2][64][2];          // per bound texture slot: allocation sc
 static uint32_t tex_wh[2][64][2];       // per bound texture slot: guest size
 #define RSCALE_BUFFER_INDEX 18
 
+// FIFA_GPU_PROFILE=1: every render pass and compute dispatch gets its own command buffer; GPU time is summed per
+// tag (the pass's size and first fragment program, or the compute program) and the top ones are logged with the
+// fps line (renderer_profile_report).
+static int gpu_profile(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("FIFA_GPU_PROFILE") != NULL;
+    return on;
+}
+static uint64_t prof_pass_fs;  // first fragment program drawn in the open pass
+static void commit_cb(const char *tag);
+
 static int debug_pass_no;
 static void end_pass(void) {
     if (enc) {
         [enc endEncoding];
         enc = nil;
+        if (gpu_profile()) {
+            char tag[64];
+            snprintf(tag, sizeof tag, "pass %ux%u fs %llx", st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->width : 0,
+                     st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->height : 0, (unsigned long long)prof_pass_fs);
+            commit_cb(tag);
+        }
+        prof_pass_fs = 0;
         if (g_debug_frame && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {
             id<MTLTexture> t = renderer_texture(st.rt.color[0], nil, true);
             id<MTLCommandBuffer> c = cmdbuf;
@@ -216,16 +234,54 @@ static void drain_gone(void) {
     }
 }
 
+#define PROF_N 512
+static struct { char tag[64]; double s; int n; } prof[PROF_N];
+static int nprof;
+static pthread_mutex_t prof_lock = PTHREAD_MUTEX_INITIALIZER;
+static void prof_add(const char *tag, double s) {
+    pthread_mutex_lock(&prof_lock);
+    int i = 0;
+    while (i < nprof && strcmp(prof[i].tag, tag)) i++;
+    if (i == nprof && nprof < PROF_N) {
+        snprintf(prof[nprof].tag, sizeof prof[0].tag, "%s", tag);
+        prof[nprof].s = 0;
+        prof[nprof++].n = 0;
+    }
+    if (i < nprof) { prof[i].s += s; prof[i].n++; }
+    pthread_mutex_unlock(&prof_lock);
+}
+
+static int prof_cmp(const void *a, const void *b) {
+    double x = ((const typeof(prof[0]) *)a)->s, y = ((const typeof(prof[0]) *)b)->s;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+void renderer_profile_report(void) {
+    if (!gpu_profile()) return;
+    pthread_mutex_lock(&prof_lock);
+    qsort(prof, nprof, sizeof prof[0], prof_cmp);
+    for (int i = 0; i < nprof && i < 12; i++) LOG("[prof] %6.1f ms %5d x  %s\n", prof[i].s * 1e3, prof[i].n, prof[i].tag);
+    nprof = 0;
+    pthread_mutex_unlock(&prof_lock);
+}
+
 // Commit recorded work without waiting.
 void renderer_submit(void) {
     end_pass();
     drain_gone();
+    commit_cb(NULL);
+}
+
+// Commit the open command buffer (tag: account its GPU time to that profile entry).
+static void commit_cb(const char *tag) {
     if (cmdbuf) {
         id<MTLCommandBuffer> c = cmdbuf;
         cmdbuf = nil;
+        char *ptag = tag ? strdup(tag) : NULL;
         [c addCompletedHandler:^(id<MTLCommandBuffer> done) {
             stat_gpu_s += done.GPUEndTime - done.GPUStartTime;
             __atomic_add_fetch(&g_gpu_total_ns, (uint64_t)((done.GPUEndTime - done.GPUStartTime) * 1e9), __ATOMIC_RELAXED);
+            if (ptag) { prof_add(ptag, done.GPUEndTime - done.GPUStartTime); free(ptag); }
             if (done.error) LOG("[metal] command buffer error: %s\n", done.error.localizedDescription.UTF8String);
         }];
         [c commit];
@@ -879,13 +935,14 @@ static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
     const uint8_t *vb = (const uint8_t *)vkey;
     for (size_t i = 0; i < sizeof *vkey; i++) { h ^= vb[i]; h *= 0x100000001B3ull; }
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
+    if (fkey->dual_source) { h ^= 0xd5; h *= 0x100000001B3ull; }
     if (!h) h = 1;
     uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
     while (prog_tab[slot].key && prog_tab[slot].key != h) slot = (slot + 1) & (PROG_TAB - 1);
     if (prog_tab[slot].key) { Prog *fp = (__bridge Prog *)prog_tab[slot].prog; return fp->failed ? nil : fp; }
-    NSString *key = [NSString stringWithFormat:@"%llx/%llx/%@/%@%s", p->stages[0].code_addr, p->stages[1].code_addr,
+    NSString *key = [NSString stringWithFormat:@"%llx/%llx/%@/%@%s%s", p->stages[0].code_addr, p->stages[1].code_addr,
                      [NSData dataWithBytes:vkey length:sizeof *vkey], [NSData dataWithBytes:fkey->rt_kind length:8],
-                     vkey->flip_x ? "/mirror" : ""];  // (NSData's description elides the middle of the key's bytes)
+                     vkey->flip_x ? "/mirror" : "", fkey->dual_source ? "/dual" : ""];  // (NSData's description elides the middle of the key's bytes)
     Prog *pr = cache[key];
     if (pr) {
         prog_tab[slot].key = h;
@@ -1047,11 +1104,12 @@ static id<MTLTexture> apply_swizzle(id<MTLTexture> tex, NvnTexture *t, const Nvn
 }
 
 // Upload helper: a separate command buffer, committed now so it runs before the current pass.
-static id<MTLTexture> sampled_texture(NvnTexture *t, const NvnTextureView *v, bool has_view, int want_type) {
+// image: bound for SULD / SUST, so no swizzled view (those can't be written)
+static id<MTLTexture> sampled_texture(NvnTexture *t, const NvnTextureView *v, bool has_view, int want_type, bool image) {
     // uploads (if the CPU-side contents changed) go into their own command buffer, committed before
     // the current one so they land first
     id<MTLTexture> tex = view_texture(t, v, has_view, false, nil);
-    tex = apply_swizzle(tex, t, v, has_view);
+    if (!image) tex = apply_swizzle(tex, t, v, has_view);
     MTLTextureType want = mtl_type_for(want_type);
     if (tex.textureType != want && tex.textureType != MTLTextureType2DMultisample) {
         id<MTLTexture> src = tex;
@@ -1092,6 +1150,7 @@ static void snapshots_invalidate(NvnTexture *t) {  // NULL = all
 // 0x168 + 8 * slot, separate samplers at 0x568 + 8 * slot. Bindless shaders OR a separate texture and sampler.
 static uint64_t tex_cbuf_word(int stage, uint32_t off) {
     if (off >= 0x20 && off < 0x20 + 8 * 32) return st.tex[stage][(off - 0x20) / 8];
+    if (off >= 0x120 && off < 0x120 + 8 * 8) return st.img[stage][(off - 0x120) / 8];
     if (off >= 0x168 && off < 0x168 + 8 * 128) return st.septex[stage][(off - 0x168) / 8];
     if (off >= 0x568 && off < 0x568 + 8 * 32) return st.sepsmp[stage][(off - 0x568) / 8];
     return 0;
@@ -1190,7 +1249,7 @@ static void bind_textures(int stage, ShaderInfo *si) {
         if (i < 64) tex_wh[stage][i][0] = tex_wh[stage][i][1] = 0;
         if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
             NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
-            if (e->tex) tex = sampled_texture(e->tex, &e->view, e->has_view, st_->type);
+            if (e->tex) tex = sampled_texture(e->tex, &e->view, e->has_view, st_->type, st_->is_image);
             if (e->tex && i < 64) {
                 renderer_texture_scale(e->tex, &tex_sc[stage][i][0], &tex_sc[stage][i][1]);
                 tex_wh[stage][i][0] = e->tex->width; tex_wh[stage][i][1] = e->tex->height;
@@ -1230,8 +1289,8 @@ static void bind_textures(int stage, ShaderInfo *si) {
             if (vt) LOG("target %u fmt %#x %ux%u addr %llx", vt->target, vt->format, vt->width, vt->height, (unsigned long long)vt->addr);
             LOG(" mtl type %lu %lux%lu\n", (unsigned long)tex.textureType, (unsigned long)tex.width, (unsigned long)tex.height);
         }
-        if (stage == 0) { [enc setVertexTexture:tex atIndex:i]; [enc setVertexSamplerState:smp atIndex:st_->sampler]; }
-        else { [enc setFragmentTexture:tex atIndex:i]; [enc setFragmentSamplerState:smp atIndex:st_->sampler]; }
+        if (stage == 0) { [enc setVertexTexture:tex atIndex:i]; if (!st_->is_image) [enc setVertexSamplerState:smp atIndex:st_->sampler]; }
+        else { [enc setFragmentTexture:tex atIndex:i]; if (!st_->is_image) [enc setFragmentSamplerState:smp atIndex:st_->sampler]; }
     }
 }
 
@@ -1303,6 +1362,7 @@ static CsProg *compute_program(NvnProgram *p) {
     progs[key] = [NSValue valueWithPointer:cp];
     dump_program(p);
     ShaderKey k = {0};
+    maxwell_shared_size = ss->control ? *(const uint32_t *)(ss->control + 0x754) : 0;  // (next to the local size)
     cp->si = maxwell_translate(gptr(ss->code_addr), ss->const_offset ? ss->const_offset : 0x10000, STAGE_COMPUTE, &k);
     if (!cp->si->msl) { LOG("[compute] translate failed: %s (code %llx)\n", cp->si->error, ss->code_addr); cp->failed = true; return NULL; }
     for (int i = 0; i < 3; i++) {
@@ -1325,15 +1385,24 @@ static CsProg *compute_program(NvnProgram *p) {
 
 // Global memory (LDG/STG) window: the memory pool holding the stage's first storage buffer, else its first uniform
 // buffer; shaders read zeros outside it. win = {GPU address of the pool buffer, its guest address, its size, 0}.
-static id<MTLBuffer> gmem_window(int stage, uint64_t win[4]) {
-    uint64_t hint = 0;
-    for (int i = 0; i < 16 && !hint; i++) hint = st.sbuf[stage][i].addr;
-    for (int i = 0; i < 18 && !hint; i++) hint = st.ubuf[stage][i].addr;
-    memset(win, 0, 4 * sizeof *win);
-    uint64_t base;
-    id<MTLBuffer> b = hint ? renderer_pool_window(hint, &base) : nil;
-    if (b) { win[0] = b.gpuAddress; win[1] = base; win[2] = b.length; }
-    return b;
+// gfind windows (GMEM_WINDOWS, shader.h): the memory pools of the stage's storage buffers, then of its uniform
+// buffers; unused entries have size 0. Returns the count; bufs gets the pool buffers (for useResource).
+static int gmem_windows(int stage, uint64_t win[GMEM_WINDOWS][4], __unsafe_unretained id<MTLBuffer> bufs[GMEM_WINDOWS]) {
+    memset(win, 0, sizeof(uint64_t) * 4 * GMEM_WINDOWS);
+    int n = 0;
+    static int max = -1;  // FIFA_GMEM_ONE=1: only the first window (the old behaviour, for comparisons)
+    if (max < 0) max = getenv("FIFA_GMEM_ONE") ? 1 : GMEM_WINDOWS;
+    for (int i = 0; i < 16 + 18 && n < max; i++) {
+        uint64_t a = i < 16 ? st.sbuf[stage][i].addr : st.ubuf[stage][i - 16].addr, base;
+        if (!a) continue;
+        bool have = false;
+        for (int k = 0; k < n; k++) have |= a - win[k][1] < win[k][2];
+        id<MTLBuffer> b = have ? nil : renderer_pool_window(a, &base);
+        if (!b) continue;
+        win[n][0] = b.gpuAddress; win[n][1] = base; win[n][2] = b.length;
+        bufs[n++] = b;
+    }
+    return n;
 }
 
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
@@ -1346,6 +1415,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
 #define CST(x) do { if (trace) { fprintf(stderr, "[cs] %s\n", x); fflush(stderr); } } while (0)
     CST("end_pass");
     end_pass();
+    if (gpu_profile()) commit_cb("other");
     CST("encoder");
     id<MTLComputeCommandEncoder> ce = [cb() computeCommandEncoder];
     CST("pipeline");
@@ -1387,9 +1457,10 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     }
     CST("gmem");
     if (si->uses_gmem) {
-        uint64_t win[4];
-        id<MTLBuffer> gb = gmem_window(5, win);
-        if (gb) [ce useResource:gb usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        uint64_t win[GMEM_WINDOWS][4];
+        __unsafe_unretained id<MTLBuffer> bufs[GMEM_WINDOWS];
+        int n = gmem_windows(5, win, bufs);
+        for (int k = 0; k < n; k++) [ce useResource:bufs[k] usage:MTLResourceUsageRead | MTLResourceUsageWrite];
         [ce setBytes:win length:sizeof win atIndex:GMEM_BUFFER_INDEX];
     }
     CST("textures");
@@ -1402,7 +1473,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         tex_sc[0][i][0] = tex_sc[0][i][1] = 1;
         if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
             NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
-            if (e->tex) tex = sampled_texture(e->tex, &e->view, e->has_view, st_->type);
+            if (e->tex) tex = sampled_texture(e->tex, &e->view, e->has_view, st_->type, st_->is_image);
             if (e->tex && i < 64) renderer_texture_scale(e->tex, &tex_sc[0][i][0], &tex_sc[0][i][1]);
             for (int k = 0; k < nfeedback; k++)
                 if (e->tex == feedback_tex[k]) {
@@ -1415,7 +1486,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         }
         if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = sampler_for(&((NvnSamplerDesc *)st.spool->entries)[tsc]);
         [ce setTexture:tex ? tex : dummy_texture(st_->type) atIndex:i];
-        [ce setSamplerState:smp ? smp : default_sampler() atIndex:st_->sampler];
+        if (!st_->is_image) [ce setSamplerState:smp ? smp : default_sampler() atIndex:st_->sampler];
     }
     if (si->uses_rscale) {
         float rs[65][4] = {{1, 1, 0, 0}};
@@ -1433,6 +1504,11 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     }
     [ce dispatchThreadgroups:MTLSizeMake(gx, gy, gz) threadsPerThreadgroup:MTLSizeMake(cp->local[0], cp->local[1], cp->local[2])];
     [ce endEncoding];
+    if (gpu_profile()) {
+        char tag[64];
+        snprintf(tag, sizeof tag, "cs %llx", (unsigned long long)st.program->stages[5].code_addr);
+        commit_cb(tag);
+    }
     CST("done");
     stat_dispatches++;
 }
@@ -1608,8 +1684,11 @@ static void draw(CmdRec *r, bool indexed) {
     vkey.depth_minus_one = nvn_depth_mode() == 0;
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
+    if (st.color_state[0] & 1)  // target 0 blends with SRC1 factors: the shader's target 1 output is that source
+        for (int k = 1; k <= 4; k++) fkey.dual_source |= st.blend[0][k] >= 0x10 && st.blend[0][k] <= 0x13;
     Prog *pr = get_program(st.program, &vkey, &fkey);
     if (!pr || !pr->ready) { SKIP(1); return; }
+    if (!prof_pass_fs) prof_pass_fs = st.program->stages[1].code_addr;
     static int log_rt_w = -1, log_rt_h;
     if (log_rt_w < 0) { const char *e = getenv("FIFA_LOG_RT"); log_rt_w = 0; if (e) sscanf(e, "%dx%d", &log_rt_w, &log_rt_h); }
     static uint64_t log_rt_addr = 1;
@@ -1823,12 +1902,15 @@ static void draw(CmdRec *r, bool indexed) {
     // resources
     bind_cbufs(0, pr->vi);
     bind_cbufs(1, pr->fi);
-    if (pr->vi->uses_gmem || pr->fi->uses_gmem) {
-        uint64_t win[4];
-        id<MTLBuffer> gb = gmem_window(pr->vi->uses_gmem ? 0 : 1, win);
-        if (gb) [enc useResource:gb usage:MTLResourceUsageRead | MTLResourceUsageWrite stages:MTLRenderStageVertex | MTLRenderStageFragment];
-        if (pr->vi->uses_gmem) [enc setVertexBytes:win length:sizeof win atIndex:GMEM_BUFFER_INDEX];
-        if (pr->fi->uses_gmem) [enc setFragmentBytes:win length:sizeof win atIndex:GMEM_BUFFER_INDEX];
+    for (int sg = 0; sg < 2; sg++) {
+        if (!(sg ? pr->fi : pr->vi)->uses_gmem) continue;
+        uint64_t win[GMEM_WINDOWS][4];
+        __unsafe_unretained id<MTLBuffer> bufs[GMEM_WINDOWS];
+        int n = gmem_windows(sg, win, bufs);
+        for (int k = 0; k < n; k++)
+            [enc useResource:bufs[k] usage:MTLResourceUsageRead | MTLResourceUsageWrite stages:sg ? MTLRenderStageFragment : MTLRenderStageVertex];
+        if (sg) [enc setFragmentBytes:win length:sizeof win atIndex:GMEM_BUFFER_INDEX];
+        else [enc setVertexBytes:win length:sizeof win atIndex:GMEM_BUFFER_INDEX];
     }
     static id<MTLBuffer> dbgvs;
     bool dbg_this = maxwell_dbg_vs && (const uint8_t *)gptr(st.program->stages[0].code_addr) == maxwell_dbg_vs;
@@ -2096,7 +2178,7 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
     NvnTexture *st_ = (NvnTexture *)(uintptr_t)src->tex, *dt = (NvnTexture *)(uintptr_t)dst->tex;
     if (!st_ || !dt) return;
     end_pass();
-    id<MTLTexture> s = sampled_texture(st_, &src->view, src->has_view, TEXTYPE_2D);
+    id<MTLTexture> s = sampled_texture(st_, &src->view, src->has_view, TEXTYPE_2D, false);
     renderer_mark_gpu_owned(dt);
     id<MTLTexture> d = view_texture(dt, &dst->view, dst->has_view, true, nil);
     const int32_t *sr = src->region, *dr = dst->region;

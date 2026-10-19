@@ -18,6 +18,7 @@
 //   hold <button> <frames>
 //   stick <l|r> <x> <y> <frames>    x, y in -1..1
 //   wait <frames>
+//   debug                           the next frame is the debug frame (FIFA_DEBUG_FRAME)
 //   shot [path]                     save the next presented image (default build/live.png; written whole, then renamed)
 // e.g. echo 'down 4; a; wait 60; shot' > /tmp/fifa.ctl
 #import <AppKit/AppKit.h>
@@ -172,6 +173,8 @@ static _Atomic(char *) shot_path;  // taken by the next present (input_take_shot
 static _Atomic uint64_t shots_done;
 
 char *input_take_shot(void) { return atomic_exchange(&shot_path, NULL); }
+static _Atomic bool debug_req;
+bool input_take_debug(void) { return atomic_exchange(&debug_req, false); }
 void input_shot_done(void) { atomic_fetch_add(&shots_done, 1); }
 
 static void wait_frame(uint64_t frame) {
@@ -199,6 +202,9 @@ static void control_command(char *cmd) {
     } else if (!strcmp(a, "stick") && sscanf(cmd, "%*s %63s %lf %lf %ld", b, &x, &y, &n) == 4 && (*b == 'l' || *b == 'r')) {
         add_press((Press){now + 1, now + 1 + n, 0, (int32_t)(x * STICK_MAX), (int32_t)(y * STICK_MAX), *b == 'l' ? 1 : 2});
         wait_frame(now + 1 + n + 2);
+    } else if (!strcmp(a, "debug")) {  // FIFA_DEBUG_FRAME for the next frame
+        atomic_store(&debug_req, true);
+        wait_frame(now + 2);
     } else if (!strcmp(a, "shot")) {
         if (sscanf(cmd, "%*s %255s", b) != 1) strcpy(b, "build/live.png");
         uint64_t done = atomic_load(&shots_done);

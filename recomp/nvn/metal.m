@@ -529,6 +529,68 @@ void renderer_save_texture_alpha(id<MTLTexture> tex, const char *path) {
     free(a);
 }
 
+// Debug: a float texture's colour channels scaled by their largest finite value (<path>_n.png); logs the maxima
+// (HDR targets hold values that an 8-bit dump shows as black).
+static void save_texture_normalized(id<MTLTexture> tex, const char *path) {
+    NSUInteger w = tex.width, h = tex.height;
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+                                                                                 width:w height:h mipmapped:NO];
+    d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    d.storageMode = MTLStorageModeShared;
+    id<MTLTexture> dst = [dev newTextureWithDescriptor:d];
+    static id<MTLRenderPipelineState> pipe;
+    if (!pipe) {
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        id<MTLLibrary> lib = [dev newLibraryWithSource:@(present_src) options:nil error:nil];
+        pd.vertexFunction = [lib newFunctionWithName:@"vs"];
+        pd.fragmentFunction = [lib newFunctionWithName:@"fs"];
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA32Float;
+        pipe = [dev newRenderPipelineStateWithDescriptor:pd error:nil];
+    }
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = dst;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+    float pv[4] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0};
+    [e setRenderPipelineState:pipe];
+    [e setVertexBytes:pv length:sizeof pv atIndex:0];
+    [e setFragmentTexture:raw_view(tex) atIndex:0];
+    [e setFragmentSamplerState:present_sampler atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    float *fp = malloc(w * h * 16);
+    [dst getBytes:fp bytesPerRow:w * 16 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    float mx[3] = {0, 0, 0};
+    size_t nonzero = 0, bad = 0;
+    for (NSUInteger i = 0; i < w * h; i++) {
+        bool nz = false;
+        for (int k = 0; k < 3; k++) {
+            float v = fp[i * 4 + k];
+            if (!isfinite(v)) { bad++; continue; }
+            if (v > mx[k]) mx[k] = v;
+            nz |= v != 0;
+        }
+        nonzero += nz;
+    }
+    float m = fmaxf(mx[0], fmaxf(mx[1], mx[2]));
+    uint8_t *px = malloc(w * h * 4);
+    for (NSUInteger i = 0; i < w * h * 4; i++) {
+        float v = (i & 3) == 3 ? 1.0f : fp[i];
+        px[i] = (uint8_t)(m > 0 && isfinite(v) ? fminf(fmaxf(v / ((i & 3) == 3 ? 1.0f : m), 0), 1) * 255.0f + 0.5f : 0);
+    }
+    char np[512];
+    snprintf(np, sizeof np, "%.*s_n.png", (int)(strlen(path) > 4 ? strlen(path) - 4 : strlen(path)), path);
+    save_png(px, w, h, false, np);
+    LOG("[metal] %s: max %g %g %g, %zu/%lu pixels nonzero, %zu non-finite\n", np, mx[0], mx[1], mx[2], nonzero,
+        (unsigned long)(w * h), bad);
+    free(px);
+    free(fp);
+}
+
 // A texture as the window shows it (upright, alpha ignored), as PNG.
 void renderer_save_texture(id<MTLTexture> tex, const char *path) {
     NSUInteger w = tex.width, h = tex.height;
@@ -566,6 +628,10 @@ void renderer_save_texture(id<MTLTexture> tex, const char *path) {
     save_png(px, w, h, false, path);
     free(px);
     LOG("[metal] saved %s (%lux%lu)\n", path, (unsigned long)w, (unsigned long)h);
+    MTLPixelFormat f = tex.pixelFormat;
+    if (f == MTLPixelFormatRG11B10Float || f == MTLPixelFormatRGBA16Float || f == MTLPixelFormatRGBA32Float ||
+        f == MTLPixelFormatRG16Float || f == MTLPixelFormatR16Float || f == MTLPixelFormatR32Float || f == MTLPixelFormatRG32Float)
+        save_texture_normalized(tex, path);
 }
 
 // ================================================================== present
@@ -627,13 +693,14 @@ void backend_present(NvnTexture *t) {
     }
     static long debug_at = -1;  // FIFA_DEBUG_FRAME=<n>: log (and dump passes of) frame n
     if (debug_at < 0) debug_at = ENV("FIFA_DEBUG_FRAME") ? atol(ENV("FIFA_DEBUG_FRAME")) : 0;
-    g_debug_frame = debug_at && total_frames == (uint64_t)debug_at;
+    g_debug_frame = (debug_at && total_frames == (uint64_t)debug_at) || input_take_debug();  // or FIFA_CONTROL "debug"
     if (g_debug_frame) LOG("===== debug frame %llu =====\n", (unsigned long long)total_frames);
     double now = now_s();
     if (now - last_fps_time >= 2.0) {
         if (last_fps_time > 0)
             LOG("[metal] frame %llu %.1f fps (%s)\n", (unsigned long long)total_frames, frames / (now - last_fps_time),
                 renderer_stats());
+        renderer_profile_report();
         frames = 0;
         last_fps_time = now;
     }

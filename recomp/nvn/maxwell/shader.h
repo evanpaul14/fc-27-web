@@ -45,6 +45,7 @@ typedef struct {
                             // after flip_y: keys without it hash as before - shader caches stay valid.)
     uint32_t vs_out_mask;   // fragment: varyings the vertex shader provides
     uint8_t glsl;           // emit Vulkan GLSL (see the contract above) instead of MSL
+    uint8_t dual_source;    // (MSL) fragment: target 1 is the second blend source of target 0, [[color(0), index(1)]]
 } ShaderKey;
 
 typedef struct {
@@ -82,16 +83,20 @@ typedef struct {
     char error[256];        // set when translation fails
 } ShaderInfo;
 
-// Global memory (LDG/STG). MSL (fifa-web): a window of guest memory bound per draw as constant ulong4 gmem_win =
-// {GPU address of the window's start, its guest address, its size}: the guest's GPU memory spans more than one
-// Metal buffer can wrap. GLSL: one buffer at maxwell_gmem_base, as in LAS Recomp.
+// Global memory (LDG/STG). MSL (fifa-web): GMEM_WINDOWS windows of guest memory bound per draw as constant ulong4
+// gmem_win[] = {GPU address of the window's start, its guest address, its size} (size 0: unused): the guest's GPU
+// memory spans more than one Metal buffer can wrap, and a shader's storage buffers lie in different memory pools.
+// GLSL: one buffer at maxwell_gmem_base, as in LAS Recomp.
 #define GMEM_BUFFER_INDEX 17
+#define GMEM_WINDOWS 8
 // (GLSL compute, Vulkan) the fast copy of a dispatch's storage buffers: its address table and its data
 #define GMAP_BUFFER_INDEX 20
 #define GFAST_BUFFER_INDEX 21
 #define GMAP_MAX 16  // ranges in the table (GMap { uvec4 gmap[GMAP_MAX + 1]; }: [i] = addr lo, addr hi, size, word offset;
                      // [GMAP_MAX].x = count)
 extern uint64_t maxwell_gmem_base, maxwell_gmem_size;
+// Compute: bytes of shared memory (LDS/STS) the program declares; 0 = Metal's maximum (32 KB).
+extern uint32_t maxwell_shared_size;
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
 // maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).
 extern const uint8_t *maxwell_dbg_code;

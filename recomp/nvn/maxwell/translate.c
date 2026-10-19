@@ -30,6 +30,15 @@ const uint8_t *maxwell_dbg_vs;
 
 #define RZ 255
 #define LMEM_WORDS 256  // local memory per invocation (1 KB)
+uint32_t maxwell_shared_size;
+
+// compute shared memory words: the program's size rounded up to a power of two (addresses are masked), else
+// Metal's 32 KB limit
+static int smem_words(void) {
+    int n = 1;
+    while (n * 4 < (int)maxwell_shared_size && n < 8192) n *= 2;
+    return maxwell_shared_size ? n : 8192;
+}
 #define PT 7
 
 typedef struct {
@@ -63,7 +72,7 @@ typedef struct {
     uint8_t pred_used[8];
     uint32_t in_attr_mask, out_attr_mask;
     uint32_t vs_in_comp[32];
-    bool uses_branches, uses_cc, uses_local, uses_vid, uses_iid, uses_frag_coord, uses_front_facing, uses_lane;
+    bool uses_branches, uses_cc, uses_local, uses_shared, uses_vid, uses_iid, uses_frag_coord, uses_front_facing, uses_lane;
     bool uses_rscale;  // resolution-scale table (fragment/compute only)
     uint32_t flat_mask;           // fragment inputs using constant (flat) interpolation
     uint32_t noperspective_mask;  // fragment inputs using pass (linear) interpolation
@@ -72,6 +81,8 @@ typedef struct {
     bool tex_weak[64];            // slot type only guessed (from a size query): the next sample decides
     uint32_t bl_key[64];          // bindless handle cbuf offsets (a << 16 | b), slot + 1 in bl_slot
     int bl_slot[64], nbl;
+    int img_slot[8];              // NVN image bindings (c[2][0x120 + 8 * i]) -> slot + 1
+    uint8_t img_access[64];       // per slot: 1 read, 2 written (SULD / SUST)
     const uint64_t *words;        // instruction words, and the index of the one being translated
     size_t cur;
     bool fail;
@@ -996,6 +1007,92 @@ static void emit_tld4_bindless(Ctx *c, uint64_t w) {
     write_tex_result(c, slot, call, mask, d, RZ, false, false);
 }
 
+// SULD / SUST (surface load / store), bindless only: the handle register is a MOV of an NVN image binding,
+// c[2][0x120 + 8 * slot]. Bits: 0-7 data, 8-15 coordinates (array layer last), 20-23 component mask (.P) or
+// size (.D, bit 52), 23 .BA (.D: x in bytes), 33-35 type, 39-46 handle register, 51 bound.
+static void emit_surface(Ctx *c, uint64_t w, bool store) {
+    int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), hreg = (int)bits(w, 39, 8);
+    int stype = (int)bits(w, 33, 3);
+    bool sized = bits(w, 52, 1);
+    if (c->glsl) { fail(c, "surface ops (GLSL)"); return; }
+    if (bits(w, 51, 1)) { fail(c, "bound surface"); return; }
+    if (stype == 1 || stype > 5) { fail(c, "surface type %d", stype); return; }
+    uint32_t ho[2];
+    if (trace_handle(c, c->cur, hreg, ho, 0, 0) != 1 || ho[0] < 0x120 || ho[0] >= 0x160) {
+        fail(c, "surface handle r%d at %#zx not an image binding", hreg, c->cur * 8);
+        return;
+    }
+    static const int types[] = {TEXTYPE_1D, TEXTYPE_BUFFER, TEXTYPE_1D_ARRAY, TEXTYPE_2D, TEXTYPE_2D_ARRAY, TEXTYPE_3D};
+    int type = types[stype];
+    bool array = stype == 2 || stype == 4;
+    int slot = tex_slot_at(c, &c->img_slot[(ho[0] - 0x120) / 8], ho[0], type, false, array);
+    if (c->fail) return;
+    c->info->tex[slot].is_image = true;
+    c->img_access[slot] |= store ? 2 : 1;
+    int nco = stype == 0 || stype == 2 ? 1 : stype == 5 ? 3 : 2;
+    int size = (int)bits(w, 20, 3), bytes = size == 5 ? 8 : size == 6 ? 16 : 4;
+    if (sized && size < 4) { fail(c, "surface .D size %d", size); return; }
+    char co[160], tmp[48];
+    const char *x0 = R(a);
+    if (sized && bits(w, 23, 1)) { sprintf(tmp, "(%s / %du)", R(a), bytes); x0 = tmp; }  // .BA
+    if (nco == 1) sprintf(co, "uint(%s)", x0);
+    else if (nco == 2) sprintf(co, "uint2(%s, %s)", x0, R(a + 1));
+    else sprintf(co, "uint3(%s, %s, %s)", x0, R(a + 1), R(a + 2));
+    if (array) sprintf(co + strlen(co), ", %s", R(a + nco));
+    uint32_t mask = sized ? (1u << (bytes / 4)) - 1 : (uint32_t)bits(w, 20, 4);
+    if (store) {
+        char v[4][48];
+        for (int i = 0, k = 0; i < 4; i++) {
+            if (mask & (1u << i)) sprintf(v[i], "as_type<float>(%s)", R(d == RZ ? RZ : d + k++));
+            else strcpy(v[i], "0.0f");
+        }
+        sp(&c->body, "    t%d.write(float4(%s, %s, %s, %s), %s);\n", slot, v[0], v[1], v[2], v[3], co);
+    } else {
+        char call[300];
+        sprintf(call, "t%d.read(%s)", slot, co);
+        write_tex_result(c, slot, call, mask, d, RZ, false, false);
+    }
+}
+
+// ATOMS (shared), ATOM / RED (global; RED returns nothing). 32-bit integer operations only.
+//   ATOMS: 0-7 d, 8-15 address, 20-27 value, 28-29 size (0 U32, 1 S32), 30-51 word offset, 52-55 op
+//   ATOM:  0-7 d, 8-15 address (.E bit 48: 64-bit pair), 20-27 value, 28-47 byte offset, 49-51 size, 52-55 op
+//   RED:   0-7 value, 8-15 address (.E bit 48), 20-22 size, 23-25 op, 28-47 byte offset
+// ops: 0 add, 1 min, 2 max, 5 and, 6 or, 7 xor, 8 exch (not RED)
+static void emit_atomic(Ctx *c, uint64_t w, int kind) {  // kind: 0 ATOMS, 1 ATOM, 2 RED
+    int d = kind == 2 ? RZ : (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), b = kind == 2 ? (int)bits(w, 0, 8) : (int)bits(w, 20, 8);
+    int size = kind == 0 ? (int)bits(w, 28, 2) : kind == 1 ? (int)bits(w, 49, 3) : (int)bits(w, 20, 3);
+    int op = kind == 2 ? (int)bits(w, 23, 3) : (int)bits(w, 52, 4);
+    static const char *const fn[] = {"add", "min", "max", NULL, NULL, "and", "or", "xor", "exchange"};
+    if (c->glsl) { fail(c, "atomics (GLSL)"); return; }
+    if (size > 1 || op > 8 || !fn[op]) { fail(c, "atomic op %d size %d", op, size); return; }
+    const char *ty = size == 1 ? "int" : "uint";
+    char call[512], addr[256];
+    if (kind == 0) {
+        if (c->stage != STAGE_COMPUTE) { fail(c, "shared memory outside compute"); return; }
+        c->uses_shared = true;
+        uint32_t off = (uint32_t)bits(w, 30, 22) * 4;
+        if (a == RZ) sprintf(addr, "%uu", off);
+        else sprintf(addr, "(%s + %uu)", R(a), off);
+        sp(&c->body, "    { threadgroup atomic_%s *ap = (threadgroup atomic_%s *)&smem[(%s >> 2) & %du];\n", ty, ty, addr,
+           smem_words() - 1);
+    } else {
+        int64_t off = sbits(w, 28, 20);
+        c->info->uses_gmem = true;
+        c->info->uses_gmem_store = true;
+        if (a == RZ) sprintf(addr, "ulong(%lld)", (long long)off);
+        else if (bits(w, 48, 1)) sprintf(addr, "((ulong(%s) << 32 | ulong(%s)) + ulong(%lld))", R(a + 1), R(a), (long long)off);
+        else sprintf(addr, "(ulong(%s) + ulong(%lld))", R(a), (long long)off);
+        sp(&c->body, "    { ulong ga = gfind(gmem_win, %s); device atomic_%s *ap = (device atomic_%s *)(gmem + ga);\n", addr, ty, ty);
+        sp(&c->body, "      if (ga != ~0ul) {\n");
+    }
+    sprintf(call, "atomic_fetch_%s_explicit(ap, %s(%s), memory_order_relaxed)", fn[op], ty, R(b));
+    if (op == 8) sprintf(call, "atomic_exchange_explicit(ap, %s(%s), memory_order_relaxed)", ty, R(b));
+    if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = uint(%s);\n", d, call); }
+    else sp(&c->body, "      %s;\n", call);
+    sp(&c->body, kind == 0 ? "    }\n" : "    } }\n");
+}
+
 // ------------------------------------------------------------------ instruction translation
 static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     char t[2048], u[2048];
@@ -1093,6 +1190,26 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         emit_tex(c, w, false);
     } else if (OPM(0xdeb8000000000000ull, 0xfff8000000000000ull)) {  // TEX.B (bindless)
         emit_tex(c, w, true);
+    } else if (OPM(0xec00000000000000ull, 0xff00000000000000ull)) {  // ATOMS
+        emit_atomic(c, w, 0);
+    } else if (OPM(0xed00000000000000ull, 0xff00000000000000ull)) {  // ATOM
+        emit_atomic(c, w, 1);
+    } else if (OPM(0xebf8000000000000ull, 0xfff8000000000000ull)) {  // RED
+        emit_atomic(c, w, 2);
+    } else if (OPM(0x50d8000000000000ull, 0xfff8000000000000ull)) {  // VOTE (Apple SIMD-groups are 32 wide too)
+        int mode = (int)bits(w, 48, 2), pd = (int)bits(w, 45, 3);
+        const char *ps = P((int)bits(w, 39, 3), bits(w, 42, 1));
+        if (c->glsl || c->stage == STAGE_VERTEX) { fail(c, "vote outside MSL fragment/compute"); return; }
+        if (mode == 3) { fail(c, "vote mode 3"); return; }
+        sp(&c->body, "    { bool vp = %s;\n", ps);
+        if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = uint(ulong(simd_ballot(vp)));\n", d); }
+        static const char *const fn[] = {"simd_all(vp)", "simd_any(vp)", "(simd_all(vp) || simd_all(!vp))"};
+        if (pd != PT) { c->pred_used[pd] = 1; sp(&c->body, "      p%d = %s;\n", pd, fn[mode]); }
+        sp(&c->body, "    }\n");
+    } else if (OPM(0xeb10000000000000ull, 0xfff8000000000000ull)) {  // SULD
+        emit_surface(c, w, false);
+    } else if (OPM(0xeb20000000000000ull, 0xfff8000000000000ull)) {  // SUST
+        emit_surface(c, w, true);
     } else if (OPM(0xdc38000000000000ull, 0xff38000000000000ull)) {  // TLD
         emit_tld(c, w);
     } else if (OPM(0xdef8000000000000ull, 0xfff8000000000000ull)) {  // TLD4.B (bindless gather)
@@ -1595,8 +1712,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         if (c->glsl)
             sp(&c->body, "    { ulong ga = %s - 0x%llxul; bool ok = ga < 0x%llxul;\n", addr,
                (unsigned long long)maxwell_gmem_base, (unsigned long long)maxwell_gmem_size);
-        else  // MSL: the window is bound per draw (gmem_win, see GMEM_BUFFER_INDEX)
-            sp(&c->body, "    { ulong ga = %s - gmem_win.y; bool ok = ga < gmem_win.z;\n", addr);
+        else  // MSL: the windows are bound per draw (gmem_win, see GMEM_BUFFER_INDEX); ga is relative to window 0
+            sp(&c->body, "    { ulong ga = gfind(gmem_win, %s); bool ok = ga != ~0ul;\n", addr);
         static const char *const ld_small[] = {"uint(gmem[ga])", "uint(int(char(gmem[ga])))",
                                                "uint(*(device ushort *)(gmem + ga))", "uint(int(*(device short *)(gmem + ga)))"};
         int nw = size == 5 ? 2 : size >= 6 ? 4 : 1;
@@ -1709,12 +1826,17 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         icmp_expr(cmp, (int)bits(w, 49, 3), cv, "0u", bits(w, 48, 1));
         sprintf(t, "(%s ? %s : %s)", cmp, R(a), bv);
         set_reg(c, d, t);
-    } else if (OPM(0xef40000000000000ull, 0xfff8000000000000ull) || OPM(0xef50000000000000ull, 0xfff8000000000000ull)) {  // LDL / STL
-        // thread-private local memory, modelled as a word array (byte/short accesses within a word)
-        bool store = bits(w, 52, 1);
+    } else if (OPM(0xef40000000000000ull, 0xffe0000000000000ull)) {  // LDL / STL / LDS / STS
+        // thread-private local memory (lmem) or compute shared memory (smem, threadgroup), modelled as word arrays
+        // (byte/short accesses within a word)
+        bool store = bits(w, 52, 1), shared = bits(w, 51, 1);
         int size = (int)bits(w, 48, 3);
         int32_t off = (int32_t)sbits(w, 20, 24);
-        c->uses_local = true;
+        const char *mem = shared ? "smem" : "lmem";
+        int words = shared ? smem_words() : LMEM_WORDS;
+        if (shared && (c->stage != STAGE_COMPUTE || c->glsl)) { fail(c, "shared memory outside MSL compute"); return; }
+        if (shared) c->uses_shared = true;
+        else c->uses_local = true;
         char addr[128];
         if (a == RZ) sprintf(addr, "%du", off);
         else sprintf(addr, "(%s + %du)", R(a), (uint32_t)off);
@@ -1724,19 +1846,19 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             if (size < 4) {
                 static const char *const ext[] = {"(v >> sh) & 0xFFu", "uint(int(char((v >> sh) & 0xFFu)))", "(v >> sh) & 0xFFFFu",
                                                   "uint(int(short((v >> sh) & 0xFFFFu)))"};
-                if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      uint v = lmem[(la >> 2) & %du]; uint sh = (la & 3u) * 8u; r%d = %s;\n", LMEM_WORDS - 1, d, ext[size]); }
+                if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      uint v = %s[(la >> 2) & %du]; uint sh = (la & 3u) * 8u; r%d = %s;\n", mem, words - 1, d, ext[size]); }
             } else {
                 for (int k = 0; k < nw; k++)
-                    if (d != RZ && d + k < RZ) { c->reg_used[d + k] = 1; sp(&c->body, "      r%d = lmem[((la >> 2) + %du) & %du];\n", d + k, k, LMEM_WORDS - 1); }
+                    if (d != RZ && d + k < RZ) { c->reg_used[d + k] = 1; sp(&c->body, "      r%d = %s[((la >> 2) + %du) & %du];\n", d + k, mem, k, words - 1); }
             }
         } else {
             if (size < 4) {
                 uint32_t m = size < 2 ? 0xFFu : 0xFFFFu;
-                sp(&c->body, "      uint sh = (la & 3u) * 8u; uint i = (la >> 2) & %du; lmem[i] = (lmem[i] & ~(0x%xu << sh)) | ((%s & 0x%xu) << sh);\n",
-                   LMEM_WORDS - 1, m, R(d), m);
+                sp(&c->body, "      uint sh = (la & 3u) * 8u; uint i = (la >> 2) & %du; %s[i] = (%s[i] & ~(0x%xu << sh)) | ((%s & 0x%xu) << sh);\n",
+                   words - 1, mem, mem, m, R(d), m);
             } else {
                 for (int k = 0; k < nw; k++)
-                    sp(&c->body, "      lmem[((la >> 2) + %du) & %du] = %s;\n", k, LMEM_WORDS - 1, R(d == RZ ? RZ : d + k));
+                    sp(&c->body, "      %s[((la >> 2) + %du) & %du] = %s;\n", mem, k, words - 1, R(d == RZ ? RZ : d + k));
             }
         }
         sp(&c->body, "    }\n");
@@ -2207,6 +2329,10 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     // ---------------------------------------------------------- MSL source
     Str s = {0};
     sp(&s, "#include <metal_stdlib>\nusing namespace metal;\n");
+    if (info->uses_gmem)  // guest address -> offset from window 0's GPU address (wrapping), ~0 outside every window
+        sp(&s, "static inline ulong gfind(constant ulong4 *w, ulong a) {\n"
+               "  for (int i = 0; i < %d; i++) { ulong o = a - w[i].y; if (o < w[i].z) return w[i].x + o - w[0].x; }\n"
+               "  return ~0ul;\n}\n", GMEM_WINDOWS);
     sp(&s, "static inline uint cbr(constant uint4 *cb, uint off) { return cb[off >> 4][(off >> 2) & 3]; }\n");
     sp(&s, "static inline uint bfe_u(uint v, uint ctl) { uint pos = ctl & 0xFFu, len = (ctl >> 8) & 0xFFu; if (len == 0u) return 0u; if (pos >= 32u) return 0u; return extract_bits(v, pos, min(len, 32u - pos)); }\n");
     sp(&s, "static inline uint bfe_s(uint v, uint ctl) { uint pos = ctl & 0xFFu, len = (ctl >> 8) & 0xFFu; if (len == 0u) return 0u; if (pos >= 32u) return (int(v) < 0) ? 0xFFFFFFFFu : 0u; return uint(extract_bits(int(v), pos, min(len, 32u - pos))); }\n");
@@ -2242,12 +2368,15 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             sp(&s, "  float4 v%d [[user(locn%d)]]%s;\n", i, i, interp);
         }
         sp(&s, "};\n");
+        bool dual = key && key->dual_source && !c->glsl;
         sp(&s, "struct FOut {\n");
         for (int rt = 0; rt < 8; rt++) {
             if (!((c->omap_target >> (rt * 4)) & 0xF)) continue;
             int kind = key ? key->rt_kind[rt] : 0;
-            sp(&s, "  %s4 c%d [[color(%d)]];\n", kind == 1 ? "int" : kind == 2 ? "uint" : "float", rt, rt);
+            if (rt == 1 && dual) sp(&s, "  float4 c1 [[color(0), index(1)]];\n");
+            else sp(&s, "  %s4 c%d [[color(%d)]];\n", kind == 1 ? "int" : kind == 2 ? "uint" : "float", rt, rt);
         }
+        if (dual && !((c->omap_target >> 4) & 0xF)) sp(&s, "  float4 c1 [[color(0), index(1)]];\n");  // (zero)
         if (c->omap_depth) { sp(&s, "  float depth [[depth(any)]];\n"); info->writes_depth = true; }
         sp(&s, "};\n");
     }
@@ -2262,7 +2391,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             args = (Str){0};  // (was a use after free + double free of args.buf)
             fail(c, "cbuf %d clashes with gmem", GMEM_BUFFER_INDEX);
         }
-        sp(&args, ", constant ulong4 &gmem_win [[buffer(%d)]]", GMEM_BUFFER_INDEX);
+        sp(&args, ", constant ulong4 *gmem_win [[buffer(%d)]]", GMEM_BUFFER_INDEX);
     }
     if (c->uses_rscale && stage != STAGE_VERTEX) {
         sp(&args, ", constant float4 *rscale [[buffer(18)]]");
@@ -2280,6 +2409,11 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     for (int i = 0; i < info->ntex; i++) {
         ShaderTexture *t = &info->tex[i];
         const char *tn = tex_type_name(t->type);
+        if (t->is_image) {  // no sampler
+            static const char *const acc[] = {"read", "read", "write", "read_write"};
+            sp(&args, ", texture%s<float, access::%s> t%d [[texture(%d)]]", tn, acc[c->img_access[i] & 3], i, i);
+            continue;
+        }
         int same = -1;
         for (int j = 0; j < i && t->bindless && same < 0; j++)
             if (info->tex[j].bindless && info->tex[j].bindless_offset == t->bindless_offset) same = j;
@@ -2308,7 +2442,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
            args.buf ? args.buf : "");
     }
     free(args.buf);
-    if (info->uses_gmem && !c->glsl) sp(&s, "  device uchar *gmem = (device uchar *)gmem_win.x;\n");
+    if (info->uses_gmem && !c->glsl) sp(&s, "  device uchar *gmem = (device uchar *)gmem_win[0].x;\n");
     if (salias.buf) { sp(&s, "%s", salias.buf); free(salias.buf); }
     for (int i = 0; i < 256; i++)
         if (c->reg_used[i]) sp(&s, "  uint r%d = 0;\n", i);
@@ -2316,6 +2450,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         if (c->pred_used[i]) sp(&s, "  bool p%d = false;\n", i);
     if (c->uses_cc) sp(&s, "  uint cc = 0; bool ccz = false, ccs = false;\n");
     if (c->uses_local) sp(&s, "  uint lmem[%d] = {};\n", LMEM_WORDS);
+    if (c->uses_shared) sp(&s, "  threadgroup uint smem[%d];\n", smem_words());
     if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f;\n" : "  float dbgv = -1.0f;\n");
     if (any_branch) {
         sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0; uint pbk[16]; uint pbk_n = 0; uint pcnt[16]; uint pcnt_n = 0;\n");
@@ -2333,7 +2468,8 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         if (maxwell_dbg_vs && blob == maxwell_dbg_vs) sp(&s, "  if (iid < 64u && vid < 8u) { dbgout[iid * 8u + vid] = out.pos; dbgout[512u + iid * 8u + vid] = %s; }\n", (c->out_attr_mask & 2u) ? "out.v1" : "float4(0)");
         sp(&s, "  return out;\n}\n");
     } else if (stage == STAGE_FRAGMENT) {
-        sp(&s, "  FOut o;\n");
+        bool zero_c1 = key && key->dual_source && !c->glsl && !((c->omap_target >> 4) & 0xF);
+        sp(&s, zero_c1 ? "  FOut o = {};\n" : "  FOut o;\n");
         int r = 0;
         for (int rt = 0; rt < 8; rt++) {
             uint32_t m = (c->omap_target >> (rt * 4)) & 0xF;

@@ -9,5 +9,6 @@ void input_state(InputState *s);              /* any thread */
 void input_key(unsigned short key, bool down);  /* main thread: window key events (NSEvent keyCode) */
 void input_release_all(void);
 char *input_take_shot(void);                 /* FIFA_CONTROL screenshot path for the next present (free it), or NULL */
+bool input_take_debug(void);                /* FIFA_CONTROL "debug": make the next frame the debug frame (once) */
 void input_shot_done(void);
 uint64_t renderer_present_count(void);         /* presented frames so far (nvn/metal.m) */

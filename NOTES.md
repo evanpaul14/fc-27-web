@@ -610,6 +610,34 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     textures. Bindless textures with the same sampler word share one
     `[[sampler(n)]]` (`ShaderTexture.sampler`), the renderer binds by it.
   - `FIFA_CONTROL`'s `shot <path>` silently truncated paths over 63 chars.
+  - Compute: shared memory (LDS/STS -> `threadgroup uint smem[]`, size
+    from the control section at +0x754 (`maxwell_shared_size`), masked to
+    a power of two), SULD/SUST (bindless; handles are MOVs of the NVN
+    image bindings at c[2][0x120 + 8 * slot], now in `tex_cbuf_word`;
+    Metal `access::read/write/read_write` textures, no sampler, bound
+    without swizzle views), ATOMS / ATOM / RED (32-bit int ops), VOTE
+    (`simd_ballot`/`simd_all`/`simd_any`). 14 -> 47 of 56 compute
+    programs translate. Dual-source blending: `ShaderKey.dual_source`
+    when target 0 blends with SRC1 factors; the FS's target 1 becomes
+    `[[color(0), index(1)]]`.
+  - **The 3D scene's geometry collapsed to a point**: `FIFA_DBG_VS` showed
+    every vertex of a player draw at the same clip position. Shaders got
+    one global-memory window (the pool of the stage's first storage
+    buffer) and read 0 outside it, but they read several storage buffers
+    in different pools (vertex data, instance transforms). Now
+    `gmem_win[GMEM_WINDOWS]` (8) holds the pools of all bound storage and
+    uniform buffers and `gfind()` in the MSL picks the window
+    (`FIFA_GMEM_ONE=1` restores the single window for comparisons).
+    Vertices are distinct and in the frustum since, but the main pass is
+    still black, and GPU time went up 3x (the Kick Off notice: a light-list
+    loop, FS `170461700`, now reads real records; in the match ~3 fps).
+  - Debugging aids: `debug` control command (the next frame is the debug
+    frame), `FIFA_GPU_PROFILE=1` (each pass / dispatch in its own command
+    buffer, GPU time per pass size + first FS / compute program logged as
+    `[prof]` every 2 s; absolute numbers are inflated by the extra command
+    buffers, compare runs instead), float targets in the debug frame are
+    also saved scaled to their maximum as `pass_NNN_n.png` with the
+    maxima logged.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below

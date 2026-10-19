@@ -26,6 +26,7 @@ bool renderer_is_gpu_owned(NvnTexture *t);
 void renderer_submit(void);  // commit recorded work without waiting
 bool renderer_origin_lower_left(void);
 const char *renderer_stats(void);
+void renderer_profile_report(void);  // FIFA_GPU_PROFILE: log the top GPU time per pass / compute program
 bool renderer_format_is_depth(uint32_t f);
 bool renderer_format_has_stencil(uint32_t f);
 void renderer_mark_gpu_owned(NvnTexture *t);

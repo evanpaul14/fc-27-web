@@ -59,6 +59,16 @@ int main(int argc, char **argv) {
         uint8_t *code = calloc(1, 0x10000 + 0x100);
         size_t n = fread(code, 1, 0x10000, f);
         fclose(f);
+        maxwell_shared_size = 0;  // compute: from the control section dump, as the renderer does
+        char cpath[1024];
+        snprintf(cpath, sizeof cpath, "%s", path);
+        char *cc = strstr(cpath, "_code.bin");
+        if (stage == STAGE_COMPUTE && cc) {
+            memcpy(cc, "_ctrl", 5);
+            FILE *cf = fopen(cpath, "rb");
+            if (cf && fseek(cf, 0x754, SEEK_SET) == 0 && fread(&maxwell_shared_size, 4, 1, cf) != 1) maxwell_shared_size = 0;
+            if (cf) fclose(cf);
+        }
         ShaderKey key = {0};
         ShaderInfo *si = maxwell_translate(code, n, stage, &key);
         total++;

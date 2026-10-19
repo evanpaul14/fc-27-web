@@ -54,5 +54,10 @@ void dbg_strings(uint64_t a, uint64_t n, int minlen) {
   }
 }
 
-/* lldb hook: called with each debug-frame draw's vertex stream 0 */
-__attribute__((noinline)) void dbg_vb_hook(const void *host, uint64_t guest) { __asm__ volatile("" ::"r"(host), "r"(guest)); }
+/* lldb hooks: dbg_vb_hook gets each debug-frame draw's vertex stream 0; dbg_vb_hit (break on it) only the
+ * collapsed glyph quads of the post-title screen (x = 2.0, w = -1.0, see NOTES) */
+__attribute__((noinline)) void dbg_vb_hit(const void *host, uint64_t guest) { __asm__ volatile("" ::"r"(host), "r"(guest)); }
+__attribute__((noinline)) void dbg_vb_hook(const void *host, uint64_t guest) {
+  const uint32_t *u = host;
+  if (u[0] == 0x40000000u && u[3] == 0xbf800000u) dbg_vb_hit(host, guest);
+}

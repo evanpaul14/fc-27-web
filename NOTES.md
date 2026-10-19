@@ -434,10 +434,16 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     - Substituting EABold for every missing font (all fonts then load)
       changes nothing: same zero-size quads, same empty atlas. So the
       missing font is real but not sufficient. Glyph generation itself
-      fails. Next: find who writes the quads (an lldb watchpoint on the
-      first quad's vertices via `dbg_vb_hook`; the vertex ring sits at
-      the same guest address, 0x201b1b200, in every run without lldb),
-      then the glyph metrics and GPU SDF path.
+      fails. Next: find who writes the quads, then the glyph metrics and
+      GPU SDF path. Without lldb the first quad's vertices sit at guest
+      0x201b1b200 in every run; under lldb (~15 fps) they land elsewhere
+      (0x1e9c14000) and the screen appears much later than frame 150.
+      Breaking on `dbg_vb_hit` (FIFA_DUMP_VB + FIFA_DEBUG_FRAME=1200) finds
+      them, but lldb then refuses a watchpoint on that address ("Watchpoint
+      creation failed"), probably because the pool's pages are wrapped by
+      a no-copy MTLBuffer by then. A watchpoint set at startup on a fixed
+      address did get created. Untried alternative: mprotect the page and
+      report the first faulting guest pc.
     - RomFS reads (`FIFA_LOG_ROMFS=1`): every superbundle TOC except
       `storyingamesba` and the unused `loc/*.toc` gets read; no fs errors.
   - Seen once (no debug options, ~frame 200): Frostbite small-block

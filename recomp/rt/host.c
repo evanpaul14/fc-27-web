@@ -143,6 +143,8 @@ static void crash_handler(int sig, siginfo_t *si, void *uc_) {
   Dl_info di = {0};
   dladdr((void *)pc, &di);
   uint64_t fault = (uint64_t)si->si_addr;
+  extern int dbg_watch_fault(uint64_t fault, uint64_t pc);
+  if (dbg_watch_fault(fault, pc)) return;
   HLOG("fatal: signal %d at host pc %#llx (%s+%#llx), sp %#llx, fault %#llx (guest %#llx)\n", sig,
        (unsigned long long)pc, di.dli_sname ? di.dli_sname : "?",
        (unsigned long long)(pc - (uint64_t)di.dli_saddr), (unsigned long long)sp, (unsigned long long)fault,

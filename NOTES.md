@@ -491,6 +491,46 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     they differ in the update's `main`. Seen once in the first update run
     (~frame 124): guest null read (0x58) in `F_136b2cc0` on a worker
     thread; the second 4-minute run didn't hit it.
+  - Black after the title, third pass (2026-10-18, update build). Most of
+    the "Findings" above were wrong about the cause:
+    - The screen after the title is the first-boot **Accessibility
+      Settings** screen ("Select your preferences, before continuing to the
+      game", Narration, Subtitles, Brightness, Continue, an on-screen
+      keyboard). Text goes through EAText's own OutlineFont + FreeType
+      (`EAText/FT_Stream`, guest 0xc5b0000-0xc5e0000; the FreeTypeImpl at
+      0x1208xxxx is a second copy, EATextRNA, that never runs). Fonts load
+      intact (TTFs dumped from guest memory parse; the table checksums are
+      all stale in the shipped files), GetGlyphIds / GetGlyphMetrics give
+      correct ids and metrics for real letters.
+    - The collapsed quads that `dbg_vb_hit` catches are spaces and U+200B:
+      only those go through CPU RenderGlyphBitmap (0x0 bitmaps, so -2,-2
+      padding-only quads). Real letters use the GPU SDF path.
+    - The UI target (1920x1080 fmt 0x25, the composite's tic 885) is the
+      same host NvnTexture the UI draws into, yet forcing the panel shader
+      white (`FIFA_DBG_FS=16f536a00:ffffffff:0`) still leaves it black: the
+      panels have no coverage.
+    - Likely cause: the panel VS `16eaa0900` has no vertex attributes. It
+      pulls per-draw data by LDG through c0[17] (the SSBO pointer) and its
+      vertices by `t0.read()` from a buffer texture. The handle the
+      renderer reads for t0 is 0x100000000 (tic 0, no texture), so it binds
+      a 1x1 dummy and every vertex collapses. Also, buffer textures
+      (target 10) are never uploaded (`upload_texture` returns early) and
+      get a 2D Metal texture. Next: where the VS's buffer-texture handle
+      really lives (`[vtex]` lines log it), then real buffer-texture
+      support.
+    - Debug switches added: `FIFA_LOG_GAME=1` (a printf-style logger the
+      retail build compiles out, `HLE(sub_ffd0744)` in `recomp/hle/log.c`;
+      `HLE(sub_<addr>)` now works for stripped functions), write/access
+      watches in `recomp/hle/debug.c` (`dbg_watch`, `dbg_watch_access`;
+      `FIFA_WATCH_VB=1` arms one on the collapsed glyph quad,
+      `FIFA_WATCH_FOLLOW=<memcpy symbol>` follows a memcpy to its source,
+      `FIFA_WATCH_MAX`), RT address + object in `[draw]` lines, `[vtex]`
+      lines for vertex-stage textures in the debug frame.
+    - The update build now crashes often on worker threads (guest
+      null reads around frames 120-560, a different function each time:
+      F_10232510, F_12460cc0, F_13698650, F_118b0720, F_12440280,
+      F_1243f4b0), about 1 run in 3. Not caused by the logger HLE (crashes
+      with it removed too).
   - Seen once (no debug options, ~frame 200): Frostbite small-block
     allocator trap `udf #0x8002` at 0x18172fc, reached from `sub_181b310`
     when a freelist's next pointer lies outside its arena, i.e. heap
@@ -631,12 +671,11 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
 
 ## Next steps
 
-- Black frames after the title screen (see Status, "Findings"; also
-  black with the update, so it isn't missing data): the
-  press-start screen's text renders as zero-size glyphs from an empty
-  atlas. Find the quad writer, then why glyphs are empty (GPU SDF glyph
-  generation, FreeType metrics) and why the `Fonts/EACondBlackItalic`
-  asset never registers. Then SUST/SUATOM/STS/VOTE
+- Black frames after the title screen (see Status, "third pass"): the
+  accessibility screen's panels pull vertices from a buffer texture whose
+  handle resolves to nothing. Fix the VS buffer-texture binding and
+  upload buffer textures (target 10), then the GPU SDF glyph path. Then
+  SUST/SUATOM/STS/VOTE
   and the other unknown instructions (FS `3b34…`, VS `1887…`).
 - Later: the WebGPU RenderCore2 backend (option 2 in Status).
 - `nvdrv`: real responses for Open/Initialize/ioctls the driver init needs

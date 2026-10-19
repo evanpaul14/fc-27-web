@@ -1212,12 +1212,18 @@ static void bind_textures(int stage, ShaderInfo *si) {
                 size_t nz = 0, n = dt->addr ? (size_t)dt->width * dt->height : 0;  // >= 1 byte per texel
                 const uint8_t *g = n ? gptr(dt->addr) : NULL;
                 for (size_t k = 0; k < n; k++) nz += g[k] != 0;
-                LOG("[dtex] %03d tic %u %ux%u fmt %#x fl %#x addr %llx pool %p+%llx nonzero %zu/%zu '%s'\n", dn - 1, tic, dt->width,
+                LOG("[dtex] %03d tic %u obj %p %ux%u fmt %#x fl %#x addr %llx pool %p+%llx nonzero %zu/%zu '%s'\n", dn - 1, tic, (void *)dt, dt->width,
                     dt->height, dt->format, dt->flags, dt->addr, (void *)dt->pool, dt->pool_offset, nz, n, dt->label);
             }
             renderer_save_texture(tex, path);
             snprintf(path, sizeof path, "build/dtex_%03d_%d_a.png", dn - 1, i);
             renderer_save_texture_alpha(tex, path);
+        }
+        if (g_debug_frame && stage == 0) {
+            NvnTexture *vt = h && st.tpool && tic < (uint32_t)st.tpool->count ? ((NvnTexEntry *)st.tpool->entries)[tic].tex : NULL;
+            LOG("[vtex] %d type %d handle %llx tic %u -> %s", i, st_->type, (unsigned long long)h, tic, vt ? "" : "none");
+            if (vt) LOG("target %u fmt %#x %ux%u addr %llx", vt->target, vt->format, vt->width, vt->height, (unsigned long long)vt->addr);
+            LOG(" mtl type %lu %lux%lu\n", (unsigned long)tex.textureType, (unsigned long)tex.width, (unsigned long)tex.height);
         }
         if (stage == 0) { [enc setVertexTexture:tex atIndex:i]; [enc setVertexSamplerState:smp atIndex:i]; }
         else { [enc setFragmentTexture:tex atIndex:i]; [enc setFragmentSamplerState:smp atIndex:i]; }
@@ -1528,7 +1534,7 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         else LOG(" %d=%llx", i, st.tex[1][i]);
     }
     LOG(" | rt %d", st.rt.ncolor);
-    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) LOG(" %ux%u/f%#x", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format);
+    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) LOG(" %ux%u/f%#x@%llx obj %p", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format, (unsigned long long)st.rt.color[i]->addr, (void *)st.rt.color[i]);
     if (st.rt.depth) LOG(" d%#x", st.rt.depth->format);
     LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x streams:", st.viewport[0][0], st.viewport[0][1], st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask);
     for (int i = 0; i < st.nattrib; i++) LOG(" a%d(f%#x s%u o%u)", i, st.attrib[i] & 0xFF, (st.attrib[i] >> 8) & 0x1F, st.attrib[i] >> 13);

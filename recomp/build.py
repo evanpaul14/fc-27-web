@@ -566,6 +566,8 @@ def load_hle(p):
     for path in glob.glob(os.path.join(HERE, 'hle', '*.c')) + glob.glob(os.path.join(HERE, 'nvn', '*.c')):
         for m in re.finditer(r'^HLE\((\w+)\)', open(path).read(), re.M):
             a = p.by_name.get(m.group(1))
+            if a is None and re.fullmatch(r'sub_[0-9a-f]+', m.group(1)):
+                a = int(m.group(1)[4:], 16)  # stripped function, by guest address
             if a is None:
                 print(f'warning: HLE symbol {m.group(1)} not found')
                 continue

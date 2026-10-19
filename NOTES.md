@@ -550,8 +550,9 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   Keyboard and gamepad paths are untested so far (runs were hidden).
   `FIFA_CONTROL=<fifo>` drives a running game: `echo 'down 4; a; wait 60;
   shot' > fifo` (commands in `input.m`: `<button> [n]`, `hold`, `stick`,
-  `wait`, `shot [path]`, default `build/live.png`), so menus can be walked
-  one screenshot at a time without rebooting.
+  `wait`, `shot [path]`, default `build/live.png`, `debug`), so menus can be
+  walked one screenshot at a time without rebooting; `tools/tomatch.py`
+  drives it from boot to Kick Off's match.
 - Kick Off (2026-10-19): main menu -> Kick Off -> welcome pages -> gameplay
   type picker -> Match Preview (Bournemouth v Brighton) -> Start Match ->
   difficulty notice -> match load. Fixed on the way:
@@ -731,8 +732,13 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     shader bindings of that texture, `[rtw]`; the sky cube is at 1786a8c00
     and the LUT at 178240000 every run), and with `FIFA_DBG_PERDRAW` +
     `FIFA_DBG_FS=<fs>:fffffffe:0` the traced program's textures are listed
-    too. The boot now often stops at the "sign in to the EA Servers"
-    notice; from there `a` opens the menu on Seasons (two `up`s to Kick Off).
+    too. The "sign in to the EA Servers" notice turns up at a different point
+    in each run and swallows presses, so fixed-timing menu macros break:
+    `python3 -I tools/tomatch.py <fifo>` (game started with
+    `FIFA_CONTROL=<fifo>`) goes from boot to the match, classifying a
+    screenshot after each step (menu = teal side panel, notice = flat grey;
+    `--classify PNG...` to check) and navigating `up 12; down 4` to Kick Off
+    (the menu doesn't wrap). ~8 minutes boot to match.
 - **The match renders** (2026-10-19): broadcast camera, lit pitch, players,
   stands, replays with the goal graphics, at the same ~3-4 fps. After the
   NaN fixes the image was still nearly black with only highlights:

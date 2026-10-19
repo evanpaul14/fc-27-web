@@ -638,6 +638,16 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     buffers, compare runs instead), float targets in the debug frame are
     also saved scaled to their maximum as `pass_NNN_n.png` with the
     maxima logged.
+  - The main 3D pass is **NaN/Inf in every channel of every pixel**
+    (`pass_007_n.png: ... 1354752 non-finite` at 896x504), so the
+    geometry is drawn now and its shading produces non-finite values,
+    which show as black. Later passes inherit it.
+- Handheld by default (2026-10-19): am GetOperationMode/GetPerformanceMode
+  report handheld/normal, default display resolution and the vi display are
+  1280x720 (`host_docked()`, `FIFA_DOCKED=1` for the old docked setup). The
+  title costs ~575 ms GPU per 2 s instead of ~1,000 ms and 251 MB of textures
+  instead of 714 MB; the match is still ~3 fps (GPU-bound) and its 3D
+  resolution scales down dynamically (896x504 seen).
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -783,7 +793,15 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   To Watch" with streamed portraits) and the line-up graphics render, then a
   black screen with the PL logo, and then the match itself runs: HUD
   (BOU 0-0 BHA, clock running, radar with moving players, player names,
-  "Difficulty changed to Beginner"), but the 3D scene is black. Skips are
+  "Difficulty changed to Beginner"), but the 3D scene is black: the
+  main pass's draws now have real geometry but write NaN/Inf everywhere
+  (next: find the first draw whose output is non-finite, e.g. with
+  `FIFA_DBG_FS` register probes on `16ff87600`, and what feeds it:
+  exposure/light data from compute, TLD/gather results, half-float
+  packing). Performance in the match is ~3 fps since real global-memory
+  data arrived (`FIFA_GPU_PROFILE`; the `switch (pc)` form of branchy
+  shaders is the likely cost).
+  Older state: Skips are
   down to ~230 per 2 s (`skipped (a/b/c/d/e/f)` in the stats line: no
   program / program not translated / pipeline compiling / compile started
   / pipeline failed / draw mode) and the frame rate fell to ~11 fps with

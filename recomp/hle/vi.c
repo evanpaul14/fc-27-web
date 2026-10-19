@@ -1,4 +1,4 @@
-/* nn::vi at the API level: one 1920x1080 display with one layer. The NVN
+/* nn::vi at the API level: one display (1920x1080 docked, 1280x720 handheld) with one layer. The NVN
  * window gets the layer's native window handle and doesn't look inside it, so
  * the vi:/dispdrv services (binder, buffer queues) aren't needed. */
 #include "hle.h"
@@ -30,8 +30,8 @@ HLE(_ZN2nn2vi12ListDisplaysEPNS0_11DisplayInfoEi) {
   strcpy((char *)d, "Default");
   d[0x40] = 1;
   *(int64_t *)(d + 0x48) = 1;
-  *(int64_t *)(d + 0x50) = 1920;
-  *(int64_t *)(d + 0x58) = 1080;
+  *(int64_t *)(d + 0x50) = host_docked() ? 1920 : 1280;
+  *(int64_t *)(d + 0x58) = host_docked() ? 1080 : 720;
   RET(1);
 }
 

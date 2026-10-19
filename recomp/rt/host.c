@@ -10,6 +10,12 @@
 
 uint8_t *mem;
 int host_trace;
+
+int host_docked(void) {
+  static int docked = -1;
+  if (docked < 0) docked = getenv("FIFA_DOCKED") && atoi(getenv("FIFA_DOCKED"));
+  return docked;
+}
 __thread HostThread *cur_thread;
 
 /* ---- guest allocations made by the host ---- */

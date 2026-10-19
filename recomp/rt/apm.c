@@ -44,7 +44,7 @@ static void apm(void *state, IpcMsg *m) {
   (void)state;
   switch (m->cmd) {
   case 0: ipc_push_object(m, &session_svc, 0); return;  /* OpenSession */
-  case 1: SET_OUT(uint32_t, 0, PERF_MODE_BOOST); return; /* GetPerformanceMode: docked, as am reports */
+  case 1: SET_OUT(uint32_t, 0, host_docked() ? PERF_MODE_BOOST : PERF_MODE_NORMAL); return; /* as am reports */
   case 6: SET_OUT(uint8_t, 0, 1); return;                /* IsEnoughPowerSupplied */
   default: unhandled("apm", m);
   }

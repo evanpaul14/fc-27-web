@@ -54,14 +54,14 @@ static void common_state_getter(void *state, IpcMsg *m) {
     }
     pthread_mutex_unlock(&am_lock);
     return;
-  case 5: SET_OUT(uint8_t, 0, 1); return;               /* GetOperationMode: console (docked) */
-  case 6: SET_OUT(uint32_t, 0, 1); return;              /* GetPerformanceMode: boost */
+  case 5: SET_OUT(uint8_t, 0, host_docked()); return;   /* GetOperationMode: 0 handheld, 1 console (docked) */
+  case 6: SET_OUT(uint32_t, 0, host_docked()); return;  /* GetPerformanceMode: 0 normal, 1 boost */
   case 8: SET_OUT(uint8_t, 0, 0); return;               /* GetBootMode: normal */
   case 9: SET_OUT(uint8_t, 0, FOCUS_IN_FOCUS); return;  /* GetCurrentFocusState */
   case 50: SET_OUT(uint8_t, 0, 0); return;              /* IsVrModeEnabled */
   case 60:                                              /* GetDefaultDisplayResolution */
-    SET_OUT(int32_t, 0, 1920);
-    SET_OUT(int32_t, 4, 1080);
+    SET_OUT(int32_t, 0, host_docked() ? 1920 : 1280);
+    SET_OUT(int32_t, 4, host_docked() ? 1080 : 720);
     return;
   case 61: copy_event(m, resolution_event); return;  /* GetDefaultDisplayResolutionChangeEvent */
   case 300: SET_OUT(uint8_t, 0, 1); return;          /* GetSettingsPlatformRegion: global */

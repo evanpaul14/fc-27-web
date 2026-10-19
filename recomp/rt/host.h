@@ -38,6 +38,7 @@ extern const uint64_t host_nn_init_start;
 extern const uint64_t host_ro_lookup_slot_ptr;  /* nn::ro::detail::g_pLookupGlobalManualFunctionPointer */
 
 extern int host_trace;  /* FIFA_TRACE env: log svcs and dispatcher misses */
+int host_docked(void);  /* FIFA_DOCKED=1: report a docked console (1920x1080, boost); default handheld (1280x720) */
 
 #define HLOG(...) do { fprintf(stderr, __VA_ARGS__); } while (0)
 #define HDIE(...) do { fprintf(stderr, "fatal: " __VA_ARGS__); host_backtrace(); abort(); } while (0)

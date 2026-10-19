@@ -188,7 +188,7 @@ def resolve_jump_table(p, br_pc, body, jt=None):
     r = bits(w, 9, 5)
     seq = []  # (pc, word) walking backwards through straight-line code
     a = br_pc - 4
-    while len(seq) < 40:
+    while len(seq) < 64:
         if a not in body:
             break
         seq.append((a, p.word(a)))
@@ -302,21 +302,42 @@ def resolve_jump_table(p, br_pc, body, jt=None):
     if table is None or base is None:
         return None
     # bound: cmp wI/xI, #N (subs with rd=31) somewhere before, followed by b.hi/b.hs
-    # on the index register or one it was copied from (mov wI, wS)
+    # (or b.ls/b.lo) on the index register or one it was copied from (mov wI, wS).
+    # Above a mov only its source holds the index, and above any other write to it
+    # the register is something else (0x4c3b8fc in the update: a `cmp w10, #1`
+    # above `mov w10, w14` cut a 14-entry table to 2). `and xI, xS, #2^k-1` bounds
+    # the index itself, and a cmp on a register later set by the same `and` of xS
+    # counts too (and w8, w1, #0xff; cmp w8, #0x15; b.hi; and x8, x1, #0xff). The
+    # walk follows seq (fall-through and branches into each block), not addresses.
     n = None
-    idx = {ri}
-    a = br_pc - 4
-    for _ in range(64):
-        if a not in body:
-            a -= 4
-            continue
-        ww = p.word(a)
-        if bits(ww, 30, 21) == 0b0101010000 and bits(ww, 15, 5) == 31 and bits(ww, 4, 0) in idx:  # mov (orr Rd, zr, Rm)
-            idx.add(bits(ww, 20, 16))
-        if bits(ww, 30, 23) == 0b11100010 and bits(ww, 4, 0) == 31 and bits(ww, 9, 5) in idx and not bits(ww, 22, 22):
-            n = bits(ww, 21, 10) + 1
-            break
-        a -= 4
+    idx = ri
+    pending = {}    # register -> bound from a cmp on it, if it turns out to equal the index
+    for a, ww in seq[k_ld + 1:]:  # back along the path from the table load, where ri is the index
+        if bits(ww, 30, 23) == 0b11100010 and bits(ww, 4, 0) == 31 and not bits(ww, 22, 22):
+            cond = bound_cond(p, body, a + 4)
+            if cond is not None:
+                bound = bits(ww, 21, 10) + (0 if cond in (2, 3) else 1)
+                if bits(ww, 9, 5) == idx:
+                    n = bound if n is None else min(n, bound)
+                    break
+                pending.setdefault(bits(ww, 9, 5), bound)
+        rd = reg_writes(ww) if not (is_store(ww) or is_cmp(ww) or is_branch(ww) or writes_vreg(ww)) else None
+        low = low_mask(ww)
+        if rd is not None and rd in pending and rd != idx:
+            if low and bits(ww, 9, 5) == idx:  # the cmp was on idx & mask, and idx indexes the table unmasked
+                n = pending[rd] if n is None else min(n, pending[rd])
+                break
+            del pending[rd]
+        if bits(ww, 30, 21) == 0b0101010000 and bits(ww, 15, 5) == 31 and bits(ww, 4, 0) == idx:  # mov (orr Rd, zr, Rm)
+            idx = bits(ww, 20, 16)
+            if idx in pending:  # mov w25, w0; cmp w0, #0x12; b.hi; mov w8, w25
+                n = pending[idx] if n is None else min(n, pending[idx])
+                break
+        elif rd == idx:
+            if not low:
+                break
+            n = low[0] if n is None else min(n, low[0])
+            idx = bits(ww, 9, 5)
     targets = []
     for k in range(n if n is not None else 1024):
         raw = p.read(table + k * esz, esz)
@@ -330,6 +351,49 @@ def resolve_jump_table(p, br_pc, body, jt=None):
             return None
         targets.append(t)
     return sorted(set(targets)) or None
+
+
+def bound_cond(p, body, a):
+    """Condition of the b.hs/b.lo/b.hi/b.ls that the flags set just before a
+    reach: the next branch after up to 32 instructions that leave the flags
+    alone, or one in the run of b.cond it starts (cmp; b.gt; b.hi)."""
+    for _ in range(32):
+        if a not in body:
+            return None
+        w = p.word(a)
+        if is_branch(w):
+            if bits(w, 30, 25) in (0b011010, 0b011011):  # cbz/cbnz, tbz/tbnz: flags untouched
+                a += 4
+                continue
+            if bits(w, 31, 24) != 0x54:
+                return None
+            if bits(w, 3, 0) in (2, 3, 8, 9):
+                return bits(w, 3, 0)
+        elif sets_flags(w):
+            return None
+        a += 4
+    return None
+
+
+def low_mask(w):
+    """(2^k, imms) for and Rd, Rn, #2^k-1, else None."""
+    if bits(w, 30, 23) != 0b00100100 or bits(w, 21, 16):  # and (immediate), immr = 0
+        return None
+    sf, n, imms = bits(w, 31, 31), bits(w, 22, 22), bits(w, 15, 10)
+    if (sf and n and imms < 63) or (not sf and not n and imms < 31):
+        return (1 << (imms + 1), imms)
+    return None
+
+
+def sets_flags(w):
+    """ands/tst, adds/subs/cmp/cmn (also with carry), ccmp/ccmn, fcmp/fccmp."""
+    if bits(w, 28, 23) == 0b100100 or bits(w, 28, 24) == 0b01010:  # logical (immediate / shifted register)
+        return bits(w, 30, 29) == 3
+    if bits(w, 28, 24) in (0b10001, 0b01011) or bits(w, 28, 21) == 0b11010000:  # add/sub (imm / reg / carry)
+        return bool(bits(w, 29, 29))
+    if bits(w, 28, 21) == 0b11010010:  # ccmp / ccmn
+        return True
+    return bits(w, 31, 24) == 0x1E and bool(bits(w, 21, 21)) and (bits(w, 13, 10) == 0b1000 or bits(w, 11, 10) == 1)
 
 
 def is_store(w):

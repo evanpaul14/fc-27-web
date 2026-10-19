@@ -107,7 +107,11 @@ def main():
     # Address-taken code: adr, or adrp + add on the same register within 4
     # instructions, landing in text. Jump-table labels are materialised the
     # same way, so keep only targets that look like a function entry: 16-byte
-    # aligned (99.4% of known starts) right after ret / b / udf / nop.
+    # aligned (99.4% of known starts) right after ret / b / udf / nop, or after
+    # bl / blr, which may be a call that doesn't return (0xa0aaf80 in the
+    # update follows an out-of-memory handler). The ~100 of those that are
+    # really labels inside a function only split it: falling into a start
+    # is a tail call.
     def imm21(x):
         v = (((x >> 5) & 0x7FFFF) << 2) | ((x >> 29) & 3)
         return np.where(v & (1 << 20), v - (1 << 21), v)
@@ -131,7 +135,7 @@ def main():
     t = t[(t > 0) & (t < text_end) & (t % 16 == 0)]
     prev = w64[t // 4 - 1]
     entry = (((prev & 0xFFFFFC1F) == 0xD65F0000) | ((prev & 0xFC000000) == 0x14000000) | (prev == 0)
-             | (prev == 0xD503201F))
+             | (prev == 0xD503201F) | ((prev & 0xFC000000) == 0x94000000) | ((prev & 0xFFFFFC1F) == 0xD63F0000))
     for a in t[entry].tolist():
         mark(a, 'a')
 

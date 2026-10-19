@@ -611,6 +611,17 @@ void backend_present(NvnTexture *t) {
         snprintf(path, sizeof path, "build/frame_%05llu.png", (unsigned long long)total_frames);
         renderer_save_texture(b->tex, path);
     }
+    char *shot = input_take_shot();  // FIFA_CONTROL "shot"
+    if (shot) {
+        char tmp[300];
+        snprintf(tmp, sizeof tmp, "%s.tmp", shot);
+        if (b && b->tex) {
+            renderer_save_texture(b->tex, tmp);
+            rename(tmp, shot);
+        }
+        free(shot);
+        input_shot_done();
+    }
     static long debug_at = -1;  // FIFA_DEBUG_FRAME=<n>: log (and dump passes of) frame n
     if (debug_at < 0) debug_at = ENV("FIFA_DEBUG_FRAME") ? atol(ENV("FIFA_DEBUG_FRAME")) : 0;
     g_debug_frame = debug_at && total_frames == (uint64_t)debug_at;

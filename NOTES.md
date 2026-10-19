@@ -548,6 +548,27 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   `FIFA_PRESS=300:a,600:a,900:a,1200:a,1800:a,2400:a,3000:a,3600:a`
   (with `FIFA_SCREENSHOT_EVERY=300`) walks from the intro to the main menu.
   Keyboard and gamepad paths are untested so far (runs were hidden).
+  `FIFA_CONTROL=<fifo>` drives a running game: `echo 'down 4; a; wait 60;
+  shot' > fifo` (commands in `input.m`: `<button> [n]`, `hold`, `stick`,
+  `wait`, `shot [path]`, default `build/live.png`), so menus can be walked
+  one screenshot at a time without rebooting.
+- Kick Off (2026-10-19): main menu -> Kick Off -> welcome pages -> gameplay
+  type picker -> Match Preview (Bournemouth v Brighton) -> Start Match ->
+  difficulty notice -> match load. Fixed on the way:
+  - `0xa0aaf80` (an allocator callback) was never found: it follows a
+    `blr` to a noreturn out-of-memory handler, and address-taken starts were
+    only accepted after ret/b/udf/nop. bl/blr count now (+98 starts; the
+    ones that are labels inside a function only split it).
+  - `br 0xcc3b8fc` had a 2-entry table instead of 14: the bound search
+    scanned back by address and took `cmp w10, #1` (feeding a b.ne, above
+    `mov w10, w14`) as the bound. It now walks `seq` (the path back from the
+    table load), follows the index through mov / `and #2^k-1`, needs the
+    cmp to reach a b.hs/b.lo/b.hi/b.ls (skipping cb/tb and non-flag-setting
+    instructions), and accepts a cmp on an equal register (`and w8, w1,
+    #0xff; cmp w8, #N` above `and x8, x1, #0xff`). 57 of 1,433 tables
+    changed; most shrank (the old scan read past ~40 tables' ends), and the
+    rest are now unbounded scans where no bound is on the path, which only
+    adds labels.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -689,8 +710,10 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
 
 ## Next steps
 
-- The game reaches the main menu. Next: try the keyboard and a gamepad in
-  the visible window, then go into a mode (Kick Off) and see what breaks;
+- Kick Off reaches the match load, then a host memmove from guest null
+  inside `nvnQueueSubmitCommands` (from `DeviceNvn::enqueueProcessFrame`).
+  Next: find which replayed command (host frames in the crash report now).
+- Try the keyboard and a gamepad in the visible window;
   audio output for `audout.c`'s sink thread; the dark Continue button on
   the accessibility screen (seen before the threading fix; check if it
   still happens). Then SUST/SUATOM/STS/VOTE and the other unknown shader

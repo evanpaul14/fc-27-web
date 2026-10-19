@@ -11,10 +11,24 @@
 // FIFA_PRESS=<frame>:<button>[:<frames held>],... presses buttons at presented-frame numbers, for headless runs:
 // FIFA_PRESS=600:a,640:down,680:a. Buttons: a b x y l r zl zr plus minus up down left right lstick rstick
 // (held 6 frames by default).
+//
+// FIFA_CONTROL=<fifo> drives a running game: a thread reads lines of ';'-separated commands from the named pipe
+// (created if missing), each finishing before the next starts:
+//   <button> [n]                    press n times (6 frames held, 12 apart)
+//   hold <button> <frames>
+//   stick <l|r> <x> <y> <frames>    x, y in -1..1
+//   wait <frames>
+//   shot [path]                     save the next presented image (default build/live.png; written whole, then renamed)
+// e.g. echo 'down 4; a; wait 60; shot' > /tmp/fifa.ctl
 #import <AppKit/AppKit.h>
 #import <Carbon/Carbon.h>
 #import <GameController/GameController.h>
+#include <errno.h>
+#include <pthread.h>
 #include <stdatomic.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -94,10 +108,18 @@ static void gamepad_state(InputState *s) {
     }
 }
 
-// ---- FIFA_PRESS scripts
-typedef struct { uint64_t frame, until; uint64_t button; } Press;
+// ---- FIFA_PRESS scripts and FIFA_CONTROL commands
+typedef struct { uint64_t frame, until; uint64_t button; int32_t x, y; int stick; } Press;  // stick: 0 none, 1 l, 2 r
 static Press *presses;
 static int npresses;
+static pthread_mutex_t presses_lock = PTHREAD_MUTEX_INITIALIZER;  // the control thread appends
+
+static void add_press(Press p) {
+    pthread_mutex_lock(&presses_lock);
+    presses = realloc(presses, (npresses + 1) * sizeof *presses);
+    presses[npresses++] = p;
+    pthread_mutex_unlock(&presses_lock);
+}
 
 static const struct { const char *name; uint64_t button; } button_names[] = {
     {"a", BTN_A}, {"b", BTN_B}, {"x", BTN_X}, {"y", BTN_Y}, {"l", BTN_L}, {"r", BTN_R}, {"zl", BTN_ZL}, {"zr", BTN_ZR},
@@ -123,34 +145,108 @@ static void parse_presses(void) {
             HLOG("[input] unknown button '%s' in FIFA_PRESS\n", name);
             continue;
         }
-        presses = realloc(presses, (npresses + 1) * sizeof *presses);
-        presses[npresses++] = (Press){frame, frame + held, button};
+        add_press((Press){frame, frame + held, button});
     }
     free(s);
 }
 
-static uint64_t script_buttons(void) {
-    static uint64_t logged;  // presses already reported
-    uint64_t now = renderer_present_count(), b = 0;
+static void script_state(InputState *s) {
+    static int logged;  // presses before this one already reported (they start in order)
+    uint64_t now = renderer_present_count();
+    pthread_mutex_lock(&presses_lock);
     for (int i = 0; i < npresses; i++)
         if (now >= presses[i].frame && now < presses[i].until) {
-            b |= presses[i].button;
-            if (!(logged >> (i & 63) & 1)) {
-                logged |= 1ull << (i & 63);
+            s->buttons |= presses[i].button;
+            if (presses[i].stick == 1) { s->lx = presses[i].x; s->ly = presses[i].y; }
+            if (presses[i].stick == 2) { s->rx = presses[i].x; s->ry = presses[i].y; }
+            if (i >= logged) {
+                logged = i + 1;
                 HLOG("[input] frame %llu: press %#llx\n", (unsigned long long)now, (unsigned long long)presses[i].button);
             }
         }
-    return b;
+    pthread_mutex_unlock(&presses_lock);
+}
+
+// ---- FIFA_CONTROL
+static _Atomic(char *) shot_path;  // taken by the next present (input_take_shot)
+static _Atomic uint64_t shots_done;
+
+char *input_take_shot(void) { return atomic_exchange(&shot_path, NULL); }
+void input_shot_done(void) { atomic_fetch_add(&shots_done, 1); }
+
+static void wait_frame(uint64_t frame) {
+    while (renderer_present_count() < frame) usleep(2000);
+}
+
+static uint64_t button_named(const char *name) {
+    for (size_t i = 0; i < sizeof button_names / sizeof *button_names; i++)
+        if (!strcmp(name, button_names[i].name)) return button_names[i].button;
+    return 0;
+}
+
+static void control_command(char *cmd) {
+    char a[64] = {0}, b[64] = {0};
+    double x = 0, y = 0;
+    long n = 0;
+    int k = sscanf(cmd, "%63s", a);
+    if (k < 1) return;
+    uint64_t now = renderer_present_count();
+    if (!strcmp(a, "wait") && sscanf(cmd, "%*s %ld", &n) == 1) {
+        wait_frame(now + n);
+    } else if (!strcmp(a, "hold") && sscanf(cmd, "%*s %63s %ld", b, &n) == 2 && button_named(b)) {
+        add_press((Press){now + 1, now + 1 + n, button_named(b)});
+        wait_frame(now + 1 + n + 2);
+    } else if (!strcmp(a, "stick") && sscanf(cmd, "%*s %63s %lf %lf %ld", b, &x, &y, &n) == 4 && (*b == 'l' || *b == 'r')) {
+        add_press((Press){now + 1, now + 1 + n, 0, (int32_t)(x * STICK_MAX), (int32_t)(y * STICK_MAX), *b == 'l' ? 1 : 2});
+        wait_frame(now + 1 + n + 2);
+    } else if (!strcmp(a, "shot")) {
+        if (sscanf(cmd, "%*s %63s", b) != 1) strcpy(b, "build/live.png");
+        uint64_t done = atomic_load(&shots_done);
+        free(atomic_exchange(&shot_path, strdup(b)));
+        while (atomic_load(&shots_done) == done) usleep(2000);
+    } else if (button_named(a)) {
+        if (sscanf(cmd, "%*s %ld", &n) != 1) n = 1;
+        for (long i = 0; i < n; i++) add_press((Press){now + 1 + i * 12, now + 7 + i * 12, button_named(a)});
+        wait_frame(now + 1 + n * 12);
+    } else {
+        HLOG("[control] bad command '%s'\n", cmd);
+        return;
+    }
+    HLOG("[control] %s (frame %llu)\n", cmd, (unsigned long long)renderer_present_count());
+}
+
+static void *control_thread(void *arg) {
+    const char *path = arg;
+    for (;;) {
+        FILE *f = fopen(path, "r");  // blocks until a writer opens the pipe
+        if (!f) { HLOG("[control] can't open %s\n", path); return NULL; }
+        char *line = NULL, *save;
+        size_t cap = 0;
+        while (getline(&line, &cap, f) > 0)
+            for (char *c = strtok_r(line, ";\n", &save); c; c = strtok_r(NULL, ";\n", &save)) control_command(c);
+        free(line);
+        fclose(f);
+    }
+}
+
+static void start_control(void) {
+    const char *path = getenv("FIFA_CONTROL");
+    if (!path) return;
+    if (mkfifo(path, 0600) && errno != EEXIST) { HLOG("[control] mkfifo %s failed\n", path); return; }
+    pthread_t t;
+    pthread_create(&t, NULL, control_thread, strdup(path));
+    HLOG("[control] reading commands from %s\n", path);
 }
 
 void input_state(InputState *s) {
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ parse_presses(); });
+    dispatch_once(&once, ^{ parse_presses(); start_control(); });
     memset(s, 0, sizeof *s);
-    s->buttons = atomic_load(&kb_buttons) | script_buttons();
+    s->buttons = atomic_load(&kb_buttons);
     uint32_t d = atomic_load(&kb_dirs);
     dirs_to_stick(d & 15, &s->lx, &s->ly);
     dirs_to_stick(d >> 4, &s->rx, &s->ry);
+    script_state(s);
     @autoreleasepool {
         gamepad_state(s);
     }

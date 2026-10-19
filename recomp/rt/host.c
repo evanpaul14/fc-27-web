@@ -154,6 +154,17 @@ static void crash_handler(int sig, siginfo_t *si, void *uc_) {
   if (cur_thread)
     for (int i = 0; i < 31; i++)
       HLOG("  x%-2d %016llx%s", i, (unsigned long long)cur_thread->cpu.x[i], i % 4 == 3 || i == 30 ? "\n" : "");
+  /* host frames: lr, then the frame-pointer chain */
+  uint64_t hfp = uc->uc_mcontext->__ss.__fp, hlr = uc->uc_mcontext->__ss.__lr;
+  for (int i = 0; i < 16 && hlr; i++) {
+    Dl_info hi = {0};
+    dladdr((void *)hlr, &hi);
+    HLOG("  host #%d %#llx %s+%#llx\n", i, (unsigned long long)hlr, hi.dli_sname ? hi.dli_sname : "?",
+         (unsigned long long)(hlr - (uint64_t)hi.dli_saddr));
+    if (!hfp || hfp & 7) break;
+    hlr = ((uint64_t *)hfp)[1];
+    hfp = ((uint64_t *)hfp)[0];
+  }
   host_backtrace();
   host_list_threads();
   signal(SIGABRT, SIG_DFL);

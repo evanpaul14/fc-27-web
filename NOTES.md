@@ -905,19 +905,11 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   GPU-bound; the `switch (pc)` form of branchy shaders is the likely cost),
   the occasional e_prev = 0 exposure readback, and a visual pass over the
   match (shadows, reflections, the remaining ~10 skipped draws per frame:
-  `16fd3ac00`, `171855700` TXD.B). Performance in the match is ~3 fps since real global-memory
-  data arrived (`FIFA_GPU_PROFILE`; the `switch (pc)` form of branchy
-  shaders is the likely cost).
-  Older state: Skips are
-  down to ~230 per 2 s (`skipped (a/b/c/d/e/f)` in the stats line: no
-  program / program not translated / pipeline compiling / compile started
-  / pipeline failed / draw mode) and the frame rate fell to ~11 fps with
-  the extra draws. Most likely cause of the black scene: compute programs
-  that don't translate (lighting/post in Frostbite is compute): SUST
-  `eb20` (24 programs), SULD `eb10` (4), `ef5c`/`ef5d`/`ef5e` (5+1+2,
-  ATOMS/LDS-family?), VOTE `50d9` (3). Also FS SUST (3), TXD.B `de7a`
-  (2), 7 bindless handles (indexed / predicated), and dual-source blending
-  pipelines ("does not write to color(0), index(1)").
+  `16fd3ac00`, `171855700` TXD.B). Shader coverage (`build/shtool` over
+  the dumps): 407/437 translate; the rest are unknown 3b03 (7 FS), bindless
+  handles not from c[2] (4 FS, 1 CS: indexed `LDC c[2][r + ...]`), TXD.B
+  `de7a` (2), surface type 1 (2 CS), 3a2c (2 CS), and a few words that are
+  probably constant data past the code (bf52, bf82, 4016, ...).
 - Try the keyboard and a gamepad in the visible window;
   audio output for `audout.c`'s sink thread; the dark Continue button on
   the accessibility screen (seen before the threading fix; check if it

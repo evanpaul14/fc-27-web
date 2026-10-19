@@ -1,9 +1,10 @@
 /* nn::hid npad queries at the API level: one Pro Controller (full key style)
- * attached as player 1, nothing else. The state comes from host_npad (all
- * released for now; a keyboard/gamepad backend fills it in), so neither the
- * hid shared memory layout nor the controller support applet is needed. */
+ * attached as player 1, nothing else. The state comes from rt/input.m
+ * (keyboard, gamepads, FIFA_PRESS), so neither the hid shared memory layout
+ * nor the controller support applet is needed. */
 #include <time.h>
 
+#include "../rt/input.h"
 #include "hle.h"
 
 #define NPAD_ID_NO1 0
@@ -18,7 +19,6 @@ typedef struct {
   uint32_t pad;
 } NpadState;  /* NpadFullKeyState, NpadHandheldState, NpadJoy*State: 0x28 bytes */
 
-struct { uint64_t buttons; int32_t lx, ly, rx, ry; } host_npad;
 static uint32_t supported_styles = STYLE_FULL_KEY;
 
 static int64_t sampling_number(void) { return (int64_t)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 5000000); }
@@ -28,13 +28,18 @@ static void npad_states(CPU *c, int connected) {
   int n = (int)ARG(1);
   uint32_t id = *(uint32_t *)gptr(ARG(2));
   NpadState *out = gptr(ARG(0));
+  static int logged;  /* the first few queries, to see which styles and ids the game polls */
+  if (logged < 16 && __atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 16)
+    HLOG("[hid] GetNpadStates(%s, count %d, id %#x)\n", connected ? "full key" : "other", n, id);
   if (n < 1) { RET(0); return; }
   memset(out, 0, sizeof *out);
   out->sampling_number = sampling_number();
   if (connected && id == NPAD_ID_NO1) {
-    out->buttons = host_npad.buttons;
-    out->lx = host_npad.lx; out->ly = host_npad.ly;
-    out->rx = host_npad.rx; out->ry = host_npad.ry;
+    InputState in;
+    input_state(&in);
+    out->buttons = in.buttons;
+    out->lx = in.lx; out->ly = in.ly;
+    out->rx = in.rx; out->ry = in.ry;
     out->attributes = ATTR_IS_CONNECTED;
   }
   RET(1);

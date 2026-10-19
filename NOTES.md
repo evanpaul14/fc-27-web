@@ -281,11 +281,12 @@ from the roots (215k functions), which rewrites every unit and costs a full
 ## Status (2026-10-18)
 
 Current state: with the update (`FIFA_ROMFS=extracted/update/romfs_program.json`)
-the game shows the FC 27 title at frame ~93 and then the first-boot
-Accessibility Settings screen (frame ~560), at 30 fps on the Metal
-executor. Known problems: the Continue button's contents are dark, input
-is stubbed so the screen can't be left, and worker threads hit guest
-null reads in about half the runs (see the third pass below). The rest of
+the game plays the EA SPORTS intro, the title ("Let's Play!"), the offline
+notice, the favourite-team setup and reaches the main menu (FC News,
+Ultimate Team, Kick Off, ...) at 30 fps on the Metal executor, driven by
+keyboard, gamepad or `FIFA_PRESS` scripts (see "Input" below). The
+worker-thread crashes were an exclusive-store ordering bug (see "Worker
+thread crashes" below); 8 runs of 2-3 minutes since, none crashed. The rest of
 this section is the history that led here, oldest first.
 
 `./build/fifa` gets through nnSdk init, `nninitStartup`, all 3,325 of
@@ -517,6 +518,44 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   - Seen once (with heavy debug logging, ~frame 144): guest null read
     (0x18) in `F_116768b0`; a 3-minute run without logging didn't hit it.
 
+- Worker thread crashes (2026-10-18, fixed). The update build died in about
+  half of all 30-60 s runs with guest null reads on worker threads (Job1
+  etc.), a different function each time. Two of them were the same
+  intrusive list (prev/next at +0x418/+0x420) walked into a null `next`:
+  shared data seen half-updated. Not core assignment (every game thread
+  asks for mask 0xf; `FIFA_LOG_THREADS=1` logs CreateThread prio/core and
+  mask/priority changes), not ABA-prone LL/SC pops (none in main: no load
+  ever sits between an exclusive load and its store), not the kernel's
+  mutex/condvar/arbiter code. `FIFA_CORES=N` (at most N guest threads run
+  guest code at once; the slot is given up in blocking svcs and `yield`,
+  and taken anyway after 50 ms) separated it: N=3 still crashed, N=1 never
+  did (6/6 runs of 150 s). Cause: `stxr` was a *relaxed* CAS. In
+  `ldaxr; ...; stxr` (an acquire exchange: spinlocks and lock fast paths,
+  13.8k sites in main) another thread can take and release the lock
+  between the two; the CAS still sees the old value and succeeds where
+  LL/SC would fail, and since only the CAS read that release, the critical
+  section was not ordered after the other thread's. STX's CAS is now at
+  least an acquire (cpu.h; full rebuild). `FIFA_CORES` stays as a tool.
+- Crash reports now name the crashing thread (nn::os name: TLR+0x1f8 is the
+  ThreadType, +0x1a0 its name pointer) and list all threads with priority
+  and wait state.
+- Input: `recomp/rt/input.m` feeds the npad HLE (the game polls
+  `GetNpadStates(NpadFullKeyState, 16, No1)`). Keyboard in the window:
+  arrows d-pad, WASD/IJKL sticks, Return/Space A, Esc/Delete B, X, Y, Q/E
+  L/R, 1/3 ZL/ZR, =/- Plus/Minus, F/H stick clicks. Gamepads through the
+  GameController framework, by position (east = A). Headless:
+  `FIFA_PRESS=<frame>:<button>[:<frames held>],...`, e.g.
+  `FIFA_PRESS=300:a,600:a,900:a,1200:a,1800:a,2400:a,3000:a,3600:a`
+  (with `FIFA_SCREENSHOT_EVERY=300`) walks from the intro to the main menu.
+  Keyboard and gamepad paths are untested so far (runs were hidden).
+- setjmp: the guest-jmp_buf -> host-context table never dropped entries,
+  and EAText's FreeType setjmps in every call, so it overflowed (64) on the
+  screen after the offline notice. Entries whose host context lies below
+  the current host sp (caller returned) are dropped now.
+- `mrs ctr_el0` (A57 value 0x8444c004) and DC/IC ops (`dc zva` zeroes 64
+  bytes, the rest are no-ops) translate now; `nn::os::FlushDataCache` from
+  the hardware Opus decoder init hit them on picking a favourite team.
+
 - `recomp/rt/apm.c`: `apm` → `ISession` (Set/GetPerformanceConfiguration,
   per-mode configs; reports boost mode to match am's docked state).
 - `recomp/rt/pctl.c`: `pctl`, `pctl:s/a/r` → `IParentalControlService`
@@ -650,18 +689,17 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
 
 ## Next steps
 
-- The accessibility screen renders (see Status, "third pass"). Next: the
-  dark Continue button, input to get past the screen (hid/npad), and the
-  frequent worker-thread null reads in the update build. Then
-  SUST/SUATOM/STS/VOTE
-  and the other unknown instructions (FS `3b34…`, VS `1887…`).
+- The game reaches the main menu. Next: try the keyboard and a gamepad in
+  the visible window, then go into a mode (Kick Off) and see what breaks;
+  audio output for `audout.c`'s sink thread; the dark Continue button on
+  the accessibility screen (seen before the threading fix; check if it
+  still happens). Then SUST/SUATOM/STS/VOTE and the other unknown shader
+  instructions (FS `3b34…`, VS `1887…`).
 - Later: the WebGPU RenderCore2 backend (option 2 in Status).
 - `nvdrv`: real responses for Open/Initialize/ioctls the driver init needs
   (only if the NVN HLE path doesn't bypass it).
 - Measure translator coverage over a longer run (`FIFA_DUMP_SHADERS`,
   then translate the dumps offline).
-- Then keep pushing: hid, vi, the rest of graphics, and an audio backend
-  for `audout.c`'s sink thread.
 - The 8 table-shaped `br`s in main the resolver still misses (a register
   reused along some path); fix when one is hit.
 - Name the primitive `T_*` types; tie vtables to reflection classes.

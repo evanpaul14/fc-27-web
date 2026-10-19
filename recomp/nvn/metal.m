@@ -14,6 +14,7 @@
 #include <stdatomic.h>
 #include <unistd.h>
 
+#include "../rt/input.h"
 #include "nvn.h"
 #include "renderer.h"
 
@@ -631,7 +632,8 @@ void backend_present(NvnTexture *t) {
 - (BOOL)wantsUpdateLayer { return YES; }
 - (CALayer *)makeBackingLayer { return layer; }
 - (BOOL)acceptsFirstResponder { return YES; }
-- (void)keyDown:(NSEvent *)e { (void)e; }  // (no input yet: swallow keys instead of beeping)
+- (void)keyDown:(NSEvent *)e { if (!e.isARepeat) input_key(e.keyCode, true); }  // (handled here, so no beep)
+- (void)keyUp:(NSEvent *)e { input_key(e.keyCode, false); }
 @end
 
 @interface FifaDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
@@ -640,6 +642,7 @@ void backend_present(NvnTexture *t) {
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)a { (void)a; return YES; }
 - (void)applicationWillTerminate:(NSNotification *)n { (void)n; LOG("window closed\n"); _exit(0); }
 - (void)windowDidResize:(NSNotification *)n { (void)n; [self updateDrawable]; }
+- (void)windowDidResignKey:(NSNotification *)n { (void)n; input_release_all(); }
 - (void)windowDidChangeBackingProperties:(NSNotification *)n { (void)n; [self updateDrawable]; }
 - (void)updateDrawable {
     NSSize s = [window.contentView convertSizeToBacking:window.contentView.bounds.size];

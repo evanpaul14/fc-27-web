@@ -15,9 +15,23 @@ __thread jmp_buf *a64_pending_jb;
 static __thread struct { uint64_t guest; jmp_buf *host; } jbs[MAX_JB];
 static __thread unsigned n_jbs;
 
-static void remember(uint64_t guest, jmp_buf *host) {
+/* Entries whose setjmp caller has returned: the host context sits in that
+ * caller's host frame, so below the current host stack pointer it is dead.
+ * Unwrapped entries (no host context) go when their guest jmp_buf is on the
+ * stack below the guest sp. */
+static int dead(unsigned i, uint64_t guest_sp) {
+  char here;
+  if (jbs[i].host) return (char *)jbs[i].host < &here;
+  return jbs[i].guest < guest_sp && guest_sp - jbs[i].guest < (16 << 20);
+}
+
+static void remember(uint64_t guest, jmp_buf *host, uint64_t guest_sp) {
   for (unsigned i = 0; i < n_jbs; i++)
     if (jbs[i].guest == guest) { jbs[i].host = host; return; }
+  unsigned n = 0;
+  for (unsigned i = 0; i < n_jbs; i++)
+    if (!dead(i, guest_sp)) jbs[n++] = jbs[i];
+  n_jbs = n;
   if (n_jbs == MAX_JB) HDIE("setjmp: more than %d live jmp_bufs on one thread\n", MAX_JB);
   jbs[n_jbs].guest = guest;
   jbs[n_jbs++].host = host;
@@ -29,7 +43,7 @@ static void do_setjmp(CPU *c) {
   b[12] = c->x[31];
   for (int i = 0; i < 8; i++) b[13 + i] = c->v[8 + i].d[0];
   /* NULL when the call wasn't wrapped (through a function pointer): longjmp then stops */
-  remember(ARG(0), a64_pending_jb);
+  remember(ARG(0), a64_pending_jb, c->x[31]);
   a64_pending_jb = 0;
   RET(0);
 }

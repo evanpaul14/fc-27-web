@@ -275,6 +275,10 @@ def branch_sys(w, pc):
             if op2 == 6:
                 return op('', 'isb')
             raise Unsupported('barrier')
+        if not l and o0 == 1 and crn == 7:  # DC / IC
+            if op1 == 3 and crm == 4 and op2 == 1:
+                return op(f'memset(G({rx(rt)} & ~63ull), 0, 64);', 'dc_zva')
+            return op('', 'cache')  # clean / invalidate: guest memory is host memory
         if o0 >= 2:  # MRS / MSR register
             key = (o0, op1, crn, crm, op2)
             if key == (3, 3, 4, 2, 0):  # NZCV
@@ -287,6 +291,8 @@ def branch_sys(w, pc):
                 return op(wx(rt, '19200000ull'), 'mrs_cntfrq')
             if l and key == (3, 3, 0, 0, 7):
                 return op(wx(rt, '4ull'), 'mrs_dczid')  # 64-byte DC ZVA blocks
+            if l and key == (3, 3, 0, 0, 1):
+                return op(wx(rt, '0x8444c004ull'), 'mrs_ctr')  # Cortex-A57: 64-byte I and D cache lines
             if key in SYSREG:
                 if l:
                     return op(wx(rt, SYSREG[key]), 'mrs')

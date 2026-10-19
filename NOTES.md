@@ -482,6 +482,15 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
       report the first faulting guest pc.
     - RomFS reads (`FIFA_LOG_ROMFS=1`): every superbundle TOC except
       `storyingamesba` and the unused `loc/*.toc` gets read; no fs errors.
+  - With the update (2026-10-18; `build/` is now the update's `main` on
+    the patched RomFS, `FIFA_ROMFS=extracted/update/romfs_program.json`):
+    same picture. Title at frame ~93, black from ~150 on, 30 fps and
+    ~11,800 draws / ~120 skipped per 2 s through frame 7,100 (4 min). So
+    the base cart's missing superbundles are not the cause, or not the
+    only one. Function addresses in this section are the base build's;
+    they differ in the update's `main`. Seen once in the first update run
+    (~frame 124): guest null read (0x58) in `F_136b2cc0` on a worker
+    thread; the second 4-minute run didn't hit it.
   - Seen once (no debug options, ~frame 200): Frostbite small-block
     allocator trap `udf #0x8002` at 0x18172fc, reached from `sub_181b310`
     when a freelist's next pointer lies outside its arena, i.e. heap
@@ -622,7 +631,8 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
 
 ## Next steps
 
-- Black frames after the title screen (see Status, "Findings"): the
+- Black frames after the title screen (see Status, "Findings"; also
+  black with the update, so it isn't missing data): the
   press-start screen's text renders as zero-size glyphs from an empty
   atlas. Find the quad writer, then why glyphs are empty (GPU SDF glyph
   generation, FreeType metrics) and why the `Fonts/EACondBlackItalic`

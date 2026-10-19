@@ -4,6 +4,8 @@
  * - RomFS (OpenDataStorageByCurrentProcess) is read straight out of the NSP
  *   and decrypted with AES-128-CTR on the fly; tools/nsp_extract.py writes
  *   the parameters to extracted/romfs_program.json (FIFA_ROMFS overrides).
+ *   An update's config (nsp_extract.py --base) reads the patched RomFS
+ *   through its BKTR tables from both NSPs.
  * - Save data and the SD card are host directories under build/fs
  *   (FIFA_FS overrides): save/<program id>/<type>_<user id>_<index>, sdcard. */
 #include "ipc.h"
@@ -51,22 +53,47 @@ static void mkdirs(const char *path) {
 }
 
 /* ---- RomFS image in the NSP ---- */
+/* One AES-CTR encrypted NCA section in an NSP. */
+typedef struct {
+  int fd;
+  uint64_t nca_offset, section;  /* NSP offset of the NCA, NCA offset of the section */
+  uint8_t key[16], ctr_hi[8];
+} NcaSection;
+
+/* An update's RomFS (BKTR): relocations map virtual section offsets to the
+ * base game's section or to patch data; subsections give the patch data's
+ * counters. Tables come from tools/nsp_extract.py --base (romfs_program.bktr). */
+typedef struct { uint64_t virt, phys; uint32_t is_patch, pad; } Relocation;
+typedef struct { uint64_t offset; uint32_t ctr, pad; } Subsection;
+
 typedef struct {
   int fd;
   uint64_t nca_offset, offset, size;
   int encrypted;
   uint8_t key[16], ctr_hi[8];
+  /* BKTR only: offset is the image's offset in the virtual section */
+  int patched;
+  NcaSection patch, base;
+  uint64_t patch_end, total;
+  Relocation *rel;
+  Subsection *sub;
+  uint32_t nrel, nsub;
 } RomFs;
 static RomFs romfs = {.fd = -1};
 
 /* Tiny reader for the flat JSON nsp_extract.py writes. */
-static const char *json_field(const char *js, const char *key) {
+static const char *json_find(const char *js, const char *key) {
   char k[64];
   snprintf(k, sizeof k, "\"%s\":", key);
   const char *p = strstr(js, k);
-  if (!p) HDIE("[fs] romfs config has no \"%s\"\n", key);
+  if (!p) return NULL;
   p += strlen(k);
   while (*p == ' ') p++;
+  return p;
+}
+static const char *json_field(const char *js, const char *key) {
+  const char *p = json_find(js, key);
+  if (!p) HDIE("[fs] romfs config has no \"%s\"\n", key);
   return p;
 }
 static void json_string(const char *js, const char *key, char *out, size_t n) {
@@ -78,6 +105,15 @@ static void json_hex(const char *js, const char *key, uint8_t *out, size_t n) {
   json_string(js, key, s, sizeof s);
   for (size_t i = 0; i < n; i++) sscanf(s + 2 * i, "%2hhx", &out[i]);
 }
+static uint64_t json_u64(const char *js, const char *key) { return strtoull(json_field(js, key), 0, 10); }
+
+static int open_nsp(const char *js, const char *key) {
+  char nsp[1024];
+  json_string(js, key, nsp, sizeof nsp);
+  int fd = open(nsp, O_RDONLY);
+  if (fd < 0) HLOG("[fs] can't open %s: %s\n", nsp, strerror(errno));
+  return fd;
+}
 
 static int romfs_open(void) {
   if (romfs.fd >= 0) return 1;
@@ -85,40 +121,68 @@ static int romfs_open(void) {
   if (!cfg) cfg = "extracted/romfs_program.json";
   FILE *f = fopen(cfg, "r");
   if (!f) { HLOG("[fs] no RomFS config at %s (run tools/nsp_extract.py)\n", cfg); return 0; }
-  char js[4096] = {0}, nsp[1024];
+  char js[4096] = {0};
   fread(js, 1, sizeof js - 1, f);
   fclose(f);
-  json_string(js, "nsp", nsp, sizeof nsp);
-  romfs.nca_offset = strtoull(json_field(js, "nca_offset"), 0, 10);
-  romfs.offset = strtoull(json_field(js, "offset"), 0, 10);
-  romfs.size = strtoull(json_field(js, "size"), 0, 10);
+  romfs.size = json_u64(js, "size");
+  if (json_find(js, "base_nsp")) {
+    romfs.patched = 1;
+    romfs.offset = json_u64(js, "image");
+    romfs.patch_end = json_u64(js, "patch_end");
+    romfs.patch = (NcaSection){.nca_offset = json_u64(js, "nca_offset"), .section = json_u64(js, "section")};
+    json_hex(js, "key", romfs.patch.key, 16);
+    json_hex(js, "ctr_hi", romfs.patch.ctr_hi, 8);
+    romfs.base = (NcaSection){.nca_offset = json_u64(js, "base_nca_offset"), .section = json_u64(js, "base_section")};
+    json_hex(js, "base_key", romfs.base.key, 16);
+    json_hex(js, "base_ctr_hi", romfs.base.ctr_hi, 8);
+    romfs.nrel = (uint32_t)json_u64(js, "relocations");
+    romfs.nsub = (uint32_t)json_u64(js, "subsections");
+    char tab[1024];
+    snprintf(tab, sizeof tab, "%.*s.bktr", (int)(strlen(cfg) - 5), cfg);  /* romfs_program.json -> .bktr */
+    FILE *t = fopen(tab, "rb");
+    if (!t) { HLOG("[fs] can't open %s\n", tab); return 0; }
+    romfs.rel = calloc(romfs.nrel, sizeof *romfs.rel);
+    romfs.sub = calloc(romfs.nsub, sizeof *romfs.sub);
+    if (fread(romfs.rel, sizeof *romfs.rel, romfs.nrel, t) != romfs.nrel ||
+        fread(romfs.sub, sizeof *romfs.sub, romfs.nsub, t) != romfs.nsub)
+      HDIE("[fs] short read of %s\n", tab);
+    fclose(t);
+    romfs.total = romfs.offset + romfs.size;
+    if ((romfs.patch.fd = open_nsp(js, "nsp")) < 0 || (romfs.base.fd = open_nsp(js, "base_nsp")) < 0) return 0;
+    romfs.fd = romfs.patch.fd;
+    HLOG("[fs] RomFS: %llu bytes, update over base (%u relocations, %u subsections)\n",
+         (unsigned long long)romfs.size, romfs.nrel, romfs.nsub);
+    return 1;
+  }
+  romfs.nca_offset = json_u64(js, "nca_offset");
+  romfs.offset = json_u64(js, "offset");
   romfs.encrypted = atoi(json_field(js, "encryption")) == 3;
   json_hex(js, "key", romfs.key, 16);
   json_hex(js, "ctr_hi", romfs.ctr_hi, 8);
-  romfs.fd = open(nsp, O_RDONLY);
-  if (romfs.fd < 0) { HLOG("[fs] can't open %s: %s\n", nsp, strerror(errno)); return 0; }
-  HLOG("[fs] RomFS: %llu bytes at %#llx in %s\n", (unsigned long long)romfs.size,
-       (unsigned long long)romfs.offset, nsp);
+  if ((romfs.fd = open_nsp(js, "nsp")) < 0) return 0;
+  HLOG("[fs] RomFS: %llu bytes at %#llx\n", (unsigned long long)romfs.size, (unsigned long long)romfs.offset);
   return 1;
 }
 
-/* Read [off, off+size) of the RomFS image; the caller clamps to its size. */
-static void romfs_read(uint8_t *dst, uint64_t off, uint64_t size) {
+/* Read [pos, pos+size) at NSP offset pos, AES-CTR decrypting when key is set
+ * (counter: ctr_hi, then the NCA-relative offset >> 4). */
+static void nsp_read(uint8_t *dst, int fd, uint64_t pos, uint64_t size, uint64_t nca_offset, const uint8_t *key,
+                     const uint8_t *ctr_hi) {
   static uint8_t buf[1 << 22];  /* callers hold ipc_lock */
   while (size) {
-    uint64_t pos = romfs.offset + off, a = pos & ~15ull, pad = pos - a;
+    uint64_t a = pos & ~15ull, pad = pos - a;
     uint64_t n = size < sizeof buf - 16 ? size : sizeof buf - 16;
     uint64_t len = (pad + n + 15) & ~15ull;
-    ssize_t got = pread(romfs.fd, buf, len, (off_t)a);
+    ssize_t got = pread(fd, buf, len, (off_t)a);
     if (got < (ssize_t)(pad + n)) HDIE("[fs] short RomFS read at %#llx\n", (unsigned long long)a);
-    if (romfs.encrypted) {
+    if (key) {
       uint8_t iv[16];
-      uint64_t blk = (a - romfs.nca_offset) >> 4;
-      memcpy(iv, romfs.ctr_hi, 8);
+      uint64_t blk = (a - nca_offset) >> 4;
+      memcpy(iv, ctr_hi, 8);
       for (int i = 0; i < 8; i++) iv[15 - i] = (uint8_t)(blk >> (8 * i));
       CCCryptorRef c;
       size_t moved;
-      if (CCCryptorCreateWithMode(kCCEncrypt, kCCModeCTR, kCCAlgorithmAES, ccNoPadding, iv, romfs.key, 16, 0, 0, 0,
+      if (CCCryptorCreateWithMode(kCCEncrypt, kCCModeCTR, kCCAlgorithmAES, ccNoPadding, iv, key, 16, 0, 0, 0,
                                   kCCModeOptionCTR_BE, &c) != kCCSuccess ||
           CCCryptorUpdate(c, buf, len, buf, len, &moved) != kCCSuccess)
         HDIE("[fs] AES-CTR failed\n");
@@ -126,7 +190,56 @@ static void romfs_read(uint8_t *dst, uint64_t off, uint64_t size) {
     }
     memcpy(dst, buf + pad, n);
     dst += n;
+    pos += n;
+    size -= n;
+  }
+}
+
+static void section_read(const NcaSection *s, uint8_t *dst, uint64_t off, uint64_t size, const uint8_t *ctr_hi) {
+  nsp_read(dst, s->fd, s->nca_offset + s->section + off, size, s->nca_offset, s->key, ctr_hi);
+}
+
+/* Last entry whose start is <= off, for arrays sorted by a leading u64. */
+#define UPPER_BOUND(arr, n, field, off) ({ \
+  uint32_t lo_ = 0, hi_ = (n); \
+  while (lo_ < hi_) { uint32_t m_ = (lo_ + hi_) / 2; if ((arr)[m_].field <= (off)) lo_ = m_ + 1; else hi_ = m_; } \
+  lo_ - 1; })
+
+/* Patch data at physical offset off in the update's section. */
+static void patch_read(uint8_t *dst, uint64_t off, uint64_t size) {
+  while (size) {
+    uint32_t i = UPPER_BOUND(romfs.sub, romfs.nsub, offset, off);
+    uint64_t end = i + 1 < romfs.nsub ? romfs.sub[i + 1].offset : romfs.patch_end;
+    uint64_t n = size < end - off ? size : end - off;
+    uint8_t hi[8];
+    memcpy(hi, romfs.patch.ctr_hi, 4);
+    for (int b = 0; b < 4; b++) hi[4 + b] = (uint8_t)(romfs.sub[i].ctr >> (24 - 8 * b));
+    section_read(&romfs.patch, dst, off, n, hi);
+    dst += n;
     off += n;
+    size -= n;
+  }
+}
+
+/* Read [off, off+size) of the RomFS image; the caller clamps to its size. */
+static void romfs_read(uint8_t *dst, uint64_t off, uint64_t size) {
+  if (!romfs.patched) {
+    nsp_read(dst, romfs.fd, romfs.offset + off, size, romfs.nca_offset, romfs.encrypted ? romfs.key : NULL,
+             romfs.ctr_hi);
+    return;
+  }
+  uint64_t v = romfs.offset + off;
+  while (size) {
+    uint32_t i = UPPER_BOUND(romfs.rel, romfs.nrel, virt, v);
+    const Relocation *r = &romfs.rel[i];
+    uint64_t end = i + 1 < romfs.nrel ? romfs.rel[i + 1].virt : romfs.total;
+    uint64_t n = size < end - v ? size : end - v, phys = r->phys + (v - r->virt);
+    if (r->is_patch)
+      patch_read(dst, phys, n);
+    else
+      section_read(&romfs.base, dst, phys, n, romfs.base.ctr_hi);
+    dst += n;
+    v += n;
     size -= n;
   }
 }

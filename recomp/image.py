@@ -118,7 +118,9 @@ def main():
             return []
         return [struct.unpack_from('<Q', m['img'], d[tag_addr] + 8 * k)[0] for k in range(d.get(tag_size, 0) // 8)]
 
-    layout = {'modules': [], 'missing': {nm: a for nm, a in missing.items()}}
+    # code_dir's parent holds analysis/ too (extracted/, or extracted/update/ for the update)
+    layout = {'extracted': os.path.abspath(os.path.dirname(os.path.normpath(code_dir))), 'modules': [],
+              'missing': {nm: a for nm, a in missing.items()}}
     for m in mods:
         segs = [{'name': s['name'], 'addr': m['base'] + s['mem_off'], 'size': s['size']} for s in m['info']['segments']]
         mod = {'name': m['name'], 'base': m['base'], 'size': m['size'], 'segments': segs,

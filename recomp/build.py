@@ -89,12 +89,13 @@ class Program:
         self.missing = {a: nm for nm, a in self.layout['missing'].items()}
         self.starts = set()
         self.vtables = {}
+        ext = self.layout.get('extracted', os.path.join(ROOT, 'extracted'))
         for base, end, img, t0, t1, m in self.mods:
-            adir = os.path.join(ROOT, 'extracted', 'analysis', m['name'])
+            adir = os.path.join(ext, 'analysis', m['name'])
             for line in open(os.path.join(adir, 'functions.tsv')):
                 self.starts.add(base + int(line.split('\t', 1)[0], 16))
             self.starts.update(code_pointer_starts(img, base, t0, t1))
-            elf = os.path.join(ROOT, 'extracted', 'code', m['name'] + '.elfsyms.tsv')
+            elf = os.path.join(ext, 'code', m['name'] + '.elfsyms.tsv')
             if os.path.exists(elf):  # FUNC symbols of an unstripped ELF (tools/elfsyms.py)
                 for line in open(elf):
                     nm, val, sz, shn, inf = line.rstrip('\n').split('\t')

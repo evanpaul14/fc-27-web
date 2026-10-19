@@ -4,8 +4,9 @@ Reads NCAs in place from the NSP, decrypts only the byte ranges needed, and list
 the RomFS tree (without extracting it) so assets can be pulled selectively later.
 
 usage: python3 -I tools/nsp_extract.py GAME.nsp OUTDIR [--keys ~/.switch/prod.keys]
+       python3 -I tools/nsp_extract.py UPDATE.nsp OUTDIR --base GAME.nsp   (patched RomFS)
 """
-import argparse, json, os, struct, sys
+import argparse, bisect, json, os, struct, sys
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 MEDIA = 0x200
@@ -140,6 +141,97 @@ def romfs_storage(nsp, sec):
             'encryption': sec.enc, 'key': sec.key.hex(), 'ctr_hi': sec.ctr_hi.hex()}
 
 
+def bucket_tree(sec, hdr_off, esize):
+    """Entries of a BKTR bucket tree (one offset node, then 0x4000-byte entry
+    sets) whose header is at hdr_off in the section header. The tables sit at
+    the end of the section under the section's own counter."""
+    off, size = struct.unpack_from('<QQ', sec.fsh, hdr_off)
+    magic, _, count = struct.unpack_from('<4sII', sec.fsh, hdr_off + 0x10)
+    assert magic == b'BKTR', magic
+    sec.enc, enc = 3, sec.enc
+    blob = sec.read(off, size)
+    sec.enc = enc
+    nsets, total = struct.unpack_from('<IQ', blob, 4)
+    ents = []
+    for s in range(nsets):
+        b = 0x4000 * (s + 1)
+        n = struct.unpack_from('<I', blob, b + 4)[0]
+        ents += [blob[b + 0x10 + i * esize:b + 0x10 + (i + 1) * esize] for i in range(n)]
+    assert len(ents) == count, (len(ents), count)
+    return ents, total
+
+
+class PatchedSection:
+    """An update's RomFS section (AES-CTR-Ex, encryption 4) laid over the base
+    game's: the relocation table maps virtual offsets to the base section or to
+    patch data, and the subsection table gives the patch data's counters."""
+
+    def __init__(self, sec, base):
+        self.sec, self.base, self.fsh = sec, base, sec.fsh
+        rel, self.size = bucket_tree(sec, 0x100, 0x14)
+        self.rel = [struct.unpack('<QQI', e) for e in rel]
+        sub, _ = bucket_tree(sec, 0x120, 0x10)
+        self.sub = [struct.unpack('<QII', e) for e in sub]
+        self.patch_end = struct.unpack_from('<Q', sec.fsh, 0x100)[0]  # relocation table offset
+
+    def _patch(self, off, size):
+        out = bytearray()
+        while size:
+            i = bisect.bisect_right(self.sub, (off, 1 << 32, 0)) - 1
+            end = self.sub[i + 1][0] if i + 1 < len(self.sub) else self.patch_end
+            n = min(size, end - off)
+            self.sec.ctr_hi = self.sec.fsh[0x140:0x148][::-1][:4] + self.sub[i][2].to_bytes(4, 'big')
+            self.sec.enc = 3
+            out += self.sec.read(off, n)
+            off, size = off + n, size - n
+        return bytes(out)
+
+    def read(self, off, size):
+        out = bytearray()
+        while size:
+            i = bisect.bisect_right(self.rel, (off, 1 << 64, 0)) - 1
+            v, p, is_patch = self.rel[i]
+            end = self.rel[i + 1][0] if i + 1 < len(self.rel) else self.size
+            n = min(size, end - off)
+            out += (self._patch if is_patch else self.base.read)(p + off - v, n)
+            off, size = off + n, size - n
+        return bytes(out)
+
+    def storage(self, nsp, base_nsp):
+        """romfs_storage for fs.c, plus the base section and the two tables
+        (written next to the JSON as <tag>.bktr)."""
+        lvl_off, lvl_size = romfs_level(self.sec)
+        b = self.base
+        return {'nsp': os.path.abspath(nsp), 'nca_offset': self.sec.nca_base, 'section': self.sec.start,
+                'image': lvl_off, 'size': lvl_size, 'patch_end': self.patch_end,
+                'key': self.sec.key.hex(), 'ctr_hi': self.sec.fsh[0x140:0x148][::-1].hex(),
+                'base_nsp': os.path.abspath(base_nsp), 'base_nca_offset': b.nca_base, 'base_section': b.start,
+                'base_key': b.key.hex(), 'base_ctr_hi': b.ctr_hi.hex(),
+                'relocations': len(self.rel), 'subsections': len(self.sub)}
+
+    def tables(self):
+        """Relocations as (u64 virtual, u64 physical, u32 is_patch, u32 0), then
+        subsections as (u64 offset, u32 counter, u32 0)."""
+        return (b''.join(struct.pack('<QQII', v, p, i, 0) for v, p, i in self.rel) +
+                b''.join(struct.pack('<QII', o, c, 0) for o, _, c in self.sub))
+
+
+def base_program_romfs(path, keys):
+    f = open(path, 'rb')
+    ents = read_pfs0(f, 0)
+    tik = next((e for e in ents if e[0].endswith('.tik')), None)
+    title_key = None
+    if tik:
+        f.seek(tik[1] + 0x180)
+        title_key = f.read(16)
+    for name, off, _ in ents:
+        if name.endswith('.nca'):
+            nca = Nca(f, off, keys, title_key)
+            if nca.content_type == 0:
+                return next(s for _, s in nca.sections if section_info(s)['fs_type'] == 'romfs')
+    raise SystemExit(f'{path}: no Program NCA')
+
+
 def romfs_tree(sec):
     lvl_off, lvl_size = romfs_level(sec)
     h = struct.unpack('<10Q', sec.read(lvl_off, 0x50))
@@ -173,6 +265,7 @@ def main():
     ap.add_argument('nsp')
     ap.add_argument('out')
     ap.add_argument('--keys', default='~/.switch/prod.keys')
+    ap.add_argument('--base', metavar='BASE.nsp', help="for an update NSP: the base game, whose RomFS the patch applies to")
     ap.add_argument('--romfs-get', nargs='*', default=[], metavar='PATH',
                     help='Program RomFS files to extract into OUT/romfs/')
     a = ap.parse_args()
@@ -206,14 +299,24 @@ def main():
                     si['files'][fname] = fsize
                     print(f'exefs/{fname}: {fsize:,}')
             elif si['fs_type'] == 'romfs' and not si['has_compression'] and not si['has_sparse']:
-                tree = romfs_tree(sec)
                 tag = {0: 'program', 2: 'control'}.get(nca.content_type, f'type{nca.content_type}')
+                if si['encryption'] == 4:  # update: BKTR over the base game's RomFS
+                    if nca.content_type != 0 or not a.base:
+                        print(f'{name} section {i}: patch RomFS skipped (needs --base, Program only)', file=sys.stderr)
+                        continue
+                    sec = PatchedSection(sec, base_program_romfs(a.base, keys))
+                    with open(os.path.join(a.out, f'romfs_{tag}.bktr'), 'wb') as o:
+                        o.write(sec.tables())
+                    storage = sec.storage(a.nsp, a.base)
+                else:
+                    storage = romfs_storage(a.nsp, sec)
+                tree = romfs_tree(sec)
                 with open(os.path.join(a.out, f'romfs_{tag}.tsv'), 'w') as o:
                     for p, fo, fs in tree:
                         o.write(f'{p}\t{fo}\t{fs}\n')
                 si['romfs_files'] = len(tree)
                 with open(os.path.join(a.out, f'romfs_{tag}.json'), 'w') as o:
-                    json.dump(romfs_storage(a.nsp, sec), o, indent=1)
+                    json.dump(storage, o, indent=1)
                 print(f'{name} romfs: {len(tree):,} files')
                 if nca.content_type == 0:
                     for p, fo, fs in tree:

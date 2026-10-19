@@ -17,6 +17,16 @@ Game data is read from local files at runtime and is never committed.
 - `python3 -I tools/nso.py extracted/exefs/main extracted/code/main` writes a
   flat memory image (`.bin`), segment/MOD0/dynamic info (`.json`) and the
   dynamic symbols (`.syms.tsv`). Segment SHA-256s match the NSO header.
+- Update (v262144, see "The update"): `python3 -I tools/nsp_extract.py
+  UPDATE.nsp extracted/update --base GAME.nsp [--romfs-get ...]` writes the
+  new ExeFS, the patched RomFS listing, `romfs_program.json` (both NSPs) and
+  `romfs_program.bktr` (relocation + subsection tables). Then
+  `nso.py` per module into `extracted/update/code` (NRO/NRS via
+  `--romfs-get`, `elfsyms.py` for the NRS), `analyze.py` for main and nro
+  into `extracted/update/analysis` (sdk/rtld are identical: copy), and
+  `recomp/image.py extracted/update/code build`; `layout.json` records the
+  extracted dir, so `build.py` reads the matching analysis. Run with
+  `FIFA_ROMFS=extracted/update/romfs_program.json`.
 
 ## What's in the NSP
 
@@ -39,6 +49,32 @@ RomFS (116 files) is standard Frostbite: `Data/initfs_NX`, `layout.toc`,
 `chunkmanifest`, superbundle `.toc`s under `Data/NX/`, and ~13.9 GB of `.cas`
 under `Data/NX/superbundlelayout/installpackage_*`. `oo2tex.key` means Oodle
 Texture is in use; expect Oodle (Kraken/etc.) compressed chunks.
+
+### The update (0100C49025D3E800, v262144)
+
+Branch `//fifa/27-g4/patcha`, CL 9226929, data CL 9214591, built
+2026-09-18 (base: `rl`, CL 9154273, data CL 9153338, 2026-08-11). New
+`main` (same size class, 300,735 function starts vs 300,643) and a new
+RenderCore2 NRO/NRS; nnSdk and rtld are byte-identical.
+
+**The base RomFS is not the whole game.** The base build's own
+`Data/layout.toc` lists superbundles that only the update ships:
+`contentsb`, `globalsfull`, `careersba`, `storycharsb`, `worldssb`,
+`storysba`, `worldcupsb`, commentary, and `installpackage_05`..`08`,
+`installpackage_licensed` (~16 GB of CAS). The game parses RomFS itself
+through `IStorage`, so the missing files never surfaced as fs errors.
+The update's RomFS (193 files, 34 GB virtual: 14 GB relocated from the base
+section, 20 GB new) also adds a Frostbite patch layer under `/Patch/`
+(`initfs_NX` (encrypted), `layout.toc`, patch TOCs and small CAS files).
+
+BKTR: the update's RomFS section is AES-CTR-Ex (encryption 4). Its section
+header holds two bucket trees at 0x100 (relocations: virtual offset,
+physical offset, is_patch; 231 entries) and 0x120 (subsections: offset,
+counter; 101 entries), stored at the end of the section under the plain
+section counter. Base reads use the base section's key and counter; patch
+reads use the update's counter with bytes 4..7 replaced by the subsection's
+counter (big endian). `tools/nsp_extract.py` (`PatchedSection`) and
+`recomp/rt/fs.c` implement it.
 
 ## Seams for the port
 

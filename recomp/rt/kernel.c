@@ -26,6 +26,13 @@
 
 static pthread_mutex_t klock = PTHREAD_MUTEX_INITIALIZER;
 
+/* FIFA_LOG_THREADS=1: thread creation, priority and core mask changes. */
+static int log_threads(void) {
+  static int on = -1;
+  if (on < 0) on = getenv("FIFA_LOG_THREADS") != NULL;
+  return on;
+}
+
 /* ---- handles ---- */
 struct KEvent { int signaled; };
 typedef struct KEvent Event;
@@ -69,6 +76,18 @@ HostThread *thread_create_context(uint64_t stack_size) {
   all_threads = t;
   pthread_mutex_unlock(&klock);
   return t;
+}
+/* The nn::os thread name: TLR+0x1f8 holds the ThreadType, +0x1a0 its name pointer. */
+const char *thread_name(HostThread *t) {
+  uint64_t tt = *(uint64_t *)gptr(t->tlr + 0x1f8), np;
+  if (tt < NULL_GUARD_END || tt >= GUEST_SPACE - 0x200) return "?";
+  np = *(uint64_t *)gptr(tt + 0x1a0);
+  return np >= NULL_GUARD_END && np < GUEST_SPACE ? gstr(np) : "?";
+}
+void host_list_threads(void) {
+  for (HostThread *t = all_threads; t; t = t->next)
+    HLOG("  thread %#llx %-24.24s prio %2d core %2d wait %d%s\n", (unsigned long long)t->id, thread_name(t),
+         t->priority, t->core, t->wait_kind, t->exited ? " exited" : "");
 }
 static HostThread *thread_of(uint32_t h) {
   if (h == PSEUDO_THREAD) return cur_thread;
@@ -141,7 +160,9 @@ static void *thread_main(void *p) {
   CPU *c = &t->cpu;
   c->x[0] = t->arg;
   c->x[30] = 0;
+  core_enter();
   a64_call(c, t->entry);
+  core_leave();
   pthread_mutex_lock(&klock);
   t->exited = 1;
   for (HostThread *o = all_threads; o; o = o->next)
@@ -328,7 +349,53 @@ void kevent_clear(KEvent *e) {
 }
 
 
+/* ---- guest cores ----
+ * FIFA_CORES=N lets at most N guest threads run guest code at once, like the
+ * Switch's 3 application cores; a thread gives its slot up while it blocks in
+ * the kernel or yields. Pure spin loops can't be preempted, so a thread that
+ * waits more than 50 ms for a slot runs anyway. Unset or 0: no limit. */
+static pthread_mutex_t core_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t core_cv = PTHREAD_COND_INITIALIZER;
+static int core_limit = -1, core_running;
+static __thread int core_held;
+
+void core_enter(void) {
+  if (core_limit < 0) core_limit = getenv("FIFA_CORES") ? atoi(getenv("FIFA_CORES")) : 0;
+  if (!core_limit || core_held) return;
+  pthread_mutex_lock(&core_lock);
+  struct timespec dl;
+  clock_gettime(CLOCK_REALTIME, &dl);
+  dl.tv_nsec += 50000000;
+  if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+  while (core_running >= core_limit)
+    if (pthread_cond_timedwait(&core_cv, &core_lock, &dl) == ETIMEDOUT) {
+      static int n;
+      if (++n <= 20 || !(n & (n - 1))) HLOG("[kernel] core slot wait timed out (%d times)\n", n);
+      break;
+    }
+  core_running++;
+  core_held = 1;
+  pthread_mutex_unlock(&core_lock);
+}
+void core_leave(void) {
+  if (!core_limit || !core_held) return;
+  pthread_mutex_lock(&core_lock);
+  core_running--;
+  core_held = 0;
+  pthread_cond_signal(&core_cv);
+  pthread_mutex_unlock(&core_lock);
+}
+
+static void svc_dispatch_inner(CPU *c, uint32_t imm, uint64_t pc);
 void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
+  /* SleepThread, WaitSynchronization, ArbitrateLock, WaitProcessWideKeyAtomic, WaitForAddress */
+  int blocking = imm == 0x0B || imm == 0x18 || imm == 0x1A || imm == 0x1C || imm == 0x34;
+  if (blocking) core_leave();
+  svc_dispatch_inner(c, imm, pc);
+  if (blocking) core_enter();
+}
+
+static void svc_dispatch_inner(CPU *c, uint32_t imm, uint64_t pc) {
   uint64_t *x = c->x;
   HostThread *self = cur_thread;
   if (host_trace) HLOG("[svc %llx] %#x at %#llx x0=%#llx x1=%#llx x2=%#llx x3=%#llx\n", (unsigned long long)self->id,
@@ -365,8 +432,11 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
     t->entry = x[1]; t->arg = x[2];
     t->stack_top = x[3]; t->cpu.x[31] = x[3];
     t->priority = (int)x[4];
+    t->core = (int)x[5];
     x[0] = RES_OK; x[1] = t->handle;
-    if (host_trace) HLOG("[kernel] CreateThread %#x entry %#llx\n", t->handle, (unsigned long long)t->entry);
+    if (host_trace || log_threads())
+      HLOG("[kernel] CreateThread %#x id %#llx entry %#llx prio %d core %d (from thread %#llx)\n", t->handle,
+           (unsigned long long)t->id, (unsigned long long)t->entry, t->priority, t->core, (unsigned long long)self->id);
     return;
   }
   case 0x09: {  /* StartThread(handle) */
@@ -382,6 +452,7 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
     return;
   }
   case 0x0A:  /* ExitThread */
+    core_leave();
     pthread_mutex_lock(&klock);
     self->exited = 1;
     sync_notify();
@@ -401,15 +472,21 @@ void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc) {
   case 0x0D: {  /* SetThreadPriority(handle, prio) */
     HostThread *t = thread_of((uint32_t)x[0]);
     if (t) t->priority = (int)x[1];
+    if (t && log_threads()) HLOG("[kernel] SetThreadPriority id %#llx prio %d\n", (unsigned long long)t->id, t->priority);
     x[0] = t ? RES_OK : R_INVALID_HANDLE;
     return;
   }
   case 0x0E:  /* GetThreadCoreMask -> core, mask */
     x[0] = RES_OK; x[1] = 0; x[2] = 0xF;
     return;
-  case 0x0F:  /* SetThreadCoreMask */
+  case 0x0F: {  /* SetThreadCoreMask(handle, ideal core, mask) */
+    HostThread *t = thread_of((uint32_t)x[0]);
+    if (t && log_threads())
+      HLOG("[kernel] SetThreadCoreMask id %#llx core %d mask %#llx\n", (unsigned long long)t->id, (int)x[1],
+           (unsigned long long)x[2]);
     x[0] = RES_OK;
     return;
+  }
   case 0x10:  /* GetCurrentProcessorNumber */
     x[0] = 0;
     return;

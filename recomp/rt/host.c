@@ -150,10 +150,12 @@ static void crash_handler(int sig, siginfo_t *si, void *uc_) {
        (unsigned long long)(pc - (uint64_t)di.dli_saddr), (unsigned long long)sp, (unsigned long long)fault,
        (unsigned long long)(fault - (uint64_t)mem));
   if (fault - (uint64_t)mem < NULL_GUARD_END) HLOG("  (guest null-region access)\n");
+  if (cur_thread) HLOG("  thread %#llx (%s)\n", (unsigned long long)cur_thread->id, thread_name(cur_thread));
   if (cur_thread)
     for (int i = 0; i < 31; i++)
       HLOG("  x%-2d %016llx%s", i, (unsigned long long)cur_thread->cpu.x[i], i % 4 == 3 || i == 30 ? "\n" : "");
   host_backtrace();
+  host_list_threads();
   signal(SIGABRT, SIG_DFL);
   abort();
 }
@@ -205,6 +207,7 @@ static void *main_thread(void *p) {
   cur_thread = p;
   host_thread_signals();
   HLOG("[host] calling nn::init::Start\n");
+  core_enter();
   a64_call(&cur_thread->cpu, host_nn_init_start);
   HLOG("[host] nn::init::Start returned\n");
   exit(0);

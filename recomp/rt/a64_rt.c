@@ -141,7 +141,8 @@ uint64_t a64_host_cntpct(void) {
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 19200000ull + (uint64_t)ts.tv_nsec * 192 / 10000;
 }
-void a64_yield(void) { sched_yield(); }
+void core_enter(void), core_leave(void);  /* kernel.c */
+void a64_yield(void) { core_leave(); sched_yield(); core_enter(); }
 
 __attribute__((weak)) void a64_trap(CPU *c, uint64_t pc, uint32_t word) {
   (void)c;

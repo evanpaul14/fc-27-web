@@ -48,14 +48,18 @@ A64_INLINE void STQ(uint64_t a, V128 v) { memcpy(G(a), &v, 16); }
 #define STL(bits, a, v) __atomic_store_n((uint##bits##_t *)G(a), (uint##bits##_t)(v), __ATOMIC_RELEASE)
 
 /* Exclusive monitor modelled as compare-and-swap against the value loaded by
- * the matching ldxr. ABA is indistinguishable here and harmless in practice. */
+ * the matching ldxr. ABA is indistinguishable here, so the CAS is at least an
+ * acquire: in `ldaxr; stxr` (an acquire exchange, e.g. a spinlock) another
+ * thread can take and release the lock between the two, and the store then
+ * succeeds where real LL/SC fails. Only the CAS saw that release, so it has to
+ * synchronize with it, or the critical section reads data from before it. */
 #define LDX(bits, cpu, a, acq) ({ uint64_t _a = (a); (cpu)->excl_addr = _a; \
   uint64_t _v = __atomic_load_n((uint##bits##_t *)G(_a), (acq) ? __ATOMIC_ACQUIRE : __ATOMIC_RELAXED); \
   (cpu)->excl_val = _v; _v; })
 #define STX(bits, cpu, a, val, rel) ({ uint64_t _a = (a); uint32_t _r = 1; \
   if ((cpu)->excl_addr == _a) { uint##bits##_t _e = (uint##bits##_t)(cpu)->excl_val; \
     _r = !__atomic_compare_exchange_n((uint##bits##_t *)G(_a), &_e, (uint##bits##_t)(val), 0, \
-        (rel) ? __ATOMIC_SEQ_CST : __ATOMIC_RELAXED, __ATOMIC_RELAXED); } \
+        (rel) ? __ATOMIC_SEQ_CST : __ATOMIC_ACQUIRE, __ATOMIC_RELAXED); } \
   (cpu)->excl_addr = ~0ull; _r; })
 uint32_t a64_stxp128(CPU *c, uint64_t a, uint64_t lo, uint64_t hi);
 void a64_ldxp128(CPU *c, uint64_t a, uint64_t *lo, uint64_t *hi);

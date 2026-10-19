@@ -54,7 +54,7 @@ typedef struct HostThread {
   uint32_t handle;
   uint64_t id;
   uint64_t entry, arg;
-  int priority, exited, cancel;
+  int priority, core, exited, cancel;
   /* kernel wait state, guarded by the kernel lock */
   int wait_kind;
   uint64_t wait_addr, wait_mutex, wait_seq;
@@ -64,12 +64,16 @@ typedef struct HostThread {
   struct HostThread *next;
 } HostThread;
 extern __thread HostThread *cur_thread;
+const char *thread_name(HostThread *t);
+void host_list_threads(void);
 
 /* Read/write guest memory from host code. */
 static inline void *gptr(uint64_t a) { return mem + a; }
 static inline const char *gstr(uint64_t a) { return a ? (const char *)(mem + a) : "(null)"; }
 
 void svc_dispatch(CPU *c, uint32_t imm, uint64_t pc);
+void core_enter(void);  /* FIFA_CORES: take / give up a guest core slot */
+void core_leave(void);
 
 /* kernel objects (kernel.c) */
 enum { H_FREE, H_THREAD, H_EVENT_R, H_EVENT_W, H_SESSION, H_SHMEM, H_TMEM };

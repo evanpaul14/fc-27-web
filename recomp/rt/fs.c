@@ -170,7 +170,7 @@ static void nsp_read(uint8_t *dst, int fd, uint64_t pos, uint64_t size, uint64_t
                      const uint8_t *ctr_hi) {
   static uint8_t buf[1 << 22];  /* callers hold ipc_lock */
   while (size) {
-    uint64_t a = pos & ~15ull, pad = pos - a;
+    uint64_t a = nca_offset + ((pos - nca_offset) & ~15ull), pad = pos - a;  /* AES blocks start at the NCA, which needn't be 16-aligned in the NSP */
     uint64_t n = size < sizeof buf - 16 ? size : sizeof buf - 16;
     uint64_t len = (pad + n + 15) & ~15ull;
     ssize_t got = pread(fd, buf, len, (off_t)a);
@@ -257,6 +257,14 @@ static void storage(void *state, IpcMsg *m) {
     if (log_reads < 0) log_reads = getenv("FIFA_LOG_ROMFS") != NULL;
     if (host_trace || log_reads) HLOG("[fs] RomFS read %#llx +%#llx\n", (unsigned long long)off, (unsigned long long)size);
     romfs_read(gptr(m->b[0].addr), off, size);
+    if (log_reads && size <= 0x80) {  /* headers and small tables */
+      const uint8_t *b = gptr(m->b[0].addr);
+      for (uint64_t i = 0; i < size; i += 16) {
+        char line[64], *q = line;
+        for (uint64_t j = i; j < i + 16 && j < size; j++) q += sprintf(q, "%02x", b[j]);
+        HLOG("[fs]   %04llx %s\n", (unsigned long long)i, line);
+      }
+    }
     return;
   }
   case 1: case 3: m->result = R_FS_UNSUPPORTED; return;  /* Write, SetSize: read-only */

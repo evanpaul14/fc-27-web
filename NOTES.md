@@ -691,6 +691,48 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     clear colours and targets in `[clear]`, `[clearbuf]`.
   - Menu input timing varies between runs ("down 4" from the main menu
     lands on Player Career or one entry off); check with `shot` before `a`.
+- NaN hunt, second round (2026-10-19): **the match's main 3D pass is finite
+  and shows the scene** (pitch, players, stands, ad boards in the HDR
+  target; `pass_008_n.png` max ~5). The final image is still nearly black
+  (exposure, below).
+  - Where the 48-byte buffer comes from: it is not a fixed buffer but a
+    transient allocation (179d7fb00 is reused by several programs). Chain:
+    sky FS `16f50ba00` draws the six faces of a 128x128 RG11B10F cube ->
+    `CMD_DOWNSAMPLE` mips -> compute `16dbfe800` / `16e472300` filter it
+    into a second cube (image stores, one handle per mip) -> `16ee81e00` /
+    `16e895800` prefilter -> `16da34400` projects 96 SH records ->
+    `16f732700` reduces them into 3 x 16 bytes (the buffer the light-list
+    FS divides by). Every step read zeros:
+  - The sky FS never translated: its SUST handle is `@P3 MOV r10,
+    c[2][0x120]` under the same predicate as the `@P3 SUST`, and
+    `trace_handle` refused all predicated writes. A write under the using
+    instruction's predicate counts now, when no SETP/R2P in between sets
+    that predicate (`pred_written_between`). shtool: 398 -> 407/437.
+  - The cube filters bind the cube as `texture2d_array` (faces as layers)
+    and one shader as `texturecube_array`; `sampled_texture` had no
+    Cube -> 2DArray / CubeArray views and bound the dummy texture
+    (`[tex] type mismatch: want 3 have 5`), so reads were 0 and image
+    stores went nowhere.
+  - One-shot draws were lost to async compiles: the sky cube (drawn once at
+    boot and once at match load) and a 128x128 RGBA16F lookup table (FS
+    `16e7daa00`, drawn once at frame ~73; the object shaders take
+    `1 / t14.x` of it at pc 0x3ac8 -> Inf) were skipped while their
+    pipelines compiled, and never drawn again. `one_shot_target()`: a draw
+    whose colour/depth target was not drawn during the previous frame waits
+    for its program and pipeline (`compile N/Mms wait Kms` in the stats
+    line; ~40 ms in a whole boot-to-match run). Targets drawn every frame
+    still skip.
+  - Debug aids: `FIFA_DBG_SBUF=<addr>` (compute dispatches binding a storage
+    buffer holding addr: uniforms, the buffer before and after the GPU ran
+    it, `[sbufw]`), `FIFA_DBG_CSW=<cs>,...` (the first 12 dispatches of
+    those programs, same readback plus every bound texture's size, guest
+    bytes and which mips/faces of the Metal texture hold anything),
+    `FIFA_DBG_RTW=<tex addr>` (render-target binds, draws, copies, clears and
+    shader bindings of that texture, `[rtw]`; the sky cube is at 1786a8c00
+    and the LUT at 178240000 every run), and with `FIFA_DBG_PERDRAW` +
+    `FIFA_DBG_FS=<fs>:fffffffe:0` the traced program's textures are listed
+    too. The boot now often stops at the "sign in to the EA Servers"
+    notice; from there `a` opens the menu on Seasons (two `up`s to Kick Off).
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -836,10 +878,12 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   To Watch" with streamed portraits) and the line-up graphics render, then a
   black screen with the PL logo, and then the match itself runs: HUD
   (BOU 0-0 BHA, clock running, radar with moving players, player names,
-  "Difficulty changed to Beginner"), but the 3D scene is black: the
-  main pass's draws now have real geometry but write NaN/Inf everywhere
-  (next: the zero 48-byte light/parameter buffer at 179d7fb00 and the
-  empty exposure histogram, see "NaN hunt" in Status). Performance in the match is ~3 fps since real global-memory
+  "Difficulty changed to Beginner"). The 3D scene now renders into the
+  HDR target (NaN hunt, second round), but the final image is almost black
+  with only the brightest parts of the stands showing: next is exposure /
+  tonemapping (the 256x256 luminance target that the histograms read is
+  never drawn into in the match, so the exposure LUT is 0/0, see the first
+  NaN hunt round in Status). Performance in the match is ~3 fps since real global-memory
   data arrived (`FIFA_GPU_PROFILE`; the `switch (pc)` form of branchy
   shaders is the likely cost).
   Older state: Skips are

@@ -96,6 +96,7 @@ typedef struct {
     bool glsl;               // emit Vulkan GLSL: dialect-specific constructs here, the rest via glsl_rewrite()
     bool uses_gmem_store;    // STG present: the gmem buffer is not readonly
     uint32_t cbuf_need[18];  // highest constant vec4 index + 1 per cbuf (array size of the GLSL block)
+    size_t trace_use;        // trace_handle: the instruction that uses the handle
 } Ctx;
 
 static uint64_t bits(uint64_t w, int lo, int n) { return (w >> lo) & ((n == 64) ? ~0ull : ((1ull << n) - 1)); }
@@ -619,13 +620,35 @@ static bool writes_reg(uint64_t w, int r) {
     return r > d && r <= d + 3 && ((top >= 0xc0 && top < 0xe0) || top == 0xee || top == 0xef || (top & 0xe0) == 0x80);
 }
 
+// Does an instruction in (from, to) write predicate p (set-predicate ops: bits 3-5, and 0-2 for the second result)?
+static bool pred_written_between(Ctx *c, size_t from, size_t to, int p) {
+    for (size_t j = from + 1; j < to; j++) {
+        if (j % 4 == 0) continue;
+        uint64_t w = c->words[j];
+        uint16_t op = (uint16_t)(w >> 48), o8 = op & 0xfff8;
+        bool setp = (op & 0xfff0) == 0x5bb0 || (op & 0xfff0) == 0x4bb0 || (op & 0xfef0) == 0x36b0 ||
+                    (op & 0xfff0) == 0x5b60 || (op & 0xfff0) == 0x4b60 || (op & 0xfef0) == 0x3660 ||
+                    (op & 0xfff0) == 0x5b80 || (op & 0xfff0) == 0x4b80 || (op & 0xfef0) == 0x3680 ||
+                    o8 == 0x5d20 || (op & 0xfe80) == 0x7e80 || (op & 0xfe80) == 0x7e00 || o8 == 0x5090 || o8 == 0x50a0;
+        if ((op & 0xfef8) == 0x38c0) return true;  // R2P: any predicate
+        if (setp && ((int)bits(w, 3, 3) == p || (int)bits(w, 0, 3) == p)) return true;
+    }
+    return false;
+}
+
+// The constant-buffer word(s) a handle register holds at instruction `at`. A write under a predicate counts when the
+// using instruction has the same predicate (`@P3 MOV r10, c[2][0x120]; @P3 SUST ... r10`) and nothing in between
+// sets it; c->trace_use is that instruction.
 static int trace_handle(Ctx *c, size_t at, int r, uint32_t *offs, int n, int depth) {
     if (r == RZ || depth > 6 || n < 0) return -1;
+    if (depth == 0) c->trace_use = at;
     for (size_t j = at; j-- > 0;) {
         if (j % 4 == 0) continue;
         uint64_t w = c->words[j];
         if (!writes_reg(w, r)) continue;
-        if (bits(w, 16, 4) != PT) return -1;  // predicated write: the value depends on the path
+        uint32_t wp = (uint32_t)bits(w, 16, 4), up = (uint32_t)bits(c->words[c->trace_use], 16, 4);
+        if (wp != PT && (wp != up || pred_written_between(c, j, c->trace_use, (int)(wp & 7))))
+            return -1;  // predicated write: the value depends on the path
         uint64_t op = w & 0xfff8000000000000ull;
         bool lop_or = bits(w, 41, 2) == 1 && !bits(w, 39, 2);  // LOP.OR, neither operand inverted
         if (op == 0x5c98000000000000ull) return trace_handle(c, j, (int)bits(w, 20, 8), offs, n, depth + 1);  // MOV

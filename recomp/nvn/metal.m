@@ -821,3 +821,39 @@ void ui_run(void) {
     }
     exit(0);
 }
+
+// Debug: per mip level, how many slices of the texture have any nonzero byte, and the first texel's bytes.
+void renderer_texture_probe(NvnTexture *t) {
+    id<MTLTexture> tex = tex_backend(t)->tex;  // (no upload, not marked GPU-owned)
+    if (!tex) return;
+    NSUInteger slices = tex.textureType == MTLTextureTypeCube ? 6 : tex.textureType == MTLTextureTypeCubeArray ? 6 * tex.arrayLength : tex.arrayLength;
+    LOG("[probe] type %lu fmt %lu %lux%lu levels %lu slices %lu:", (unsigned long)tex.textureType, (unsigned long)tex.pixelFormat,
+        (unsigned long)tex.width, (unsigned long)tex.height, (unsigned long)tex.mipmapLevelCount, (unsigned long)slices);
+    for (NSUInteger l = 0; l < tex.mipmapLevelCount; l++) {
+        NSUInteger w = MAX(tex.width >> l, 1), h = MAX(tex.height >> l, 1), bpr = w * 16, len = bpr * h;
+        id<MTLBuffer> buf = [dev newBufferWithLength:len * slices options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+        NSUInteger bpp = 0;
+        switch (tex.pixelFormat) {
+        case MTLPixelFormatRGBA32Float: bpp = 16; break;
+        case MTLPixelFormatRGBA16Float: case MTLPixelFormatRG32Float: bpp = 8; break;
+        default: bpp = 4; break;
+        }
+        for (NSUInteger s = 0; s < slices; s++)
+            [b copyFromTexture:tex sourceSlice:s sourceLevel:l sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                      toBuffer:buf destinationOffset:s * len destinationBytesPerRow:w * bpp destinationBytesPerImage:w * h * bpp];
+        [b endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        const uint32_t *p = buf.contents;
+        int nz = 0;
+        for (NSUInteger s = 0; s < slices; s++) {
+            bool any = false;
+            for (NSUInteger i = 0; i < w * h * bpp / 4 && !any; i++) any = p[s * len / 4 + i] != 0;
+            nz += any;
+        }
+        LOG(" L%lu %d/%lu (%08x %08x)", (unsigned long)l, nz, (unsigned long)slices, p[0], bpp > 4 ? p[1] : 0);
+    }
+    LOG("\n");
+}

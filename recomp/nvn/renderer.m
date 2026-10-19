@@ -84,6 +84,7 @@ bool renderer_origin_lower_left(void) { return nvn_window_origin() == 0; }
 
 static double stat_compile_ms;  // time spent building shaders/pipelines (first-use stutter)
 static int stat_compiles;
+static double stat_compile_wait_ms;  // draws into one-shot targets waiting for their compiles (one_shot_target)
 static inline double now_ms(void) { return (double)clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e6; }
 #define TIMED_COMPILE(expr) ({ double t0_ = now_ms(); __auto_type r_ = (expr); stat_compile_ms += now_ms() - t0_; stat_compiles++; r_; })
 
@@ -99,13 +100,13 @@ const char *renderer_stats(void) {
     struct task_vm_info vmi;
     mach_msg_type_number_t vn = TASK_VM_INFO_COUNT;
     uint64_t foot = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &vn) == KERN_SUCCESS ? vmi.phys_footprint : 0;
-    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped (%llu/%llu/%llu/%llu/%llu/%llu), %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms, fbcopy %llu | tex %d (%.0f MB) views %d snaps %lu mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu", stat_draws, stat_skipped,
+    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped (%llu/%llu/%llu/%llu/%llu/%llu), %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms wait %.0fms, fbcopy %llu | tex %d (%.0f MB) views %d snaps %lu mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu", stat_draws, stat_skipped,
              skip_why[0], skip_why[1], skip_why[2], skip_why[3], skip_why[4], skip_why[5],
-             stat_passes, stat_dispatches, stat_flushes, stat_gpu_s * 1000.0, (double)stat_wait_ns / 1e6 * 125.0 / 3.0, stat_compiles, stat_compile_ms, stat_feedback_copies,
+             stat_passes, stat_dispatches, stat_flushes, stat_gpu_s * 1000.0, (double)stat_wait_ns / 1e6 * 125.0 / 3.0, stat_compiles, stat_compile_ms, stat_compile_wait_ms, stat_feedback_copies,
              g_tex_live, g_tex_live_bytes / 1048576.0, g_views_live, (unsigned long)(g_snap_copies ? g_snap_copies.count : 0), foot / 1048576.0, stat_wait_by[0] / 24e3, (unsigned long long)stat_wait_n[0], stat_wait_by[1] / 24e3, (unsigned long long)stat_wait_n[1], stat_wait_by[2] / 24e3, (unsigned long long)stat_wait_n[2]);
     stat_compiles = 0;
     stat_feedback_copies = 0;
-    stat_compile_ms = 0;
+    stat_compile_ms = stat_compile_wait_ms = 0;
     memset(skip_why, 0, sizeof skip_why);
     stat_draws = stat_skipped = stat_passes = stat_dispatches = stat_flushes = stat_wait_ns = 0;
     memset(stat_wait_by, 0, sizeof stat_wait_by); memset(stat_wait_n, 0, sizeof stat_wait_n);
@@ -1153,6 +1154,11 @@ static id<MTLTexture> sampled_texture(NvnTexture *t, const NvnTextureView *v, bo
             tex = view_cached(src, 0x6000000000000000ull | 1, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 1)]; });
         else if (want == MTLTextureType2DArray && tex.textureType == MTLTextureType2D)
             tex = view_cached(src, 0x6000000000000000ull | 2, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureType2DArray levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 1)]; });
+        else if (want == MTLTextureType2DArray && (tex.textureType == MTLTextureTypeCube || tex.textureType == MTLTextureTypeCubeArray))
+            // cube faces as array layers (the cube filters and their image stores address faces by layer)
+            tex = view_cached(src, 0x6000000000000000ull | 4, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureType2DArray levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, src.textureType == MTLTextureTypeCube ? 6 : src.arrayLength * 6)]; });
+        else if (want == MTLTextureTypeCubeArray && tex.textureType == MTLTextureTypeCube)
+            tex = view_cached(src, 0x6000000000000000ull | 5, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureTypeCubeArray levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 6)]; });
         else if (want == MTLTextureTypeCube && tex.textureType == MTLTextureType2DArray && tex.arrayLength >= 6)
             tex = view_cached(src, 0x6000000000000000ull | 3, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureTypeCube levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 6)]; });
         else {
@@ -1274,6 +1280,7 @@ static void resolve_feedback(Prog *pr) {
         }
 }
 
+static bool rtw(const NvnTexture *t);
 static void bind_textures(int stage, ShaderInfo *si) {
     for (int i = 0; i < si->ntex; i++) {
         ShaderTexture *st_ = &si->tex[i];
@@ -1285,6 +1292,10 @@ static void bind_textures(int stage, ShaderInfo *si) {
         if (i < 64) tex_wh[stage][i][0] = tex_wh[stage][i][1] = 0;
         if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
             NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
+            if (rtw(e->tex)) {
+                static int n;
+                if (n++ < 40) LOG("[rtw] %s %llx binds it at t%d (image %d)\n", stage ? "fs" : "vs", st.program->stages[stage].code_addr, i, st_->is_image);
+            }
             if (e->tex) tex = sampled_texture(e->tex, &e->view, e->has_view, st_->type, st_->is_image);
             if (e->tex && i < 64) {
                 renderer_texture_scale(e->tex, &tex_sc[stage][i][0], &tex_sc[stage][i][1]);
@@ -1449,6 +1460,27 @@ static int gmem_windows(int stage, uint64_t win[GMEM_WINDOWS][4], __unsafe_unret
     return n;
 }
 
+// Debug: each texture a stage's program binds (handle, size, format, guest bytes, GPU-owned) and which mip levels /
+// faces of its Metal texture hold anything (renderer_texture_probe), for the [sbufw] / [perdraw] traces.
+static void log_bound_textures(int stage, ShaderInfo *si) {
+    for (int i = 0; i < si->ntex; i++) {
+        uint64_t h = shader_tex_handle(stage, &si->tex[i]);
+        uint32_t tic = h & 0xFFFFF;
+        NvnTexEntry *e = h && st.tpool && tic < (uint32_t)st.tpool->count ? &((NvnTexEntry *)st.tpool->entries)[tic] : NULL;
+        LOG(" t%d(h %llx type %d img %d tex %p", i, h, si->tex[i].type, si->tex[i].is_image, e ? e->tex : NULL);
+        if (e && e->tex) {
+            size_t nz = 0, len = e->tex->pool ? (size_t)tegra_total_size(&e->tex->layout) : 0;
+            const uint8_t *g = gptr(e->tex->addr);
+            for (size_t b = 0; b < len; b++) nz += g[b] != 0;
+            LOG(" %ux%u fmt %u addr %llx flags %x label '%s' guest %zu/%zu nonzero, gpu-owned %d", e->tex->width, e->tex->height,
+                e->tex->format, e->tex->addr, e->tex->flags, e->tex->label, nz, len, renderer_is_gpu_owned(e->tex));
+        }
+        LOG(")");
+        extern void renderer_texture_probe(NvnTexture *t);
+        if (e && e->tex && e->tex->backend) renderer_texture_probe(e->tex);
+    }
+}
+
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate(NULL);
     if (!st.program || !gx || !gy || !gz) return;
@@ -1517,6 +1549,10 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         tex_sc[0][i][0] = tex_sc[0][i][1] = 1;
         if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
             NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
+            if (rtw(e->tex)) {
+                static int n;
+                if (n++ < 40) LOG("[rtw] cs %llx binds it at t%d (image %d)\n", st.program->stages[5].code_addr, i, st_->is_image);
+            }
             if (e->tex) tex = sampled_texture(e->tex, &e->view, e->has_view, st_->type, st_->is_image);
             if (e->tex && i < 64) renderer_texture_scale(e->tex, &tex_sc[0][i][0], &tex_sc[0][i][1]);
             for (int k = 0; k < nfeedback; k++)
@@ -1538,6 +1574,66 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         [ce setBytes:rs length:(NSUInteger)(1 + si->ntex) * 16 atIndex:RSCALE_BUFFER_INDEX];
     }
     CST("dispatch");
+    static uint64_t sbuf_watch = ~0ull;
+    if (sbuf_watch == ~0ull) sbuf_watch = getenv("FIFA_DBG_SBUF") ? strtoull(getenv("FIFA_DBG_SBUF"), NULL, 16) : 0;
+    bool sbuf_hit = false;
+    static int csw_on = -1;
+    if (csw_on < 0) csw_on = getenv("FIFA_DBG_CSW") != NULL;
+    if (sbuf_watch || csw_on) {
+        // FIFA_DBG_SBUF=<addr>: log the first dispatches of each program that binds a storage buffer holding <addr>,
+        // and the 48 bytes there whenever they changed since the previous dispatch.
+        static uint64_t seen_cs[64];
+        static int seen_n[64], nseen;
+        static uint32_t last[12];
+        static const uint32_t none[12];
+        const uint32_t *now = sbuf_watch ? (uint32_t *)gptr(sbuf_watch) : none;
+        bool changed = memcmp(last, now, sizeof last) != 0;
+        if (changed) memcpy(last, now, sizeof last);
+        uint64_t cs = st.program->stages[5].code_addr;
+        for (int i = 0; i < 16; i++)
+            if (st.sbuf[5][i].addr <= sbuf_watch && sbuf_watch < st.sbuf[5][i].addr + st.sbuf[5][i].size) {
+                int k = 0;
+                while (k < nseen && seen_cs[k] != cs) k++;
+                if (k == nseen && nseen < 64) seen_cs[nseen++] = cs;
+                if (k < 64 && seen_n[k]++ >= 3 && !changed) break;
+                sbuf_hit = true;
+                LOG("[sbufw] cs %llx groups %ux%ux%u ssbo %d (%llx,%llu) ubo0 %llx:", cs, gx, gy, gz, i, st.sbuf[5][i].addr,
+                    st.sbuf[5][i].size, st.ubuf[5][0].addr);
+                if (st.ubuf[5][0].addr) for (int w = 0; w < 56 && w * 4 < (int)st.ubuf[5][0].size; w++) LOG(" %08x", ((uint32_t *)gptr(st.ubuf[5][0].addr))[w]);
+                LOG(" | buf:");
+                for (int w = 0; w < 12; w++) LOG(" %08x", now[w]);
+                LOG("\n");
+                break;
+            }
+        static uint64_t csw[16];
+        static int ncsw = -1, csw_n[16];
+        if (ncsw < 0) {
+            // FIFA_DBG_CSW=<cs>,...: also the first 12 dispatches of these programs, whatever they bind.
+            ncsw = 0;
+            for (const char *e = getenv("FIFA_DBG_CSW"); e && *e && ncsw < 16;) {
+                char *end;
+                csw[ncsw++] = strtoull(e, &end, 16);
+                e = *end == ',' ? end + 1 : "";
+            }
+        }
+        for (int k = 0; k < ncsw && !sbuf_hit; k++)
+            if (csw[k] == cs && csw_n[k]++ < 12) {
+                extern uint64_t g_rt_watch_addr;
+                if (!g_rt_watch_addr && si->ntex && !si->tex[0].is_image) {
+                    uint64_t h = shader_tex_handle(5, &si->tex[0]);
+                    uint32_t tic = h & 0xFFFFF;
+                    NvnTexEntry *e = h && st.tpool && tic < (uint32_t)st.tpool->count ? &((NvnTexEntry *)st.tpool->entries)[tic] : NULL;
+                    if (e && e->tex) g_rt_watch_addr = e->tex->addr;
+                }
+                sbuf_hit = true;
+                LOG("[sbufw] cs %llx groups %ux%ux%u\n", cs, gx, gy, gz);
+            }
+        if (changed) {
+            LOG("[sbufw] changed before cs %llx:", cs);
+            for (int w = 0; w < 12; w++) LOG(" %08x", now[w]);
+            LOG("\n");
+        }
+    }
     extern bool g_debug_frame;
     if (g_debug_frame) {
         LOG("[dispatch] cs=%llx groups %ux%ux%u ssbo:", st.program->stages[5].code_addr, gx, gy, gz);
@@ -1548,6 +1644,18 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     }
     [ce dispatchThreadgroups:MTLSizeMake(gx, gy, gz) threadsPerThreadgroup:MTLSizeMake(cp->local[0], cp->local[1], cp->local[2])];
     [ce endEncoding];
+    if (sbuf_hit) {
+        renderer_flush();
+        LOG("[sbufw] after (local %ux%ux%u):", cp->local[0], cp->local[1], cp->local[2]);
+        log_bound_textures(5, si);
+        for (int w = 0; w < 12 && sbuf_watch; w++) LOG(" %08x", ((uint32_t *)gptr(sbuf_watch))[w]);
+        for (int i = 0; i < 16; i++)
+            if (st.sbuf[5][i].addr && st.sbuf[5][i].size <= 4096) {
+                LOG(" | ssbo%d %llx:", i, st.sbuf[5][i].addr);
+                for (int w = 0; w < 12 && w * 4 < (int)st.sbuf[5][i].size; w++) LOG(" %08x", ((uint32_t *)gptr(st.sbuf[5][i].addr))[w]);
+            }
+        LOG("\n");
+    }
     if (gpu_profile()) {
         char tag[64];
         snprintf(tag, sizeof tag, "cs %llx", (unsigned long long)st.program->stages[5].code_addr);
@@ -1593,6 +1701,8 @@ static id<MTLBuffer> expand_indices(uint32_t mode, uint32_t count, const void *i
 
 // FIFA_DBG_PERDRAW=1: in the debug frame every draw ends its pass, waits for the GPU and logs how many pixels of
 // each float colour target are non-finite, so the first draw that writes NaN/Inf can be found.
+static Prog *perdraw_prog;  // the draw being checked
+static void log_bound_textures(int stage, ShaderInfo *si);
 static void perdraw_check(void) {
     static int ndraw;
     [enc endEncoding];
@@ -1618,7 +1728,11 @@ static void perdraw_check(void) {
             unsigned pc = 0;
             trace_fs = e && sscanf(e, "%llx:%x", &a, &pc) == 2 && pc == 0xfffffffeu ? a : 0;
         }
-        if (trace_fs && st.program && st.program->stages[1].code_addr == trace_fs) renderer_nantrace_report(tex);
+        if (trace_fs && st.program && st.program->stages[1].code_addr == trace_fs) {
+            renderer_nantrace_report(tex);
+            static int nprobe;
+            if (perdraw_prog && nprobe++ < 2) { LOG("[perdraw] fs textures:"); log_bound_textures(1, perdraw_prog->fi); LOG("\n"); }
+        }
         long first;
         size_t bad = renderer_count_nonfinite(tex, &first);
         LOG("[perdraw] draw %d pass %d rt%d %llx %lux%lu fmt %lu: %zu non-finite (first %ld,%ld) vs %llx fs %llx\n", ndraw,
@@ -1768,7 +1882,41 @@ static uint64_t pipeline_state_hash(Prog *pr) {
     return h ? h : 1;
 }
 
+// Draws whose program or pipeline is still compiling are skipped, which is harmless for a target the game redraws
+// every frame. Others (an environment cube captured once, a BRDF lookup table drawn at boot) would stay empty, and
+// the lighting divides by them: those draws wait for the compile. True when a bound target was not drawn into
+// during the previous frame (marks this frame's use).
+static bool one_shot_target(void) {
+    uint64_t now = renderer_present_count();
+    bool once = false;
+    for (int i = 0; i <= st.rt.ncolor; i++) {
+        NvnTexture *t = i < st.rt.ncolor ? st.rt.color[i] : st.rt.depth;
+        if (!t) continue;
+        if (t->draw_frame != now) { t->draw_prev_frame = t->draw_frame; t->draw_frame = now; }
+        once |= !t->draw_prev_frame || t->draw_prev_frame + 1 < now;
+    }
+    return once;
+}
+
+uint64_t g_rt_watch_addr;  // debug: draws into the colour target at this address are logged ([rtw])
+// FIFA_DBG_RTW=<addr>: every render-target bind, copy, clear and image binding of the texture at <addr> ([rtw]).
+static bool rtw(const NvnTexture *t) {
+    static int init;
+    if (!init) { init = 1; const char *e = getenv("FIFA_DBG_RTW"); if (e) g_rt_watch_addr = strtoull(e, NULL, 16); }
+    return t && g_rt_watch_addr && t->addr == g_rt_watch_addr;
+}
 static void draw(CmdRec *r, bool indexed) {
+    if (g_rt_watch_addr) {
+        static int n;
+        for (int i = 0; i < st.rt.ncolor && n < 80; i++)
+            if (st.rt.color[i] && st.rt.color[i]->addr == g_rt_watch_addr) {
+                n++;
+                LOG("[rtw] frame %llu draw rt%d %ux%u vs %llx fs %llx\n", (unsigned long long)renderer_present_count(), i,
+                    st.rt.color[i]->width, st.rt.color[i]->height, st.program ? st.program->stages[0].code_addr : 0,
+                    st.program ? st.program->stages[1].code_addr : 0);
+                break;
+            }
+    }
     if (!st.program) { SKIP(0); return; }
     static bool logged_modes;
     if (!logged_modes) {
@@ -1785,6 +1933,12 @@ static void draw(CmdRec *r, bool indexed) {
     if (st.color_state[0] & 1)  // target 0 blends with SRC1 factors: the shader's target 1 output is that source
         for (int k = 1; k <= 4; k++) fkey.dual_source |= st.blend[0][k] >= 0x10 && st.blend[0][k] <= 0x13;
     Prog *pr = get_program(st.program, &vkey, &fkey);
+    bool must_draw = one_shot_target();
+    if (pr && !pr->ready && must_draw) {
+        double t0 = now_ms();
+        while (!pr->ready && !__atomic_load_n(&pr->failed, __ATOMIC_ACQUIRE)) usleep(100);
+        stat_compile_wait_ms += now_ms() - t0;
+    }
     if (!pr || !pr->ready) { SKIP(1); return; }
     if (!prof_pass_fs) prof_pass_fs = st.program->stages[1].code_addr;
     static int log_rt_w = -1, log_rt_h;
@@ -1900,10 +2054,21 @@ static void draw(CmdRec *r, bool indexed) {
             id done = ready_pipes[pk];
             if (done) { [ready_pipes removeObjectForKey:pk]; cache[pk] = done; pobj = done; }
         }
+        if (pobj == pending && must_draw) {
+            double t0 = now_ms();
+            while (pobj == pending) {
+                usleep(100);
+                @synchronized(ready_pipes) {
+                    id done = ready_pipes[pk];
+                    if (done) { [ready_pipes removeObjectForKey:pk]; cache[pk] = done; pobj = done; }
+                }
+            }
+            stat_compile_wait_ms += now_ms() - t0;
+        }
         if (pobj == pending) { SKIP(2); return; }
     }
     if (!pobj) {
-        if (sync_shaders()) {
+        if (sync_shaders() || must_draw) {
             NSError *err;
             pobj = TIMED_COMPILE([dev newRenderPipelineStateWithDescriptor:pd error:&err]);
             if (!pobj) {
@@ -2084,7 +2249,7 @@ static void draw(CmdRec *r, bool indexed) {
     stat_draws++;
     static int perdraw = -1;
     if (perdraw < 0) perdraw = getenv("FIFA_DBG_PERDRAW") != NULL;
-    if (g_debug_frame && perdraw) perdraw_check();
+    if (g_debug_frame && perdraw) { perdraw_prog = pr; perdraw_check(); }
     if (dbg_this) {
         static int nlog;
         if (nlog++ < 4) {
@@ -2277,6 +2442,9 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
 static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t flags) {
     snap_reason = "tex2tex"; snapshots_invalidate(NULL);
     NvnTexture *st_ = (NvnTexture *)(uintptr_t)src->tex, *dt = (NvnTexture *)(uintptr_t)dst->tex;
+    if (rtw(dt) || rtw(st_))
+        LOG("[rtw] copy %llx (%ux%u f%#x) -> %llx (%ux%u f%#x) flags %llx\n", st_ ? st_->addr : 0, st_ ? st_->width : 0, st_ ? st_->height : 0,
+            st_ ? st_->format : 0, dt ? dt->addr : 0, dt ? dt->width : 0, dt ? dt->height : 0, dt ? dt->format : 0, flags);
     if (!st_ || !dt) return;
     end_pass();
     id<MTLTexture> s = sampled_texture(st_, &src->view, src->has_view, TEXTYPE_2D, false);
@@ -2520,7 +2688,13 @@ static void exec_list(uint64_t handle, int depth) {
             st.rt.depth = (NvnTexture *)(uintptr_t)rt->depth;
             st.rt.dview = rt->dview;
             st.rt.has_dview = rt->has_dview;
+            for (int i = 0; i < st.rt.ncolor; i++)
+                if (rtw(st.rt.color[i]))
+                    LOG("[rtw] frame %llu set rt%d of %d view %d (min layer %u layers %u level %u)\n", (unsigned long long)renderer_present_count(),
+                        i, st.rt.ncolor, st.rt.has_cview[i], st.rt.cview[i].min_layer, st.rt.cview[i].num_layers, st.rt.cview[i].base_level);
             drop_unrenderable_targets();
+            for (int i = 0; i < 8; i++)
+                if (rtw((NvnTexture *)(uintptr_t)rt->tex[i]) && st.rt.color[i] != (NvnTexture *)(uintptr_t)rt->tex[i]) LOG("[rtw] dropped rt%d\n", i);
             st.rt_dirty = true;
             break;
         }
@@ -2567,6 +2741,7 @@ static void exec_list(uint64_t handle, int depth) {
             // Done as a render-target clear: bind the texture alone, scissor = region, clear(), restore.
             const struct { uint64_t tex; NvnTextureView view; uint8_t has_view; int32_t region[6]; float color[4]; } *ct = x;
             NvnTexture *t = (NvnTexture *)(uintptr_t)ct->tex;
+            if (rtw(t)) LOG("[rtw] clear texture\n");
             if (!t) break;
             snap_reason = "clear-texture"; snapshots_invalidate(NULL);
             RtState saved = st.rt;

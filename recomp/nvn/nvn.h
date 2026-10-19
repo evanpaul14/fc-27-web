@@ -76,6 +76,7 @@ typedef struct NvnTexture {
   void *backend;  /* renderer-side texture */
   uint64_t debug_id;
   char label[64];
+  uint64_t draw_frame, draw_prev_frame;  /* renderer: the last two frames that drew into it (one_shot_target) */
 } NvnTexture;
 
 typedef struct {

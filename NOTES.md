@@ -730,13 +730,16 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
 
 - Kick Off now loads the match: the Premier League loading cards ("Player
   To Watch" with streamed portraits) and the line-up graphics render, then a
-  black screen with the PL logo while ~6k draws/s are still skipped
+  black screen with the PL logo, and then the match itself runs: HUD
+  (BOU 0-0 BHA, clock running, radar with moving players, player names,
+  "Difficulty changed to Beginner"), but the 3D scene is black while
+  10-20k draws/s are still skipped
   (`skipped (a/b/c/d/e/f)` in the stats line: no program / program not
   translated / pipeline compiling / compile started / pipeline failed /
   draw mode). Next: the remaining untranslated shaders (VS `5bdf` was LEA
   and is done; compute `eb20`/`eb10`/`ef5c` (SUST/SULD/ATOM?), FS
   `defa`/`dc38`, bindless handles not from c[2]) and the ~120 failing
-  pipelines; then whether the match itself starts.
+  pipelines.
 - Try the keyboard and a gamepad in the visible window;
   audio output for `audout.c`'s sink thread; the dark Continue button on
   the accessibility screen (seen before the threading fix; check if it

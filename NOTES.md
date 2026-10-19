@@ -733,6 +733,28 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     `FIFA_DBG_FS=<fs>:fffffffe:0` the traced program's textures are listed
     too. The boot now often stops at the "sign in to the EA Servers"
     notice; from there `a` opens the menu on Seasons (two `up`s to Kick Off).
+- **The match renders** (2026-10-19): broadcast camera, lit pitch, players,
+  stands, replays with the goal graphics, at the same ~3-4 fps. After the
+  NaN fixes the image was still nearly black with only highlights:
+  - Colour grading: compute `16dd60c00` turns a 33x33x33 RGBA32F LUT asset
+    into a 33^3 RGB10A2 one, `16e714900` resamples it to 32^3, and the
+    post FS `16de63d00` decodes its lookups (`exp2(...) * 2^-15`). The asset
+    is swizzled by the game on the CPU (no packaged layout), and with our
+    3D default (8 x 32 GOBs) a third of it read as zero. Deswizzling the
+    guest data with every block height / depth (`FIFA_DBG_3D=1`, RGBA32F 3D
+    textures: mean neighbour difference and zero texels per choice) left one
+    clean answer, 1 GOB high and 16 deep. `tegra_layout_init`: 3D blocks
+    hold at most 16 GOBs, depth first.
+  - Exposure: compute `16e884800` (histogram) -> `16f5aa200` -> `16ed56900`
+    writes {e / e_prev, e} to an 8-byte buffer (f0 of the post FS); e_prev
+    is a uniform the CPU fills from the previous frame's result. One run had
+    e_prev = 0 (word 0 inf); `FIFA_FENCE_FLUSH=1` (fences wait for the GPU)
+    kept it at ~1.0. Not seen without it in the other runs, so left as is.
+  - Debug aids: `FIFA_DBG_PROBE_FS=<fs>` (debug frame: that program's
+    textures, `[probefs]`), `FIFA_DBG_RTW_SIZE=<w>x<h>x<d>` (the texture
+    watch by size), `[rt3d]` (3D render targets), `[copy3d]` (buffer copies
+    into 3D textures), RGB10A2 colour counts in the texture probe;
+    `FIFA_DBG_CSW` also fires in the debug frame.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -878,12 +900,12 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   To Watch" with streamed portraits) and the line-up graphics render, then a
   black screen with the PL logo, and then the match itself runs: HUD
   (BOU 0-0 BHA, clock running, radar with moving players, player names,
-  "Difficulty changed to Beginner"). The 3D scene now renders into the
-  HDR target (NaN hunt, second round), but the final image is almost black
-  with only the brightest parts of the stands showing: next is exposure /
-  tonemapping (the 256x256 luminance target that the histograms read is
-  never drawn into in the match, so the exposure LUT is 0/0, see the first
-  NaN hunt round in Status). Performance in the match is ~3 fps since real global-memory
+  "Difficulty changed to Beginner") and the 3D scene renders (see "The
+  match renders" in Status). Next: performance (~3-4 fps in the match,
+  GPU-bound; the `switch (pc)` form of branchy shaders is the likely cost),
+  the occasional e_prev = 0 exposure readback, and a visual pass over the
+  match (shadows, reflections, the remaining ~10 skipped draws per frame:
+  `16fd3ac00`, `171855700` TXD.B). Performance in the match is ~3 fps since real global-memory
   data arrived (`FIFA_GPU_PROFILE`; the `switch (pc)` form of branchy
   shaders is the likely cost).
   Older state: Skips are

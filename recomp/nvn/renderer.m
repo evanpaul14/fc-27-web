@@ -1608,7 +1608,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         static uint64_t csw[16];
         static int ncsw = -1, csw_n[16];
         if (ncsw < 0) {
-            // FIFA_DBG_CSW=<cs>,...: also the first 12 dispatches of these programs, whatever they bind.
+            // FIFA_DBG_CSW=<cs>,...: also the first 12 dispatches of these programs (and all in the debug frame), whatever they bind.
             ncsw = 0;
             for (const char *e = getenv("FIFA_DBG_CSW"); e && *e && ncsw < 16;) {
                 char *end;
@@ -1617,7 +1617,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
             }
         }
         for (int k = 0; k < ncsw && !sbuf_hit; k++)
-            if (csw[k] == cs && csw_n[k]++ < 12) {
+            if (csw[k] == cs && (csw_n[k]++ < 12 || g_debug_frame)) {
                 extern uint64_t g_rt_watch_addr;
                 if (!g_rt_watch_addr && si->ntex && !si->tex[0].is_image) {
                     uint64_t h = shader_tex_handle(5, &si->tex[0]);
@@ -1752,7 +1752,15 @@ static void skip_log(int n) {
         st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->width : 0, st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->height : 0);
 }
 
+static void log_bound_textures(int stage, ShaderInfo *si);
 static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
+    static uint64_t probe_fs = 1;  // FIFA_DBG_PROBE_FS=<fs>: the debug frame lists that program's textures ([probefs])
+    if (probe_fs == 1) { const char *e = getenv("FIFA_DBG_PROBE_FS"); probe_fs = e ? strtoull(e, NULL, 16) : 0; }
+    if (probe_fs && g_debug_frame && st.program && st.program->stages[1].code_addr == probe_fs) {
+        LOG("[probefs] %llx:", probe_fs);
+        log_bound_textures(1, pr->fi);
+        LOG("\n");
+    }
     static uint64_t dump_fs = 1;
     if (dump_fs == 1) { const char *e = getenv("FIFA_DUMP_UBO"); dump_fs = e ? strtoull(e, NULL, 16) : 0; }
     if (dump_fs && st.program && st.program->stages[1].code_addr == dump_fs) {
@@ -1900,9 +1908,17 @@ static bool one_shot_target(void) {
 
 uint64_t g_rt_watch_addr;  // debug: draws into the colour target at this address are logged ([rtw])
 // FIFA_DBG_RTW=<addr>: every render-target bind, copy, clear and image binding of the texture at <addr> ([rtw]).
+// FIFA_DBG_RTW_SIZE=<w>x<h>x<d>: the same for every texture of that size (addresses that change between runs).
 static bool rtw(const NvnTexture *t) {
     static int init;
-    if (!init) { init = 1; const char *e = getenv("FIFA_DBG_RTW"); if (e) g_rt_watch_addr = strtoull(e, NULL, 16); }
+    static unsigned ww, wh, wd;
+    if (!init) {
+        init = 1;
+        const char *e = getenv("FIFA_DBG_RTW");
+        if (e) g_rt_watch_addr = strtoull(e, NULL, 16);
+        if ((e = getenv("FIFA_DBG_RTW_SIZE"))) sscanf(e, "%ux%ux%u", &ww, &wh, &wd);
+    }
+    if (t && ww && t->width == ww && t->height == wh && t->depth == wd) return true;
     return t && g_rt_watch_addr && t->addr == g_rt_watch_addr;
 }
 static void draw(CmdRec *r, bool indexed) {
@@ -2312,6 +2328,14 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
     if (!fi || !fi->bpb) return;
     static int nlog;
     if (nlog++ < 20) LOG("[copy] buf %llx -> tex %ux%u f%#x region %d,%d,%d %dx%dx%d row %llu lvl %d\n", src, t->width, t->height, t->format, rg[0], rg[1], rg[2], rg[3], rg[4], rg[5], row, level);
+    if (t->target == 2 || rtw(t)) {  // (3D textures: colour-grading LUTs)
+        static int n3;
+        size_t nz = 0, n = (size_t)img * (rg[5] > 0 ? rg[5] : 1);
+        for (size_t k = 0; k < n; k++) nz += ((const uint8_t *)gptr(src))[k] != 0;
+        if (n3++ < 40)
+            LOG("[copy3d] buf %llx -> tex %ux%ux%u f%#x target %u region %d,%d,%d %dx%dx%d row %llu img %llu lvl %d: %zu/%zu bytes nonzero\n",
+                src, t->width, t->height, t->depth, t->format, t->target, rg[0], rg[1], rg[2], rg[3], rg[4], rg[5], row, img, level, nz, n);
+    }
     id<MTLBlitCommandEncoder> b = [cb() blitCommandEncoder];
     id<MTLTexture> tex = renderer_texture(t, b, false);  // make sure prior CPU contents are uploaded first
     renderer_mark_gpu_owned(t);
@@ -2688,6 +2712,15 @@ static void exec_list(uint64_t handle, int depth) {
             st.rt.depth = (NvnTexture *)(uintptr_t)rt->depth;
             st.rt.dview = rt->dview;
             st.rt.has_dview = rt->has_dview;
+            for (int i = 0; i < st.rt.ncolor; i++)
+                if (st.rt.color[i] && st.rt.color[i]->target == 2) {
+                    static int n3d;
+                    if (n3d++ < 80)
+                        LOG("[rt3d] frame %llu rt%d %ux%ux%u addr %llx view %d (setmask %x min layer %u layers %u level %u)\n",
+                            (unsigned long long)renderer_present_count(), i, st.rt.color[i]->width, st.rt.color[i]->height,
+                            st.rt.color[i]->depth, st.rt.color[i]->addr, st.rt.has_cview[i], st.rt.cview[i].setmask,
+                            st.rt.cview[i].min_layer, st.rt.cview[i].num_layers, st.rt.cview[i].base_level);
+                }
             for (int i = 0; i < st.rt.ncolor; i++)
                 if (rtw(st.rt.color[i]))
                     LOG("[rtw] frame %llu set rt%d of %d view %d (min layer %u layers %u level %u)\n", (unsigned long long)renderer_present_count(),

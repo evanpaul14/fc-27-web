@@ -20,10 +20,17 @@ static uint32_t block_depth_for(uint32_t depth) {
     return log2;
 }
 
+// 3D textures: a block holds at most 16 GOBs, depth first. The game swizzles its 33x33x33 RGBA32F colour-grading
+// LUT on the CPU this way (1 GOB high, 16 deep; trying every combination, only this one gives a smooth LUT); with
+// 8 x 32 GOBs a third of it read as zero and the graded image was nearly black.
 void tegra_layout_init(TexLayout *t) {
     uint32_t hb = div_up(t->height, t->fmt->bh);
     t->block_height_log2 = tegra_default_block_height_log2(hb);
     t->block_depth_log2 = t->depth > 1 ? block_depth_for(t->depth) : 0;
+    if (t->depth > 1) {
+        if (t->block_depth_log2 > 4) t->block_depth_log2 = 4;
+        if (t->block_height_log2 > 4 - t->block_depth_log2) t->block_height_log2 = 4 - t->block_depth_log2;
+    }
 }
 
 // Block height shrinks with the level so a block never exceeds the level height.

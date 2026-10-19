@@ -398,6 +398,26 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
     uint32_t layers = t->layout.layers ? t->layout.layers : 1;
     uint64_t layer_size = tegra_layer_size(&t->layout);
     bool linear = (t->flags & 0x10) != 0;
+    if (t->layout.depth > 1 && !linear && t->layout.fmt->bpb == 16 && ENV("FIFA_DBG_3D")) {
+        // Debug: which block height / depth makes this 3D texture smooth (RGBA32F LUTs vary slowly between texels)
+        LevelLayout l0 = tegra_level(&t->layout, 0);
+        uint64_t n = (uint64_t)l0.wb * l0.hb * l0.d;
+        float *lin = malloc(n * 16);
+        for (uint32_t bh = 0; bh <= 4; bh++)
+            for (uint32_t bd = 0; bd <= 5; bd++) {
+                tegra_deswizzle(mem, (uint8_t *)lin, l0.wb, l0.hb, l0.d, 16, bh, bd);
+                double diff = 0; uint64_t zero = 0, cnt = 0;
+                for (uint64_t i = 0; i < n; i++) {
+                    zero += lin[i * 4] == 0 && lin[i * 4 + 1] == 0 && lin[i * 4 + 2] == 0;
+                    if (i % l0.wb + 1 < l0.wb)
+                        for (int k = 0; k < 3; k++) { float dd = fabsf(lin[i * 4 + k] - lin[(i + 1) * 4 + k]); if (isfinite(dd)) { diff += dd; cnt++; } }
+                }
+                LOG("[3d] %ux%ux%u fmt %#x addr %llx bh %u bd %u (default %u %u): mean neighbour diff %.5f, %llu/%llu zero\n",
+                    t->width, t->height, t->layout.depth, t->format, t->addr, bh, bd, l0.block_height_log2, l0.block_depth_log2,
+                    cnt ? diff / cnt : 0, zero, n);
+            }
+        free(lin);
+    }
     for (uint32_t layer = 0; layer < layers; layer++) {
         for (uint32_t lv = 0; lv < t->layout.levels; lv++) {
             LevelLayout l = tegra_level(&t->layout, lv);
@@ -826,7 +846,9 @@ void ui_run(void) {
 void renderer_texture_probe(NvnTexture *t) {
     id<MTLTexture> tex = tex_backend(t)->tex;  // (no upload, not marked GPU-owned)
     if (!tex) return;
-    NSUInteger slices = tex.textureType == MTLTextureTypeCube ? 6 : tex.textureType == MTLTextureTypeCubeArray ? 6 * tex.arrayLength : tex.arrayLength;
+    bool is3d = tex.textureType == MTLTextureType3D;
+    NSUInteger slices = tex.textureType == MTLTextureTypeCube ? 6 : tex.textureType == MTLTextureTypeCubeArray ? 6 * tex.arrayLength
+                      : is3d ? tex.depth : tex.arrayLength;
     LOG("[probe] type %lu fmt %lu %lux%lu levels %lu slices %lu:", (unsigned long)tex.textureType, (unsigned long)tex.pixelFormat,
         (unsigned long)tex.width, (unsigned long)tex.height, (unsigned long)tex.mipmapLevelCount, (unsigned long)slices);
     for (NSUInteger l = 0; l < tex.mipmapLevelCount; l++) {
@@ -840,20 +862,28 @@ void renderer_texture_probe(NvnTexture *t) {
         case MTLPixelFormatRGBA16Float: case MTLPixelFormatRG32Float: bpp = 8; break;
         default: bpp = 4; break;
         }
-        for (NSUInteger s = 0; s < slices; s++)
-            [b copyFromTexture:tex sourceSlice:s sourceLevel:l sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+        NSUInteger ls = is3d ? MAX(slices >> l, 1) : slices;  // (3D: the level's depth slices)
+        for (NSUInteger s = 0; s < ls; s++)
+            [b copyFromTexture:tex sourceSlice:is3d ? 0 : s sourceLevel:l sourceOrigin:MTLOriginMake(0, 0, is3d ? s : 0) sourceSize:MTLSizeMake(w, h, 1)
                       toBuffer:buf destinationOffset:s * len destinationBytesPerRow:w * bpp destinationBytesPerImage:w * h * bpp];
         [b endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
         const uint32_t *p = buf.contents;
         int nz = 0;
-        for (NSUInteger s = 0; s < slices; s++) {
+        size_t rgb = 0;  // RGB10A2: texels with nonzero colour (alpha alone doesn't count)
+        bool a2 = tex.pixelFormat == MTLPixelFormatRGB10A2Unorm || tex.pixelFormat == MTLPixelFormatRGB10A2Uint;
+        for (NSUInteger s = 0; s < ls; s++) {
             bool any = false;
-            for (NSUInteger i = 0; i < w * h * bpp / 4 && !any; i++) any = p[s * len / 4 + i] != 0;
+            for (NSUInteger i = 0; i < w * h * bpp / 4; i++) {
+                uint32_t v = p[s * len / 4 + i];
+                any |= v != 0;
+                rgb += a2 && (v & 0x3fffffffu);
+            }
             nz += any;
         }
-        LOG(" L%lu %d/%lu (%08x %08x)", (unsigned long)l, nz, (unsigned long)slices, p[0], bpp > 4 ? p[1] : 0);
+        LOG(" L%lu %d/%lu (%08x %08x)", (unsigned long)l, nz, (unsigned long)ls, p[0], bpp > 4 ? p[1] : 0);
+        if (a2) LOG(" rgb %zu/%lu", rgb, (unsigned long)(w * h * ls));
     }
     LOG("\n");
 }

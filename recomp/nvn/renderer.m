@@ -25,7 +25,8 @@ static NSMutableDictionary<NSString *, id> *cache;
 // (stats) GPU wait time by cause: 0 = guest fence (nvnSyncWait), 1 = full flush (CPU reads GPU results / ring), 2 = sync all
 static uint64_t stat_wait_by[3], stat_wait_n[3];
 static uint64_t skip_why[6];  // no program, program not ready, pipeline compiling, compile started, pipeline failed, draw mode
-#define SKIP(n) (stat_skipped++, skip_why[n]++)
+#define SKIP(n) (stat_skipped++, skip_why[n]++, skip_log(n))
+static void skip_log(int n);
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
 static double stat_gpu_s;
 static uint64_t g_gpu_total_ns;  // GPU time of all completed command buffers
@@ -579,8 +580,17 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
     if (g_debug_frame) {
         int pw, ph;
         pass_size(&pw, &ph);
-        LOG("[clear] pass %d idx %d depth %d (%g) stencil %d | pass %dx%d scissor %d,%d %dx%d\n", debug_pass_no, index, depth,
+        const float *cf = color;
+        const uint32_t *cu = color;
+        LOG("[clear] pass %d idx %d depth %d (%g) stencil %d | pass %dx%d scissor %d,%d %dx%d", debug_pass_no, index, depth,
             dval, stencil, pw, ph, st.scissor[0][0], st.scissor[0][1], st.scissor[0][2], st.scissor[0][3]);
+        if (index >= 0 && color) {
+            if (kind == 0) LOG(" | color %g %g %g %g mask %x", cf[0], cf[1], cf[2], cf[3], mask);
+            else LOG(" | color %#x %#x %#x %#x (kind %d) mask %x", cu[0], cu[1], cu[2], cu[3], kind, mask);
+            if (index < st.rt.ncolor && st.rt.color[index])
+                LOG(" | rt %llx f%#x", (unsigned long long)st.rt.color[index]->addr, st.rt.color[index]->format);
+        }
+        LOG("\n");
     }
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
     id<MTLLibrary> lib = clear_lib(index < 0 ? 0 : index);
@@ -662,6 +672,7 @@ static int cbuf_base = 3, tex_base = 8;
 @public
     id<MTLFunction> vs, fs;
     ShaderInfo *vi, *fi;
+    uint64_t fs_addr;  // fragment code address (debug switches)
     bool failed;
     _Atomic bool ready;  // functions compiled (async compile: draws are skipped until then)
 }
@@ -875,14 +886,28 @@ static void shader_cache_note(const char *vs, const char *fs) {
     }
 }
 
+// Options for translated shaders: vertex programs keep invariance (depth pre-pass + EQUAL test). FIFA_SAFE_MATH=1
+// turns fast math off (IEEE NaN/Inf handling: Maxwell's FMNMX drops a NaN operand, fast-math fmax may not).
+static MTLCompileOptions *guest_opts(bool vertex) {
+    static MTLCompileOptions *o[2];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        bool safe = getenv("FIFA_SAFE_MATH") != NULL;
+        for (int i = 0; i < 2; i++) {
+            o[i] = [MTLCompileOptions new];
+            o[i].preserveInvariance = i == 1;
+            if (safe) o[i].fastMathEnabled = NO;
+        }
+    });
+    return o[vertex];
+}
+
 void shader_cache_warm(void) {
     static int started;
     if (started++ || getenv("FIFA_NO_SHADER_WARM")) return;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         DIR *d = opendir("cache/shaders");
         if (!d) return;
-        MTLCompileOptions *vopts = [MTLCompileOptions new];
-        vopts.preserveInvariance = YES;
         double t0 = now_ms();
         int n = 0;
         struct dirent *e;
@@ -892,7 +917,7 @@ void shader_cache_warm(void) {
             snprintf(path, sizeof path, "cache/shaders/%s", e->d_name);
             NSString *src = [NSString stringWithContentsOfFile:@(path) encoding:NSUTF8StringEncoding error:nil];
             if (!src) continue;
-            @autoreleasepool { (void)[dev newLibraryWithSource:src options:e->d_name[0] == 'v' ? vopts : nil error:nil]; }
+            @autoreleasepool { (void)[dev newLibraryWithSource:src options:guest_opts(e->d_name[0] == 'v') error:nil]; }
             n++;
         }
         closedir(d);
@@ -908,15 +933,25 @@ static bool sync_shaders(void) {  // FIFA_SYNC_SHADERS: compile on first use, bl
 
 static void compile_program(Prog *pr) {
     NSError *err = nil;
-    static MTLCompileOptions *vopts;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ vopts = [MTLCompileOptions new]; vopts.preserveInvariance = YES; });
     double t0 = now_ms();
     // FIFA_SHADER_SALT=<text>: tag sources so Metal's disk cache misses (measure cold first-use compiles)
     NSString *salt = getenv("FIFA_SHADER_SALT") ? [NSString stringWithFormat:@"\n// %s\n", getenv("FIFA_SHADER_SALT")] : @"";
-    id<MTLLibrary> vl = [dev newLibraryWithSource:[@(pr->vi->msl) stringByAppendingString:salt] options:vopts error:&err];
+    id<MTLLibrary> vl = [dev newLibraryWithSource:[@(pr->vi->msl) stringByAppendingString:salt] options:guest_opts(true) error:&err];
     if (!vl) { LOG("[shader] VS compile failed: %s\n%s\n", err.localizedDescription.UTF8String, pr->vi->msl); pr->failed = true; return; }
-    id<MTLLibrary> fl = [dev newLibraryWithSource:[@(pr->fi->msl) stringByAppendingString:salt] options:nil error:&err];
+    // FIFA_NANZERO=<fs addr hex>,...: that fragment program's non-finite outputs become 0 (tests whether a NaN source matters)
+    NSString *fsrc = @(pr->fi->msl);
+    const char *nz = getenv("FIFA_NANZERO");
+    char me[32];
+    snprintf(me, sizeof me, "%llx", (unsigned long long)pr->fs_addr);
+    if (nz && strstr(nz, me)) {
+        NSMutableString *m = [NSMutableString string];
+        for (int k = 0; k < 8; k++)
+            if ([fsrc containsString:[NSString stringWithFormat:@"o.c%d[0] =", k]])
+                [m appendFormat:@"  o.c%d = select(o.c%d, float4(0), isnan(o.c%d) || isinf(o.c%d));\n", k, k, k, k];
+        fsrc = [fsrc stringByReplacingOccurrencesOfString:@"  return o;\n}" withString:[m stringByAppendingString:@"  return o;\n}"]];
+        LOG("[shader] FIFA_NANZERO: fs %s\n", me);
+    }
+    id<MTLLibrary> fl = [dev newLibraryWithSource:[fsrc stringByAppendingString:salt] options:guest_opts(false) error:&err];
     if (!fl) { LOG("[shader] FS compile failed: %s\n%s\n", err.localizedDescription.UTF8String, pr->fi->msl); pr->failed = true; return; }
     pr->vs = [vl newFunctionWithName:@"main0"];
     pr->fs = [fl newFunctionWithName:@"main0"];
@@ -950,6 +985,7 @@ static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
         return pr->failed ? nil : pr;
     }
     pr = [Prog new];
+    pr->fs_addr = p->stages[1].code_addr;
     cache[key] = pr;
     prog_tab[slot].key = h;
     prog_tab[slot].prog = (__bridge void *)pr;  // retained by the cache dictionary
@@ -1282,6 +1318,14 @@ static void bind_textures(int stage, ShaderInfo *si) {
             snprintf(path, sizeof path, "build/dtex_%03d_%d_a.png", dn - 1, i);
             renderer_save_texture_alpha(tex, path);
         }
+        if (g_debug_frame && tex.textureType != MTLTextureType2D && stage == 1) {  // arrays, 3D, cubes: no dump, just what is bound
+            NvnTexture *dt = h && st.tpool && tic < (uint32_t)st.tpool->count ? ((NvnTexEntry *)st.tpool->entries)[tic].tex : NULL;
+            LOG("[dtexa] slot %d tic %u mtl type %lu %lux%lux%lu fmt %lu%s", i, tic, (unsigned long)tex.textureType, (unsigned long)tex.width,
+                (unsigned long)tex.height, (unsigned long)tex.arrayLength, (unsigned long)tex.pixelFormat, tex == dummy_texture(st_->type) ? " DUMMY" : "");
+            if (dt) LOG(" obj %p target %u fmt %#x %ux%ux%u addr %llx fl %#x", (void *)dt, dt->target, dt->format, dt->width, dt->height, dt->depth,
+                        (unsigned long long)dt->addr, dt->flags);
+            LOG("\n");
+        }
         if (g_debug_frame && stage == 0) {
             NvnTexture *vt = h && st.tpool && tic < (uint32_t)st.tpool->count ? ((NvnTexEntry *)st.tpool->entries)[tic].tex : NULL;
             LOG("[vtex] %d type %d off %#x bindless %d/%#x handle %llx tic %u -> %s", i, st_->type, st_->handle_offset, st_->bindless, st_->bindless_offset, (unsigned long long)h, tic, vt ? "" : "none");
@@ -1370,7 +1414,7 @@ static CsProg *compute_program(NvnProgram *p) {
         if (!cp->local[i]) cp->local[i] = 1;
     }
     NSError *err = nil;
-    id<MTLLibrary> lib = TIMED_COMPILE([dev newLibraryWithSource:@(cp->si->msl) options:nil error:&err]);
+    id<MTLLibrary> lib = TIMED_COMPILE([dev newLibraryWithSource:@(cp->si->msl) options:guest_opts(false) error:&err]);
     id<MTLFunction> f = lib ? [lib newFunctionWithName:@"main0"] : nil;
     cp->pipe = f ? TIMED_COMPILE([dev newComputePipelineStateWithFunction:f error:&err]) : nil;
     if (!cp->pipe) {
@@ -1547,6 +1591,53 @@ static id<MTLBuffer> expand_indices(uint32_t mode, uint32_t count, const void *i
     return b;
 }
 
+// FIFA_DBG_PERDRAW=1: in the debug frame every draw ends its pass, waits for the GPU and logs how many pixels of
+// each float colour target are non-finite, so the first draw that writes NaN/Inf can be found.
+static void perdraw_check(void) {
+    static int ndraw;
+    [enc endEncoding];
+    enc = nil;
+    id<MTLCommandBuffer> c = cmdbuf;
+    cmdbuf = nil;
+    [c commit];
+    [c waitUntilCompleted];
+    st.rt_dirty = true;
+    ndraw++;
+    for (int i = 0; i < st.rt.ncolor; i++) {
+        NvnTexture *t = st.rt.color[i];
+        if (!t || !t->backend) continue;
+        id<MTLTexture> tex = renderer_texture(t, nil, true);
+        MTLPixelFormat f = tex.pixelFormat;
+        if (f != MTLPixelFormatRG11B10Float && f != MTLPixelFormatRGBA16Float && f != MTLPixelFormatRGBA32Float &&
+            f != MTLPixelFormatRG16Float && f != MTLPixelFormatR16Float && f != MTLPixelFormatR32Float && f != MTLPixelFormatRG32Float)
+            continue;
+        static unsigned long long trace_fs = 1;
+        if (trace_fs == 1) {
+            const char *e = getenv("FIFA_DBG_FS");
+            unsigned long long a = 0;
+            unsigned pc = 0;
+            trace_fs = e && sscanf(e, "%llx:%x", &a, &pc) == 2 && pc == 0xfffffffeu ? a : 0;
+        }
+        if (trace_fs && st.program && st.program->stages[1].code_addr == trace_fs) renderer_nantrace_report(tex);
+        long first;
+        size_t bad = renderer_count_nonfinite(tex, &first);
+        LOG("[perdraw] draw %d pass %d rt%d %llx %lux%lu fmt %lu: %zu non-finite (first %ld,%ld) vs %llx fs %llx\n", ndraw,
+            debug_pass_no, i, (unsigned long long)t->addr, (unsigned long)tex.width, (unsigned long)tex.height,
+            (unsigned long)f, bad, first < 0 ? -1 : first % (long)tex.width, first < 0 ? -1 : first / (long)tex.width,
+            st.program ? (unsigned long long)st.program->stages[0].code_addr : 0ull,
+            st.program ? (unsigned long long)st.program->stages[1].code_addr : 0ull);
+    }
+}
+
+// Debug frame: which draws are skipped (reason as in the stats line), with their programs and colour target.
+static void skip_log(int n) {
+    if (!g_debug_frame) return;
+    LOG("[skip] %c vs %llx fs %llx rt0 %llx %ux%u\n", 'a' + n, st.program ? (unsigned long long)st.program->stages[0].code_addr : 0ull,
+        st.program ? (unsigned long long)st.program->stages[1].code_addr : 0ull,
+        st.rt.ncolor && st.rt.color[0] ? (unsigned long long)st.rt.color[0]->addr : 0ull,
+        st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->width : 0, st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->height : 0);
+}
+
 static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
     static uint64_t dump_fs = 1;
     if (dump_fs == 1) { const char *e = getenv("FIFA_DUMP_UBO"); dump_fs = e ? strtoull(e, NULL, 16) : 0; }
@@ -1580,6 +1671,13 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
             for (uint32_t k = 0; k < words && k < 16; k++) LOG(" %08x", u[v * words + k]);
             LOG("\n");
         }
+    }
+    for (int i = 0; i < 16; i++) {  // small fragment storage buffers, whole (light / parameter records)
+        if (!st.sbuf[1][i].addr || st.sbuf[1][i].size > 256) continue;
+        const uint32_t *u = gptr(st.sbuf[1][i].addr);
+        LOG("[fssbo] f%d %llx:", i, (unsigned long long)st.sbuf[1][i].addr);
+        for (uint64_t k = 0; k < st.sbuf[1][i].size / 4; k++) LOG(" %g(%08x)", *(const float *)&u[k], u[k]);
+        LOG("\n");
     }
     if (st.sbuf[0][0].addr && st.sbuf[0][0].size >= 64 && st.sbuf[0][0].size <= 8192) {
         int recw = (st.sbuf[0][0].size % 96 == 0 && st.sbuf[0][0].size % 64 != 0) ? 24 : 16;
@@ -1984,6 +2082,9 @@ static void draw(CmdRec *r, bool indexed) {
         }
     }
     stat_draws++;
+    static int perdraw = -1;
+    if (perdraw < 0) perdraw = getenv("FIFA_DBG_PERDRAW") != NULL;
+    if (g_debug_frame && perdraw) perdraw_check();
     if (dbg_this) {
         static int nlog;
         if (nlog++ < 4) {
@@ -2581,6 +2682,13 @@ static void exec_list(uint64_t handle, int depth) {
             renderer_flush();
             memmove(gptr(r->x[1]), gptr(r->x[0]), r->x[2]);
             break;
+        case CMD_CLEAR_BUFFER: {  // (address, size, 32-bit value)
+            renderer_flush();
+            uint32_t *u = gptr(r->x[0]), v = (uint32_t)r->x[2];
+            for (uint64_t k = 0; k < r->x[1] / 4; k++) u[k] = v;
+            if (g_debug_frame) LOG("[clearbuf] %llx size %#llx value %#x\n", (unsigned long long)r->x[0], (unsigned long long)r->x[1], v);
+            break;
+        }
         default: break;
         }
         p += r->size;

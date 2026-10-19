@@ -223,6 +223,12 @@ void ui_run(void) __attribute__((noreturn));
 static void *main_thread(void *p) {
   cur_thread = p;
   host_thread_signals();
+  const char *w = getenv("FIFA_WATCH");  // FIFA_WATCH=<guest addr hex>:<len hex>: report CPU writes from the start
+  if (w) {
+    extern void dbg_watch(uint64_t g, uint64_t n);
+    unsigned long long wa = 0, wn = 0;
+    if (sscanf(w, "%llx:%llx", &wa, &wn) == 2) dbg_watch(wa, wn);
+  }
   HLOG("[host] calling nn::init::Start\n");
   core_enter();
   a64_call(&cur_thread->cpu, host_nn_init_start);

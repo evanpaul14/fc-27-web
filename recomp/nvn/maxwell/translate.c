@@ -14,6 +14,7 @@
 #if defined(_WIN32)
 #include <malloc.h>  // alloca
 #endif
+#include <ctype.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -70,6 +71,8 @@ typedef struct {
     Str body;
     uint8_t reg_used[256];
     uint8_t pred_used[8];
+    // results of variable-latency instructions still in flight (scoreboard 0-5): register and stash index
+    uint8_t late_reg[6][32], nlate[6], late_used[6];
     uint32_t in_attr_mask, out_attr_mask;
     uint32_t vs_in_comp[32];
     bool uses_branches, uses_cc, uses_local, uses_shared, uses_vid, uses_iid, uses_frag_coord, uses_front_facing, uses_lane;
@@ -114,6 +117,87 @@ static void fail(Ctx *c, const char *fmt, ...) {
 static uint32_t norm_target(int64_t t) {
     if (t >= 0 && ((t / 8) % 4) == 0) t += 8;
     return (uint32_t)t;
+}
+
+// Variable-latency instructions (texture fetches, memory loads, MUFU, conversions, ...) write their results
+// when the scoreboard named by their write barrier (control bits 5-7) is released, and only an instruction
+// that waits on it (bits 11-16) sees them: the ones in between still read the old values, and the compiler
+// uses this (a TLDS whose result register is the next TLDS's coordinate). The translated instruction runs
+// at once, so its results are stashed in lwB_K and the old values restored; they move into the registers
+// before the first instruction that waits on B, a branch target, flow control or the end.
+static uint32_t sched_bits(const uint64_t *words, size_t i) { return (uint32_t)(words[i & ~(size_t)3] >> (21 * ((i & 3) - 1))) & 0x1fffff; }
+
+// FIFA_LATE_OFF=1: results land at once (the old behaviour, for comparisons)
+static bool late_off(void) {
+    static int off = -1;
+    if (off < 0) off = getenv("FIFA_LATE_OFF") != NULL;
+    return off;
+}
+
+static void commit_late(Ctx *c, unsigned bmask) {
+    for (int b = 0; b < 6; b++) {
+        if (!(bmask & (1u << b))) continue;
+        for (int k = 0; k < c->nlate[b]; k++) sp(&c->body, "    r%d = lw%d_%d;\n", c->late_reg[b][k], b, k);
+        c->nlate[b] = 0;
+    }
+}
+
+// After emitting the instruction at body offset `start` with write barrier b: the registers it assigned
+// (statements `rN = ...`) keep their old values until commit_late(b).
+static void defer_late(Ctx *c, size_t start, int b) {
+    int regs[32], n = 0;
+    for (size_t i = start; i < c->body.len && n < 32; i++) {
+        if (i != start && c->body.buf[i - 1] != '\n') continue;
+        size_t j = i;
+        while (j < c->body.len && (c->body.buf[j] == ' ' || c->body.buf[j] == '{')) j++;
+        if (j >= c->body.len || c->body.buf[j] != 'r' || !isdigit((unsigned char)c->body.buf[j + 1])) continue;
+        char *e;
+        long r = strtol(c->body.buf + j + 1, &e, 10);
+        if (strncmp(e, " = ", 3)) continue;
+        bool seen = false;
+        for (int k = 0; k < n; k++) seen |= regs[k] == r;
+        if (!seen) regs[n++] = (int)r;
+    }
+    if (!n) return;
+    if (c->nlate[b] + n > 32) commit_late(c, 1u << b);
+    size_t len = c->body.len - start;
+    char *seg = malloc(len + 1);
+    memcpy(seg, c->body.buf + start, len);
+    seg[len] = 0;
+    c->body.len = start;
+    sp(&c->body, "    {");
+    for (int k = 0; k < n; k++) sp(&c->body, " uint sv%d = r%d;", k, regs[k]);
+    sp(&c->body, "\n%s", seg);
+    free(seg);
+    for (int k = 0; k < n; k++) {
+        int slot = c->nlate[b]++;
+        c->late_reg[b][slot] = (uint8_t)regs[k];
+        if (slot + 1 > c->late_used[b]) c->late_used[b] = (uint8_t)(slot + 1);
+        sp(&c->body, "    lw%d_%d = r%d; r%d = sv%d;\n", b, slot, regs[k], regs[k], k);
+    }
+    sp(&c->body, "    }\n");
+}
+
+// FIFA_DBG_FS=<addr>:fffffffe:0 (NaN trace): after the instruction at body offset `start`, the first float result
+// (`rN = as_type<uint>(...)`, not half pairs) that is NaN or Inf records the instruction index in nanpc; the fragment
+// outputs it (index & 63, index >> 6 & 63, found) instead of its colours.
+static void nan_trace(Ctx *c, size_t start, uint32_t idx) {
+    int regs[8], n = 0;
+    for (size_t i = start; i < c->body.len && n < 8; i++) {
+        if (i != start && c->body.buf[i - 1] != '\n') continue;
+        size_t j = i;
+        while (j < c->body.len && c->body.buf[j] == ' ') j++;
+        if (c->body.buf[j] != 'r' || !isdigit((unsigned char)c->body.buf[j + 1])) continue;
+        char *e;
+        long r = strtol(c->body.buf + j + 1, &e, 10);
+        if (strncmp(e, " = as_type<uint>(", 17)) continue;
+        const char *eol = strchr(e, '\n');
+        const char *h = strstr(e, "half");
+        if (h && (!eol || h < eol)) continue;
+        regs[n++] = (int)r;
+    }
+    for (int k = 0; k < n; k++)
+        sp(&c->body, "    if (nanpc == 0u && !isfinite(as_type<float>(r%d))) nanpc = %uu;\n", regs[k], idx);
 }
 
 // ------------------------------------------------------------------ operands
@@ -1557,8 +1641,10 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                OPM(0x3800000000000000ull, 0xfef8000000000000ull)) {  // BFE
         const char *bv = B(false);
         bool sgn = bits(w, 48, 1);
-        if (bits(w, 40, 1)) fail(c, "bfe brev");
-        sprintf(t, sgn ? "bfe_s(%s, %s)" : "bfe_u(%s, %s)", R(a), bv);
+        char src[64];  // .BREV: the source is bit-reversed before the extraction
+        if (bits(w, 40, 1)) sprintf(src, c->glsl ? "bitfieldReverse(%s)" : "reverse_bits(%s)", R(a));
+        else strcpy(src, R(a));
+        sprintf(t, sgn ? "bfe_s(%s, %s)" : "bfe_u(%s, %s)", src, bv);
         set_reg(c, d, t);
     } else if (OPM(0x5bf0000000000000ull, 0xfff8000000000000ull) || OPM(0x4bf0000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x36f0000000000000ull, 0xfef8000000000000ull) || OPM(0x53f0000000000000ull, 0xfff8000000000000ull)) {  // BFI
@@ -2189,6 +2275,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     }
     for (int i = 0; i < 256; i++)
         if (c->reg_used[i]) sp(&s, "  uint r%d = 0u;\n", i);
+    for (int b = 0; b < 6; b++)
+        for (int k = 0; k < c->late_used[b]; k++) sp(&s, "  uint lw%d_%d = 0u;\n", b, k);
     for (int i = 0; i < 7; i++)
         if (c->pred_used[i]) sp(&s, "  bool p%d = false;\n", i);
     if (c->uses_cc) sp(&s, "  uint cc = 0u; bool ccz = false, ccs = false;\n");
@@ -2311,9 +2399,18 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         if (i % 4 == 0) continue;
         c->cur = i;
         uint32_t pc = (uint32_t)(i * 8);
+        uint64_t iw = ((const uint64_t *)code)[i];
+        uint32_t sch = sched_bits((const uint64_t *)code, i);
+        uint8_t top = (uint8_t)(iw >> 56);
+        bool flow = top == 0xe2 || top == 0xe3 || (iw >> 51) == (0xf0f8ull >> 3) || (iw >> 51) == (0xf0f0ull >> 3);  // + SYNC, DEPBAR
+        commit_late(c, (label[i] || flow) ? 0x3fu : (sch >> 11) & 0x3fu);
         if (any_branch && label[i]) sp(&c->body, "  case %uu:\n", pc);
-        if (annotate) sp(&c->body, "    // pc %x: %016llx\n", pc, (unsigned long long)((const uint64_t *)code)[i]);
-        emit_insn(c, ((const uint64_t *)code)[i], pc);
+        if (annotate) sp(&c->body, "    // pc %x: %016llx\n", pc, (unsigned long long)iw);
+        size_t start = c->body.len;
+        emit_insn(c, iw, pc);
+        if (dbg && maxwell_dbg_pc == 0xfffffffeu) nan_trace(c, start, (uint32_t)i);
+        int wbar = (int)((sch >> 5) & 7);
+        if (wbar < 6 && !flow && !late_off()) defer_late(c, start, wbar);
         if (dbg && pc == maxwell_dbg_pc) {
             int rr = maxwell_dbg_reg % 1000, half = maxwell_dbg_reg / 1000;  // +1000: low f16, +2000: high f16
             c->reg_used[rr] = 1;
@@ -2322,6 +2419,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         }
         info->num_insts++;
     }
+    commit_late(c, 0x3fu);
     free(label);
     if (c->fail) { free(c->body.buf); free(c); return info; }
     if (c->glsl) return glsl_finish(c, any_branch, dbg);
@@ -2446,12 +2544,15 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     if (salias.buf) { sp(&s, "%s", salias.buf); free(salias.buf); }
     for (int i = 0; i < 256; i++)
         if (c->reg_used[i]) sp(&s, "  uint r%d = 0;\n", i);
+    for (int b = 0; b < 6; b++)
+        for (int k = 0; k < c->late_used[b]; k++) sp(&s, "  uint lw%d_%d = 0u;\n", b, k);
     for (int i = 0; i < 7; i++)
         if (c->pred_used[i]) sp(&s, "  bool p%d = false;\n", i);
     if (c->uses_cc) sp(&s, "  uint cc = 0; bool ccz = false, ccs = false;\n");
     if (c->uses_local) sp(&s, "  uint lmem[%d] = {};\n", LMEM_WORDS);
     if (c->uses_shared) sp(&s, "  threadgroup uint smem[%d];\n", smem_words());
     if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f;\n" : "  float dbgv = -1.0f;\n");
+    if (dbg && maxwell_dbg_pc == 0xfffffffeu) sp(&s, "  uint nanpc = 0u;\n");
     if (any_branch) {
         sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0; uint pbk[16]; uint pbk_n = 0; uint pcnt[16]; uint pcnt_n = 0;\n");
         sp(&s, "  bool exit_now = false;\n");
@@ -2477,7 +2578,10 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             int kind = key ? key->rt_kind[rt] : 0;
             for (int comp = 0; comp < 4; comp++) {
                 if (!(m & (1u << comp))) continue;
-                if (dbg) {
+                if (dbg && maxwell_dbg_pc == 0xfffffffeu) {
+                    static const char *const v[] = {"float(nanpc & 63u)", "float((nanpc >> 6) & 63u)", "(nanpc ? 1.0f : 0.0f)", "1.0f"};
+                    sp(&s, "  o.c%d[%d] = %s;\n", rt, comp, v[comp]);
+                } else if (dbg) {
                     sp(&s, comp == 3 ? "  o.c%d[%d] = 1.0f;\n" : "  o.c%d[%d] = dbgv;\n", rt, comp);
                 } else if (r < 256 && c->reg_used[r]) {
                     if (kind == 0) sp(&s, "  o.c%d[%d] = as_type<float>(r%d);\n", rt, comp, r);

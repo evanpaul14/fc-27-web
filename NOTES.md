@@ -648,6 +648,49 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   title costs ~575 ms GPU per 2 s instead of ~1,000 ms and 251 MB of textures
   instead of 714 MB; the match is still ~3 fps (GPU-bound) and its 3D
   resolution scales down dynamically (896x504 seen).
+- NaN hunt (2026-10-19), first round; the match is still black:
+  - Variable-latency results: Maxwell texture fetches, loads, MUFU etc.
+    write their destination when their write barrier (sched bits 5-7) is
+    released, and only an instruction that waits on it (bits 11-16) sees the
+    new value. The compiler relies on this: in the exposure histogram FS
+    `16dda7600` a TLDS writes r4 and the next TLDS still uses the old r4 as
+    a coordinate. The translator ran results at once. Now each such
+    instruction's assigned registers (`rN = ...` statements in its output)
+    are stashed in `lwB_K` and the old values restored; they are committed
+    before the first instruction waiting on B, a branch target, flow
+    control (+ SYNC, DEPBAR) or the end (`defer_late`/`commit_late`).
+    `FIFA_LATE_OFF=1` restores the old behaviour. Same 398/437 shtool
+    totals either way.
+  - BFE.BREV translates (`reverse_bits` first): 2 more compute programs.
+  - `nvnCommandBufferClearBuffer` was recorded but never executed; it now
+    fills the range with the 32-bit value in submission order.
+  - Where the NaNs come from: the exposure chain is 256x256 R16F
+    luminance (FS `16fa54a00`) -> histograms (`16dda7600`,
+    `16e3c8b00`, 256x1 RG16F) -> compute `16ed0fd00` -> LUT FS
+    `16e3a1a00` (RGBA16F 256x1, `t0[x] / t0[N-1]`: an empty histogram
+    gives 0/0). In the match nothing is drawn into the 256x256 target (it is
+    cleared to 0), so the LUT is NaN and every lit draw samples it. Zeroing
+    the LUT (`FIFA_NANZERO=16e3a1a00`) is not enough: the light-list FS
+    `170461700` divides by a word of a 48-byte fragment storage buffer
+    (c[0][0x510] -> 179d7fb00, the same address every run) that is all
+    zero: 1/0 at pc 0x2778, then Inf*0. No CPU write ever reaches that
+    buffer (`FIFA_WATCH`), no ClearBuffer/copy targets it, and none of the
+    logged dispatches writes it: next, find its GPU writer (a dispatch that
+    reaches it through a pointer, one of the compute programs that still
+    fail: `ea70` x2, `3a2c` x2, surface type 1 / handle not an image
+    binding), or why the game never fills it.
+  - Debug aids: `FIFA_DBG_PERDRAW=1` (debug frame: each draw ends its pass
+    and logs the non-finite pixels of every float colour target,
+    `[perdraw]`), `FIFA_DBG_FS=<fs>:fffffffe:0` (NaN trace: the fragment
+    outputs the index of the first float result that is NaN/Inf; logged as
+    `[nantrace] ... pc <x>`), `FIFA_NANZERO=<fs>,...` (that program's
+    non-finite outputs become 0), `FIFA_SAFE_MATH=1` (fast math off; made
+    no difference), `FIFA_WATCH=<addr>:<len>` (CPU write watch armed at
+    boot), `[skip]` (skipped draws with programs), `[dtexa]` (array/3D/
+    cube textures), `[fssbo]` (fragment storage buffers up to 256 bytes),
+    clear colours and targets in `[clear]`, `[clearbuf]`.
+  - Menu input timing varies between runs ("down 4" from the main menu
+    lands on Player Career or one entry off); check with `shot` before `a`.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -795,10 +838,8 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   (BOU 0-0 BHA, clock running, radar with moving players, player names,
   "Difficulty changed to Beginner"), but the 3D scene is black: the
   main pass's draws now have real geometry but write NaN/Inf everywhere
-  (next: find the first draw whose output is non-finite, e.g. with
-  `FIFA_DBG_FS` register probes on `16ff87600`, and what feeds it:
-  exposure/light data from compute, TLD/gather results, half-float
-  packing). Performance in the match is ~3 fps since real global-memory
+  (next: the zero 48-byte light/parameter buffer at 179d7fb00 and the
+  empty exposure histogram, see "NaN hunt" in Status). Performance in the match is ~3 fps since real global-memory
   data arrived (`FIFA_GPU_PROFILE`; the `switch (pc)` form of branchy
   shaders is the likely cost).
   Older state: Skips are

@@ -531,7 +531,8 @@ void renderer_save_texture_alpha(id<MTLTexture> tex, const char *path) {
 
 // Debug: a float texture's colour channels scaled by their largest finite value (<path>_n.png); logs the maxima
 // (HDR targets hold values that an 8-bit dump shows as black).
-static void save_texture_normalized(id<MTLTexture> tex, const char *path) {
+// The texture converted to RGBA32F through the present shader (malloc'd, w * h * 4 floats).
+static float *read_float_rgba(id<MTLTexture> tex) {
     NSUInteger w = tex.width, h = tex.height;
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
                                                                                  width:w height:h mipmapped:NO];
@@ -564,6 +565,52 @@ static void save_texture_normalized(id<MTLTexture> tex, const char *path) {
     [cb waitUntilCompleted];
     float *fp = malloc(w * h * 16);
     [dst getBytes:fp bytesPerRow:w * 16 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    return fp;
+}
+
+// Debug: how many pixels of the texture have a non-finite colour channel; *first gets the first one (y * w + x).
+size_t renderer_count_nonfinite(id<MTLTexture> tex, long *first) {
+    NSUInteger n = tex.width * tex.height;
+    float *fp = read_float_rgba(tex);
+    size_t bad = 0;
+    *first = -1;
+    for (NSUInteger i = 0; i < n; i++)
+        if (!isfinite(fp[i * 4]) || !isfinite(fp[i * 4 + 1]) || !isfinite(fp[i * 4 + 2])) {
+            if (!bad++) *first = (long)i;
+        }
+    free(fp);
+    return bad;
+}
+
+// Debug (NaN trace, FIFA_DBG_FS=<addr>:fffffffe:0): pixels carry the first instruction index that produced a NaN
+// as (index & 63, index >> 6, 1); logs how many pixels found one and the most common indices (pc = index * 8).
+void renderer_nantrace_report(id<MTLTexture> tex) {
+    NSUInteger n = tex.width * tex.height;
+    float *fp = read_float_rgba(tex);
+    static uint32_t hist[4096];
+    memset(hist, 0, sizeof hist);
+    size_t found = 0;
+    for (NSUInteger i = 0; i < n; i++) {
+        if (!(fp[i * 4 + 2] > 0.5f)) continue;
+        uint32_t idx = (uint32_t)lroundf(fp[i * 4]) + 64u * (uint32_t)lroundf(fp[i * 4 + 1]);
+        hist[idx & 4095]++;
+        found++;
+    }
+    free(fp);
+    LOG("[nantrace] %zu/%lu pixels:", found, (unsigned long)n);
+    for (int t = 0; t < 6; t++) {
+        int best = -1;
+        for (int k = 0; k < 4096; k++) if (hist[k] && (best < 0 || hist[k] > hist[best])) best = k;
+        if (best < 0) break;
+        LOG(" pc %#x (%u)", best * 8, hist[best]);
+        hist[best] = 0;
+    }
+    LOG("\n");
+}
+
+static void save_texture_normalized(id<MTLTexture> tex, const char *path) {
+    NSUInteger w = tex.width, h = tex.height;
+    float *fp = read_float_rgba(tex);
     float mx[3] = {0, 0, 0};
     size_t nonzero = 0, bad = 0;
     for (NSUInteger i = 0; i < w * h; i++) {

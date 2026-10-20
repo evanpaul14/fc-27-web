@@ -1008,31 +1008,35 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
 
 ## Next steps
 
-- Kick Off now loads the match: the Premier League loading cards ("Player
-  To Watch" with streamed portraits) and the line-up graphics render, then a
-  black screen with the PL logo, and then the match itself runs: HUD
-  (BOU 0-0 BHA, clock running, radar with moving players, player names,
-  "Difficulty changed to Beginner") and the 3D scene renders (see "The
-  match renders" in Status). Next: performance (see "Match performance" in
-  Status): `16dff9100` is still ~95% of GPU time in open play after the
-  rows1d fix (~120 ms per dispatch, see "second round"): run with
-  `FIFA_SHADER_GUARD=10000 FIFA_DBG_CSW=16dff9100` to confirm the guard and
-  read the edge count against the 4 KB of shared memory; then the
-  flush-drains on buffer copies, `gfind`, structured loops. The BRX
-  pipeline fix is confirmed in a run. The
-  occasional e_prev = 0 exposure readback (seen again: black scene for part
-  of the first half), and a visual pass over the
-  match (shadows, reflections, the remaining ~10 skipped draws per frame:
-  `16fd3ac00`, `171855700` TXD.B). Shader coverage (`build/shtool` over
-  the dumps): 407/437 translate; the rest are unknown 3b03 (7 FS), bindless
-  handles not from c[2] (4 FS, 1 CS: indexed `LDC c[2][r + ...]`), TXD.B
-  `de7a` (2), surface type 1 (2 CS), 3a2c (2 CS), and a few words that are
-  probably constant data past the code (bf52, bf82, 4016, ...).
-- Try the keyboard and a gamepad in the visible window;
-  audio output for `audout.c`'s sink thread; the dark Continue button on
-  the accessibility screen (seen before the threading fix; check if it
-  still happens). Then SUST/SUATOM/STS/VOTE and the other unknown shader
-  instructions (FS `3b34…`, VS `1887…`).
+Kick Off plays a full match (loading cards, line-ups, 3D scene, HUD,
+half-time) at ~3-4 fps; the BRX pipeline fix is confirmed in a run. In
+order:
+
+1. `16dff9100` (~95% of match GPU time, ~120 ms per dispatch; see "Match
+   performance, second round"): run with `FIFA_SHADER_GUARD=10000
+   FIFA_DBG_CSW=16dff9100` to confirm the walk runs to the guard and read
+   the edge count (`cb4[0][1]`) against the 4 KB of shared memory, then fix
+   whatever keeps the contour from closing.
+2. Then the remaining performance items from the same section: GPU drains
+   on `CMD_COPY_BUFFER_TO_BUFFER` / `CMD_COPY_TEXTURE_TO_BUFFER`, `gfind`'s
+   window scan, structured loops instead of `switch (pc)` for simple
+   back-edges. Profile with `prof 1` / `prof 2` after each.
+3. The black 3D scene for part of the first half (likely the e_prev = 0
+   exposure readback, see "The match renders"), and the program that
+   samples a 32^3 3D texture as 2D (`[tex] type mismatch: want 2 have 7`).
+4. Visual pass over the match: shadows, reflections, the remaining ~10
+   skipped draws per frame (`16fd3ac00`, `171855700` TXD.B).
+5. Shader coverage (`build/shtool` over the dumps): 407/437 translate; the
+   rest are unknown 3b03 (7 FS), bindless handles not from c[2] (4 FS, 1
+   CS: indexed `LDC c[2][r + ...]`), TXD.B `de7a` (2), surface type 1 (2
+   CS), 3a2c (2 CS), SUATOM, and a few words that are probably constant
+   data past the code (bf52, bf82, 4016, ...).
+6. Try the keyboard and a gamepad in the visible window; audio output for
+   `audout.c`'s sink thread; the dark Continue button on the accessibility
+   screen (seen before the threading fix; check if it still happens).
+
+Later / as needed:
+
 - Later: the WebGPU RenderCore2 backend (option 2 in Status).
 - `nvdrv`: real responses for Open/Initialize/ioctls the driver init needs
   (only if the NVN HLE path doesn't bypass it).

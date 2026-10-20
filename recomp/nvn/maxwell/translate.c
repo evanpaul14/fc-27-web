@@ -86,6 +86,11 @@ typedef struct {
     uint32_t vs_in_comp[32];
     bool uses_branches, uses_cc, uses_local, uses_shared, uses_vid, uses_iid, uses_frag_coord, uses_front_facing, uses_lane;
     bool uses_rscale;  // resolution-scale table (fragment/compute only)
+    // MSL compute with branches and BAR: Metal's threadgroup_barrier only holds when every thread reaches it in uniform
+    // control flow, and threads of the switch (pc) loop reach a BAR after different numbers of iterations (lanes that
+    // got there early read shared memory before the others wrote it). Each BAR instead leaves the loop with pc set past
+    // it, and the threads meet at one barrier outside it, rounds until all have exited.
+    bool bar_rounds;
     uint32_t flat_mask;           // fragment inputs using constant (flat) interpolation
     uint32_t noperspective_mask;  // fragment inputs using pass (linear) interpolation
     uint32_t omap_target, omap_depth;
@@ -1766,7 +1771,23 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         case 0x25: set_reg(c, d, "ctaid.x"); break;
         case 0x26: set_reg(c, d, "ctaid.y"); break;
         case 0x27: set_reg(c, d, "ctaid.z"); break;
-        case 0x00: set_reg(c, d, "0u"); break;
+        case 0x00:  // laneid
+        case 0x38:  // eqmask, ltmask, lemask, gtmask, gemask: lanes relative to this one
+        case 0x39:
+        case 0x3a:
+        case 0x3b:
+        case 0x3c: {
+            static const char *const fmt[] = {"lane", "(1u << lane)", "((1u << lane) - 1u)", "((2u << lane) - 1u)",
+                                              "~((2u << lane) - 1u)", "~((1u << lane) - 1u)"};
+            if (c->stage == STAGE_VERTEX) {  // no SIMD-group functions: every thread is lane 0 of its own group
+                static const char *const one[] = {"0u", "1u", "0u", "1u", "0xfffffffeu", "0xffffffffu"};
+                set_reg(c, d, one[sr ? sr - 0x37 : 0]);
+            } else {
+                c->uses_lane = true;
+                set_reg(c, d, fmt[sr ? sr - 0x37 : 0]);
+            }
+            break;
+        }
         default: sprintf(t, "0u /* sr %#x */", sr); set_reg(c, d, t);
         }
     } else if (OPM(0x5c30000000000000ull, 0xfff8000000000000ull) || OPM(0x4c30000000000000ull, 0xfff8000000000000ull) ||
@@ -2066,7 +2087,10 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     } else if (OPM(0x5098000000000000ull, 0xfff8000000000000ull)) {  // CSET
         fail(c, "cset");
     } else if (OPM(0xf0a8000000000000ull, 0xfff8000000000000ull)) {  // BAR
-        if (!c->glsl) sp(&c->body, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+        if (c->bar_rounds) {
+            size_t nx = (c->cur + 1) % 4 ? c->cur + 1 : c->cur + 2;
+            sp(&c->body, "    pc = %uu; bar_now = true; break;\n", (unsigned)(nx * 8));
+        } else if (!c->glsl) sp(&c->body, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
         else if (c->stage == STAGE_COMPUTE) sp(&c->body, "    barrier();\n");
         else sp(&c->body, "    /* bar */\n");  // GLSL barrier() is compute / tessellation only
     } else {
@@ -2454,6 +2478,11 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             any_branch = true;
         }
         if ((w & 0xfff0000000000000ull) == 0xe250000000000000ull) any_branch = true;  // BRX (targets below)
+        if ((w & 0xfff8000000000000ull) == 0xf0a8000000000000ull && stage == STAGE_COMPUTE) {  // BAR: resume point
+            size_t nx = (i + 1) % 4 ? i + 1 : i + 2;
+            if (nx < end) label[nx] = 1;
+            c->bar_rounds = true;
+        }
         if ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull || (w & 0xfff0000000000000ull) == 0xe340000000000000ull ||
             (w & 0xfff0000000000000ull) == 0xe350000000000000ull)
             any_branch = true;
@@ -2472,6 +2501,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     static int annotate = -1;
     if (annotate < 0) annotate = getenv("LARECOMP_SAVE_MSL") != NULL;
     c->branchy = any_branch;
+    c->bar_rounds = c->bar_rounds && any_branch && !c->glsl;
     c->words = (const uint64_t *)code;
     for (size_t i = 0; i < end && !c->fail; i++) {
         if (i % 4 == 0) continue;
@@ -2480,7 +2510,8 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         uint64_t iw = ((const uint64_t *)code)[i];
         uint32_t sch = sched_bits((const uint64_t *)code, i);
         uint8_t top = (uint8_t)(iw >> 56);
-        bool flow = top == 0xe2 || top == 0xe3 || (iw >> 51) == (0xf0f8ull >> 3) || (iw >> 51) == (0xf0f0ull >> 3);  // + SYNC, DEPBAR
+        bool flow = top == 0xe2 || top == 0xe3 || (iw >> 51) == (0xf0f8ull >> 3) || (iw >> 51) == (0xf0f0ull >> 3) ||  // + SYNC, DEPBAR
+                    (c->bar_rounds && (iw >> 51) == (0xf0a8ull >> 3));  // BAR leaves the loop
         commit_late(c, (label[i] || flow) ? 0x3fu : (sch >> 11) & 0x3fu);
         if (any_branch && label[i]) sp(&c->body, "  case %uu:\n", pc);
         if (annotate) sp(&c->body, "    // pc %x: %016llx\n", pc, (unsigned long long)iw);
@@ -2632,7 +2663,9 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         sp(&s, "fragment FOut main0(FIn in [[stage_in]], bool front_facing [[front_facing]]%s%s) {\n",
            c->uses_lane ? ", uint lane [[thread_index_in_simdgroup]]" : "", args.buf ? args.buf : "");
     } else {
-        sp(&s, "kernel void main0(uint3 tid [[thread_position_in_threadgroup]], uint3 ctaid [[threadgroup_position_in_grid]]%s) {\n",
+        sp(&s, "kernel void main0(uint3 tid [[thread_position_in_threadgroup]], uint3 ctaid [[threadgroup_position_in_grid]]%s%s%s) {\n",
+           c->uses_lane ? ", uint lane [[thread_index_in_simdgroup]]" : "",
+           c->bar_rounds ? ", uint tlin [[thread_index_in_threadgroup]], uint3 tgsize [[threads_per_threadgroup]]" : "",
            args.buf ? args.buf : "");
     }
     free(args.buf);
@@ -2652,9 +2685,24 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     if (any_branch) {
         sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0; uint pbk[16]; uint pbk_n = 0; uint pcnt[16]; uint pcnt_n = 0;\n");
         sp(&s, "  bool exit_now = false;\n");
-        sp(&s, "  for (uint guard = 0; guard < %uu; guard++) {\n  switch (pc) {\n", guard_limit());
-        sp(&s, "%s", c->body.buf ? c->body.buf : "");
-        sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n  if (exit_now) break;\n  }\n");
+        if (c->bar_rounds) {  // see bar_rounds
+            sp(&s, "  bool bar_now = false; uint guard = 0;\n  threadgroup atomic_uint bar_exited;\n"
+                   "  if (tlin == 0u) atomic_store_explicit(&bar_exited, 0u, memory_order_relaxed);\n"
+                   "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+                   "  for (;;) {\n  if (!exit_now) {\n  bar_now = false;\n"
+                   "  for (; guard < %uu; guard++) {\n  switch (pc) {\n", guard_limit());
+            sp(&s, "%s", c->body.buf ? c->body.buf : "");
+            sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n  if (exit_now || bar_now) break;\n  }\n"
+                   "  if (!bar_now) { exit_now = true; atomic_fetch_add_explicit(&bar_exited, 1u, memory_order_relaxed); }\n  }\n"
+                   "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+                   "  uint bar_n = atomic_load_explicit(&bar_exited, memory_order_relaxed);\n"
+                   "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+                   "  if (bar_n >= tgsize.x * tgsize.y * tgsize.z) break;\n  }\n");
+        } else {
+            sp(&s, "  for (uint guard = 0; guard < %uu; guard++) {\n  switch (pc) {\n", guard_limit());
+            sp(&s, "%s", c->body.buf ? c->body.buf : "");
+            sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n  if (exit_now) break;\n  }\n");
+        }
     } else {
         sp(&s, "  do {\n%s  } while (false);\n", c->body.buf ? c->body.buf : "");
     }

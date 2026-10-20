@@ -11,5 +11,6 @@ void input_release_all(void);
 char *input_take_shot(void);                 /* FIFA_CONTROL screenshot path for the next present (free it), or NULL */
 bool input_take_debug(void);                /* FIFA_CONTROL "debug": make the next frame the debug frame (once) */
 int input_profile_mode(void);               /* FIFA_CONTROL "prof <n>": FIFA_GPU_PROFILE level from now on, or -1 */
+int input_take_csdump(void);                /* FIFA_CONTROL "csdump [n]": dispatches FIFA_DBG_CSDUMP should dump now, or 0 */
 void input_shot_done(void);
 uint64_t renderer_present_count(void);         /* presented frames so far (nvn/metal.m) */

@@ -1494,11 +1494,86 @@ static void log_bound_textures(int stage, ShaderInfo *si) {
     }
 }
 
+// FIFA_DBG_CSDUMP=<cs>:<skip>[:<count>]: after skipping <skip> dispatches of program <cs>, write the guest bytes of the
+// next <count> (default 1) dispatches' bound uniform buffers, storage buffers and textures to build/csdump/<n>/, with
+// the GPU drained first so earlier passes' writes are in memory; the storage buffers again after the dispatch
+// (`after_s<i>.bin`). meta.txt lists addresses, sizes and texture formats. For replaying a program offline.
+static int csdump_n = -1;
+static void csdump_file(const char *dir, const char *name, uint64_t addr, uint64_t size) {
+    char path[256];
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    if (addr) fwrite(gptr(addr), 1, size, f);
+    fclose(f);
+}
+static void csdump(ShaderInfo *si, uint32_t gx, uint32_t gy, uint32_t gz, bool after) {
+    char dir[64];
+    snprintf(dir, sizeof dir, "build/csdump/%d", csdump_n);
+    char name[64];
+    for (int i = 0; i < 16; i++)
+        if (st.sbuf[5][i].addr) {
+            uint64_t size = st.sbuf[5][i].size > (64u << 20) ? 64u << 20 : st.sbuf[5][i].size;
+            snprintf(name, sizeof name, "%ss%d.bin", after ? "after_" : "", i);
+            csdump_file(dir, name, st.sbuf[5][i].addr, size);
+        }
+    if (after) return;
+    snprintf(name, sizeof name, "%s/meta.txt", dir);
+    FILE *m = fopen(name, "w");
+    if (!m) return;
+    fprintf(m, "cs %llx groups %u %u %u\n", (unsigned long long)st.program->stages[5].code_addr, gx, gy, gz);
+    for (int i = 0; i < 18; i++)
+        if (st.ubuf[5][i].addr) {
+            uint64_t size = st.ubuf[5][i].size > 0x10000 ? 0x10000 : st.ubuf[5][i].size;
+            fprintf(m, "u%d %llx %llu\n", i, (unsigned long long)st.ubuf[5][i].addr, (unsigned long long)st.ubuf[5][i].size);
+            snprintf(name, sizeof name, "u%d.bin", i);
+            csdump_file(dir, name, st.ubuf[5][i].addr, size);
+        }
+    for (int i = 0; i < 16; i++)
+        if (st.sbuf[5][i].addr) fprintf(m, "s%d %llx %llu\n", i, (unsigned long long)st.sbuf[5][i].addr, (unsigned long long)st.sbuf[5][i].size);
+    for (int i = 0; i < si->ntex; i++) {
+        uint64_t h = shader_tex_handle(5, &si->tex[i]);
+        uint32_t tic = h & 0xFFFFF;
+        NvnTexEntry *e = h && st.tpool && tic < (uint32_t)st.tpool->count ? &((NvnTexEntry *)st.tpool->entries)[tic] : NULL;
+        if (!e || !e->tex) continue;
+        uint64_t len = e->tex->pool ? tegra_total_size(&e->tex->layout) : 0;
+        fprintf(m, "t%d %llx %llu fmt %u %ux%u type %d img %d\n", i, (unsigned long long)e->tex->addr, (unsigned long long)len,
+                e->tex->format, e->tex->width, e->tex->height, si->tex[i].type, si->tex[i].is_image);
+        snprintf(name, sizeof name, "t%d.bin", i);
+        csdump_file(dir, name, e->tex->addr, len);
+    }
+    fclose(m);
+}
+
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate(NULL);
     if (!st.program || !gx || !gy || !gz) return;
     CsProg *cp = compute_program(st.program);
     if (!cp) return;
+    static uint64_t csdump_cs = ~0ull;
+    static int csdump_skip, csdump_count = 1, csdump_seen, csdump_more;
+    if (csdump_cs == ~0ull) {
+        const char *e = getenv("FIFA_DBG_CSDUMP");
+        csdump_cs = e ? strtoull(e, NULL, 16) : 0;
+        if (e && (e = strchr(e, ':'))) sscanf(e, ":%d:%d", &csdump_skip, &csdump_count);
+    }
+    bool dump = false;
+    if (csdump_cs && st.program->stages[5].code_addr == csdump_cs) {
+        csdump_more += input_take_csdump();  // FIFA_CONTROL "csdump [n]": the next n dispatches, whatever the skip
+        dump = (csdump_seen >= csdump_skip && csdump_seen < csdump_skip + csdump_count) || csdump_more > 0;
+        if (csdump_more > 0 && !(csdump_seen >= csdump_skip && csdump_seen < csdump_skip + csdump_count)) csdump_more--;
+        csdump_seen++;
+    }
+    if (dump) {
+        char dir[64];
+        snprintf(dir, sizeof dir, "build/csdump/%d", ++csdump_n);
+        mkdir("build/csdump", 0755);
+        mkdir(dir, 0755);
+        end_pass();
+        renderer_flush();
+        csdump(cp->si, gx, gy, gz, false);
+        LOG("[csdump] %s\n", dir);
+    }
     static int trace = -1;
     if (trace < 0) trace = getenv("FIFA_TRACE_CS") != NULL;
 #define CST(x) do { if (trace) { fprintf(stderr, "[cs] %s\n", x); fflush(stderr); } } while (0)
@@ -1639,7 +1714,13 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
                     if (e && e->tex) g_rt_watch_addr = e->tex->addr;
                 }
                 sbuf_hit = true;
-                LOG("[sbufw] cs %llx groups %ux%ux%u\n", cs, gx, gy, gz);
+                LOG("[sbufw] cs %llx groups %ux%ux%u", cs, gx, gy, gz);
+                for (int b = 1; b < 18; b++)  // first words of each bound uniform buffer but the driver's c[0]
+                    if (st.ubuf[5][b].addr) {
+                        LOG(" | c%d:", b);
+                        for (int w = 0; w < 20 && w * 4 < (int)st.ubuf[5][b].size; w++) LOG(" %08x", ((uint32_t *)gptr(st.ubuf[5][b].addr))[w]);
+                    }
+                LOG("\n");
             }
         if (changed) {
             LOG("[sbufw] changed before cs %llx:", cs);
@@ -1657,6 +1738,10 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     }
     [ce dispatchThreadgroups:MTLSizeMake(gx, gy, gz) threadsPerThreadgroup:MTLSizeMake(cp->local[0], cp->local[1], cp->local[2])];
     [ce endEncoding];
+    if (dump) {
+        renderer_flush();
+        csdump(si, gx, gy, gz, true);
+    }
     if (sbuf_hit) {
         renderer_flush();
         LOG("[sbufw] after (local %ux%ux%u):", cp->local[0], cp->local[1], cp->local[2]);

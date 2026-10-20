@@ -867,6 +867,38 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     checked. Also 4x `[tex] type mismatch: want 2 have 7 (32x32x32 ...)`:
     a program samples a 3D LUT as 2D and gets the dummy texture (not the
     post FS `16de63d00`, which declares `texture3d`).
+- Match performance, third round (2026-10-19): **`16dff9100` fixed, the
+  match runs at ~12 fps** (gpu ~330 ms per 2 s; was 3-4 fps, gpu ~1.9 s).
+  The contour walk was not the problem:
+  - `FIFA_SHADER_GUARD=10000` cut it from ~120 to ~15 ms per dispatch, so
+    something ran to the guard. In the match it runs on 12-triangle meshes
+    (`cb4[0]` = {1, 12, 12}: max slot, count, first triangle);
+    `tools/contour_replay.py` replays the link build and walk from a dump
+    and every walk ends in 3-5 steps.
+  - Barriers: Metal's `threadgroup_barrier` only holds when all threads reach
+    it in uniform control flow. In the `switch (pc)` loop, lanes that reach a
+    BAR after fewer iterations than the others pass straight through (a
+    standalone test: 63 of 64 lanes read shared memory before lane 0 wrote
+    it, including lanes in the other SIMD group). Here lanes 1-63 read the
+    emit count `smem[1]` before thread 0's walk stored it, and the emit loop
+    `for (i = tid; i < smem[1]; i += 64)` ran to the guard on stale shared
+    memory. Translator: in MSL compute with branches, a BAR now leaves the
+    loop with pc past it (`bar_now`), and the threads meet at one barrier
+    outside it, rounds until all have exited (a threadgroup counter;
+    exited threads keep taking part, as on Maxwell). 11 of the dumped
+    programs use it.
+  - `S2R` SR_LANEID was 0 and SR_EQMASK/LTMASK/LEMASK/GTMASK/GEMASK (0x38-
+    0x3c) fell through to 0: warp-compacted appends (ballot, leader =
+    highest lane does the atomic add, `popcount(ltmask & ballot)` as the
+    slot) never ran the atomic and gave every lane the same slot. Now
+    `lane` and the masks (vertex shaders: lane 0 of 1). 7 programs, among
+    them the exposure chain `16e884800` / `16f5aa200`.
+  - Debug aids: `FIFA_DBG_CSDUMP=<cs>:<skip>[:<count>]` writes the bound
+    uniform buffers, storage buffers and textures of a dispatch (GPU drained
+    first) and the storage buffers after it to `build/csdump/<n>/`
+    (`meta.txt`; `u<i>` is c[i + 3]); the control command `csdump [n]`
+    dumps the next n dispatches of that program. `FIFA_DBG_CSW` lines also
+    print the bound uniform buffers.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -1009,20 +1041,17 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
 ## Next steps
 
 Kick Off plays a full match (loading cards, line-ups, 3D scene, HUD,
-half-time) at ~3-4 fps; the BRX pipeline fix is confirmed in a run. In
-order:
+half-time) at ~12 fps since the barrier fix ("Match performance, third
+round"). In order:
 
-1. `16dff9100` (~95% of match GPU time, ~120 ms per dispatch; see "Match
-   performance, second round"): run with `FIFA_SHADER_GUARD=10000
-   FIFA_DBG_CSW=16dff9100` to confirm the walk runs to the guard and read
-   the edge count (`cb4[0][1]`) against the 4 KB of shared memory, then fix
-   whatever keeps the contour from closing.
-2. Then the remaining performance items from the same section: GPU drains
+1. ~~`16dff9100`~~ done (divergent barriers, SR_LANEID / lane masks).
+2. Then the remaining performance items from the second round: GPU drains
    on `CMD_COPY_BUFFER_TO_BUFFER` / `CMD_COPY_TEXTURE_TO_BUFFER`, `gfind`'s
    window scan, structured loops instead of `switch (pc)` for simple
    back-edges. Profile with `prof 1` / `prof 2` after each.
 3. The black 3D scene for part of the first half (likely the e_prev = 0
-   exposure readback, see "The match renders"), and the program that
+   exposure readback, see "The match renders"; recheck first: the exposure
+   chain used the broken lane masks), and the program that
    samples a 32^3 3D texture as 2D (`[tex] type mismatch: want 2 have 7`).
 4. Visual pass over the match: shadows, reflections, the remaining ~10
    skipped draws per frame (`16fd3ac00`, `171855700` TXD.B).

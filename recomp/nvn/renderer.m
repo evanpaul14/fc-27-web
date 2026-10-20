@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <float.h>
+#include <stdatomic.h>
 #include <math.h>
 #include <sys/stat.h>
 #include <mach/mach.h>
@@ -30,6 +31,8 @@ static uint64_t skip_why[6];  // no program, program not ready, pipeline compili
 static void skip_log(int n);
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
 static uint64_t stat_blits, stat_pend_waits;  // copies run as blits in command order; drains because the CPU touched one
+static uint64_t stat_rings, stat_rings_new;  // uniform rings started (wraps), of them newly allocated
+static _Atomic uint64_t g_done_seq;  // highest submission whose command buffer has completed
 static double stat_gpu_s;
 static uint64_t g_gpu_total_ns;  // GPU time of all completed command buffers
 // (forward: texture-lifetime cleanup and stats, defined further down)
@@ -102,12 +105,12 @@ const char *renderer_stats(void) {
     struct task_vm_info vmi;
     mach_msg_type_number_t vn = TASK_VM_INFO_COUNT;
     uint64_t foot = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &vn) == KERN_SUCCESS ? vmi.phys_footprint : 0;
-    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped (%llu/%llu/%llu/%llu/%llu/%llu), %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms wait %.0fms, fbcopy %llu, blits %llu/%llu waited | tex %d (%.0f MB) views %d snaps %lu mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu", stat_draws, stat_skipped,
+    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped (%llu/%llu/%llu/%llu/%llu/%llu), %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms wait %.0fms, fbcopy %llu, blits %llu/%llu waited, rings %llu/%llu new | tex %d (%.0f MB) views %d snaps %lu mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu", stat_draws, stat_skipped,
              skip_why[0], skip_why[1], skip_why[2], skip_why[3], skip_why[4], skip_why[5],
              stat_passes, stat_dispatches, stat_flushes, stat_gpu_s * 1000.0, (double)stat_wait_ns / 1e6 * 125.0 / 3.0, stat_compiles, stat_compile_ms, stat_compile_wait_ms, stat_feedback_copies,
-             stat_blits, stat_pend_waits, g_tex_live, g_tex_live_bytes / 1048576.0, g_views_live, (unsigned long)(g_snap_copies ? g_snap_copies.count : 0), foot / 1048576.0, stat_wait_by[0] / 24e3, (unsigned long long)stat_wait_n[0], stat_wait_by[1] / 24e3, (unsigned long long)stat_wait_n[1], stat_wait_by[2] / 24e3, (unsigned long long)stat_wait_n[2]);
+             stat_blits, stat_pend_waits, stat_rings, stat_rings_new, g_tex_live, g_tex_live_bytes / 1048576.0, g_views_live, (unsigned long)(g_snap_copies ? g_snap_copies.count : 0), foot / 1048576.0, stat_wait_by[0] / 24e3, (unsigned long long)stat_wait_n[0], stat_wait_by[1] / 24e3, (unsigned long long)stat_wait_n[1], stat_wait_by[2] / 24e3, (unsigned long long)stat_wait_n[2]);
     stat_compiles = 0;
-    stat_feedback_copies = stat_blits = stat_pend_waits = 0;
+    stat_feedback_copies = stat_blits = stat_pend_waits = stat_rings = stat_rings_new = 0;
     stat_compile_ms = stat_compile_wait_ms = 0;
     memset(skip_why, 0, sizeof skip_why);
     stat_draws = stat_skipped = stat_passes = stat_dispatches = stat_flushes = stat_wait_ns = 0;
@@ -290,7 +293,12 @@ static void commit_cb(const char *tag) {
         id<MTLCommandBuffer> c = cmdbuf;
         cmdbuf = nil;
         char *ptag = tag ? strdup(tag) : NULL;
+        pthread_mutex_lock(&cb_lock);
+        uint64_t seq = submit_seq + 1;
+        pthread_mutex_unlock(&cb_lock);
         [c addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            uint64_t d = atomic_load(&g_done_seq);
+            while (d < seq && !atomic_compare_exchange_weak(&g_done_seq, &d, seq)) {}
             stat_gpu_s += done.GPUEndTime - done.GPUStartTime;
             __atomic_add_fetch(&g_gpu_total_ns, (uint64_t)((done.GPUEndTime - done.GPUStartTime) * 1e9), __ATOMIC_RELAXED);
             if (ptag) { prof_add(ptag, done.GPUEndTime - done.GPUStartTime); free(ptag); }
@@ -729,16 +737,45 @@ static int cbuf_base = 3, tex_base = 8;
 @end
 
 static id<MTLBuffer> ring;
-static uint64_t ring_off;
+static uint64_t ring_off, ring_gen;  // ring_gen: changes whenever earlier offsets may be overwritten
 #define RING_SIZE (64u << 20)
+// Full rings wait here until the submission that last used them completes, then get reused: a fresh 64 MB shared
+// buffer costs a zero-fill page fault on every first touch.
+#define RING_SPARE 4
+static struct { id<MTLBuffer> buf; uint64_t seq; } ring_spare[RING_SPARE];
+
+static id<MTLBuffer> ring_next(uint64_t size) {
+    if (size <= RING_SIZE) {
+        uint64_t done = atomic_load(&g_done_seq);
+        for (int i = 0; i < RING_SPARE; i++)
+            if (ring_spare[i].buf && ring_spare[i].seq <= done) {
+                id<MTLBuffer> b = ring_spare[i].buf;
+                ring_spare[i].buf = nil;
+                return b;
+            }
+    }
+    stat_rings_new++;
+    return [dev newBufferWithLength:(size > RING_SIZE ? size : RING_SIZE) options:MTLResourceStorageModeShared];
+}
 
 static uint64_t ring_alloc(const void *data, uint64_t size) {
     cpu_read_ptr(data, size);
-    if (!ring) ring = [dev newBufferWithLength:RING_SIZE options:MTLResourceStorageModeShared];
+    if (!ring) ring = ring_next(size);
     uint64_t aligned = (ring_off + 255) & ~255ull;
-    if (aligned + size > RING_SIZE) {
+    if (aligned + size > ring.length) {
         // Start a fresh ring; command buffers in flight keep the old one alive until they complete.
-        ring = [dev newBufferWithLength:(size > RING_SIZE ? size : RING_SIZE) options:MTLResourceStorageModeShared];
+        stat_rings++;
+        if (ring.length == RING_SIZE) {
+            int k = 0;  // a free slot, else the oldest
+            for (int i = 0; i < RING_SPARE; i++) {
+                if (!ring_spare[i].buf) { k = i; break; }
+                if (ring_spare[i].seq < ring_spare[k].seq) k = i;
+            }
+            ring_spare[k].buf = ring;
+            ring_spare[k].seq = renderer_fence_seq();
+        }
+        ring = ring_next(size);
+        ring_gen++;
         aligned = 0;
     }
     memcpy((uint8_t *)ring.contents + aligned, data, size);
@@ -746,7 +783,7 @@ static uint64_t ring_alloc(const void *data, uint64_t size) {
     return aligned;
 }
 
-static void ring_reset(void) { ring_off = 0; }
+static void ring_reset(void) { ring_off = 0; ring_gen++; }
 
 // Bind guest memory [addr, addr+size) as a buffer: zero-copy inside a memory pool, copied otherwise.
 static void bind_guest(id<MTLRenderCommandEncoder> e, bool vertex_stage, uint64_t addr, uint64_t size, int index) {
@@ -1412,6 +1449,10 @@ static void bind_textures(int stage, ShaderInfo *si) {
     }
 }
 
+// Driver and compiler constants rarely change between draws: reuse the last copy in the ring while it is the same.
+static struct { uint64_t gen, size, off; uint32_t drv[0x800 / 4]; } drv_last[2];
+static struct { uint64_t gen, src, size, off; } const_last[2];
+
 static void bind_cbufs(int stage, ShaderInfo *si) {
     for (int k = 0; k < 18; k++) {
         if (!(si->cbuf_mask & (1u << k))) continue;
@@ -1427,7 +1468,14 @@ static void bind_cbufs(int stage, ShaderInfo *si) {
                 e[2] = (uint32_t)st.sbuf[stage][i].size;
             }
             uint64_t size = si->cbuf_size[0] > sizeof drv ? sizeof drv : (si->cbuf_size[0] ? si->cbuf_size[0] : 256);
-            uint64_t off = ring_alloc(drv, size);
+            typeof(drv_last[0]) *dl = &drv_last[stage == 1];
+            uint64_t off;
+            if (dl->gen == ring_gen && ring && dl->size == size && !memcmp(dl->drv, drv, size)) off = dl->off;
+            else {
+                off = ring_alloc(drv, size);
+                dl->gen = ring_gen; dl->size = size; dl->off = off;
+                memcpy(dl->drv, drv, size);
+            }
             if (stage == 0) [enc setVertexBuffer:ring offset:off atIndex:0];
             else [enc setFragmentBuffer:ring offset:off atIndex:0];
             continue;
@@ -1436,7 +1484,13 @@ static void bind_cbufs(int stage, ShaderInfo *si) {
             NvnShaderStage *ss = &st.program->stages[stage];
             uint64_t size = ss->const_size ? ss->const_size : 16;
             if (size < si->cbuf_size[1]) size = si->cbuf_size[1];
-            uint64_t off = ring_alloc(gptr(ss->code_addr + ss->const_offset), size);
+            uint64_t src = ss->code_addr + ss->const_offset, off;
+            typeof(const_last[0]) *cl = &const_last[stage == 1];
+            if (cl->gen == ring_gen && ring && cl->src == src && cl->size == size) off = cl->off;
+            else {
+                off = ring_alloc(gptr(src), size);
+                *cl = (typeof(*cl)){ring_gen, src, size, off};
+            }
             if (stage == 0) [enc setVertexBuffer:ring offset:off atIndex:1];
             else [enc setFragmentBuffer:ring offset:off atIndex:1];
             continue;

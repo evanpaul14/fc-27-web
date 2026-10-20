@@ -373,6 +373,27 @@ const uint8_t *nvn_texture_data(NvnTexture *t, uint64_t size, uint8_t **tmp) {
     return buf;
 }
 
+int nvn_texture_spans(NvnTexture *t, uint64_t size, NvnSpan *out, int max) {
+    NvnPool *p = t->pool;
+    if (!p || max < 1) return 0;
+    renderer_cpu_access(p->storage + t->pool_offset, size, false);
+    if (p->storage) { out[0] = (NvnSpan){GP(p->storage + t->pool_offset), size}; return 1; }
+    uint64_t lo = t->pool_offset, hi = lo + size, at = lo;
+    int i = 0, n = 0;
+    while (i < p->nmap && p->map[i].voff + p->map[i].size <= lo) i++;
+    for (; at < hi; i++) {
+        if (i >= p->nmap || p->map[i].voff > at) return 0;  // hole
+        NvnPoolMapping *m = &p->map[i];
+        uint64_t end = m->voff + m->size < hi ? m->voff + m->size : hi;
+        const uint8_t *q = GP(m->phys + (at - m->voff));
+        if (n && out[n - 1].p + out[n - 1].n == q) out[n - 1].n += end - at;  // physically contiguous
+        else if (n == max) return -1;
+        else out[n++] = (NvnSpan){q, end - at};
+        at = end;
+    }
+    return n;
+}
+
 // ================================================================== buffers
 // Builder: device@0 pool@8 offset@0x10 size@0x18. Buffer: address@0 pool@8 offset@0x10 size@0x18 id@0x20
 NVN(nvnBufferBuilderSetDevice) { FLD(uint64_t, A(0), 0) = A(1); }

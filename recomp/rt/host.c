@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -85,13 +86,24 @@ uint64_t host_symbol_addr(const char *name, uint64_t lo, uint64_t hi) {
 }
 
 /* ---- dispatch ---- */
+/* Indirect calls (vtables, function pointers) look up their target here. The table has ~340k entries (5 MB), so the
+ * binary search is ~19 dependent cache misses; a direct-mapped cache in front holds (addr << 32 | index + 1) in one
+ * word, so threads can share it without locks (guest code addresses are below 4 GB). */
+#define FN_CACHE_BITS 16
+static _Atomic uint64_t fn_cache[1u << FN_CACHE_BITS];
+
 static const A64Fn *find_fn(uint64_t t) {
+  uint32_t slot = (uint32_t)((t >> 2) ^ (t >> (2 + FN_CACHE_BITS))) & ((1u << FN_CACHE_BITS) - 1);
+  uint64_t e = atomic_load_explicit(&fn_cache[slot], memory_order_relaxed);
+  if (e >> 32 == t && (uint32_t)e) return &a64_fn_table[(uint32_t)e - 1];
   unsigned lo = 0, hi = a64_fn_count;
   while (lo < hi) {
     unsigned m = (lo + hi) / 2;
     if (a64_fn_table[m].addr < t) lo = m + 1; else hi = m;
   }
-  return lo < a64_fn_count && a64_fn_table[lo].addr == t ? &a64_fn_table[lo] : 0;
+  if (!(lo < a64_fn_count && a64_fn_table[lo].addr == t)) return 0;
+  if (t >> 32 == 0) atomic_store_explicit(&fn_cache[slot], t << 32 | (lo + 1), memory_order_relaxed);
+  return &a64_fn_table[lo];
 }
 
 void a64_call(CPU *c, uint64_t t) {

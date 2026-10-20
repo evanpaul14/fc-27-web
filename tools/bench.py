@@ -3,11 +3,13 @@
 
   python3 tools/bench.py <outdir> <initial blits 0|1> <plan>     e.g. build/b1 0 0:150,1:150,0:120,1:120
 
-plan: comma-separated <blits value>:<seconds>, run after the match has loaded. Boots the game hidden, drives it to the
-match with tools/tomatch.py, waits LOAD (env, default 120) s, then runs the plan; each segment ends with a screenshot
-(<outdir>/seg<i>.png). Writes <outdir>/game.log (lines prefixed with seconds since start), marks.log, swap.log and
-cores.log: every 2 s the game's CPU seconds on P and E cores and their clocks (proc_pid_rusage v6, no root). Compare
-fps only at the same P clock: the P cores throttle to ~0.83 GHz under thermal pressure. SAMPLE=1 also runs
+plan: comma-separated <commands>:<seconds>, run after the match has loaded. Boots the game hidden, drives it to the
+match with tools/tomatch.py, waits LOAD (env, default 120) s, then runs the plan; <commands> are control commands
+separated by ';' (a bare number n means `blits n`), e.g. 'blits 1;prof 0:120'; each segment ends with a screenshot
+(<outdir>/seg<i>.png, and seg<i>a.png at its start). Writes <outdir>/game.log (lines prefixed with seconds since start), marks.log, swap.log and
+cores.log: every 2 s the game's CPU seconds on P and E cores, retired instructions and clocks (proc_pid_rusage v6, no
+root). Compare fps only at the same P clock: the P cores throttle to ~0.83 GHz under thermal pressure; compare runs by
+cost per frame instead (tools/benchsum.py: instructions, CPU and GPU time per frame, which don't depend on the clock). SAMPLE=1 also runs
 /usr/bin/sample for 10 s near the end of each segment (<outdir>/seg<i>.sample).
 """
 import ctypes
@@ -70,11 +72,13 @@ def cores():
                 pt = (d['user_p'] + d['system_p']) * ns / 1e9
                 et = cpu - pt
                 ecyc = d['cycles'] - d['pcycles']
-                f.write('%.1f cpu %.2f P %.2f E %.2f runnable %.2f  GHz all %.2f P %.2f E %.2f  IPC P %.2f E %.2f\n' % (
-                    time.time() - t0, cpu, pt, et, d['runnable'] * ns / 1e9,
+                th = subprocess.run(['notifyutil', '-g', 'com.apple.system.thermalpressurelevel'], capture_output=True,
+                                    text=True).stdout.split()[-1:] or ['?']
+                f.write('%.1f cpu %.2f P %.2f E %.2f runnable %.2f  Ginst %.3f P %.3f  GHz all %.2f P %.2f E %.2f  IPC P %.2f E %.2f  thermal %s\n' % (
+                    time.time() - t0, cpu, pt, et, d['runnable'] * ns / 1e9, d['instructions'] / 1e9, d['pinstr'] / 1e9,
                     d['cycles'] / cpu / 1e9 if cpu else 0, d['pcycles'] / pt / 1e9 if pt else 0,
                     ecyc / et / 1e9 if et > 0.01 else 0, d['pinstr'] / d['pcycles'] if d['pcycles'] else 0,
-                    (d['instructions'] - d['pinstr']) / ecyc if ecyc > 0 else 0))
+                    (d['instructions'] - d['pinstr']) / ecyc if ecyc > 0 else 0, th[0]))
                 f.flush()
             prev = v
             time.sleep(2)
@@ -106,9 +110,12 @@ if r.returncode:
 mark('match loading')
 time.sleep(LOAD)
 for i, seg in enumerate(plan.split(',')):
-    b, secs = seg.split(':')
-    send('blits %s' % b)
-    mark('seg %d blits %s' % (i, b))
+    cmds, secs = seg.rsplit(':', 1)
+    cmds = ['blits ' + c if c.isdigit() else c for c in cmds.split(';')]
+    for c in cmds:
+        send(c)
+    mark('seg %d %s' % (i, '; '.join(cmds)))
+    send('shot %s' % os.path.join(out, 'seg%da.png' % i))  # with the end shot: the match clock's progress
     if os.environ.get('SAMPLE') and int(secs) > 30:
         time.sleep(int(secs) - 15)
         subprocess.run(['/usr/bin/sample', str(game.pid), '10', '-file', os.path.join(out, 'seg%d.sample' % i)],

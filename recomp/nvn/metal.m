@@ -318,26 +318,38 @@ void backend_texture_destroyed(NvnTexture *t) {
 static uint64_t g_frame_counter;  // presents so far (texture change detection runs once per frame)
 static uint64_t full_hash_budget, full_hash_budget_frame;
 
-static uint64_t hash_full(const uint8_t *p, uint64_t n) {
+// Both hash a texture's runs in place (nvn_texture_spans); runs other than the last are whole pages, so the value
+// doesn't depend on how the memory is split.
+static uint64_t hash_full(const NvnSpan *s, int ns, uint64_t n) {
     uint64_t h = 0x9E3779B97F4A7C15ull ^ n;
-    uint64_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        uint64_t v;
-        memcpy(&v, p + i, 8);
-        h = (h ^ v) * 0x100000001B3ull;
-        h ^= h >> 29;
+    for (int k = 0; k < ns; k++) {
+        const uint8_t *p = s[k].p;
+        uint64_t i = 0, m = s[k].n;
+        for (; i + 8 <= m; i += 8) {
+            uint64_t v;
+            memcpy(&v, p + i, 8);
+            h = (h ^ v) * 0x100000001B3ull;
+            h ^= h >> 29;
+        }
+        for (; i < m; i++) h = (h ^ p[i]) * 0x100000001B3ull;
     }
-    for (; i < n; i++) h = (h ^ p[i]) * 0x100000001B3ull;
     return h;
 }
 
-static uint64_t fnv_sample(const uint8_t *p, uint64_t n) {
+static uint64_t fnv_sample(const NvnSpan *s, int ns, uint64_t n) {
     // cheap change detector: hash a strided sample of the data
     uint64_t h = 1469598103934665603ull;
-    uint64_t step = n > 4096 ? n / 4096 : 1;
-    for (uint64_t i = 0; i < n; i += step) { h ^= p[i]; h *= 1099511628211ull; }
+    uint64_t step = n > 4096 ? n / 4096 : 1, base = 0;
+    int k = 0;
+    for (uint64_t i = 0; i < n; i += step) {
+        while (k < ns && i >= base + s[k].n) base += s[k++].n;
+        if (k == ns) break;
+        h ^= s[k].p[i - base]; h *= 1099511628211ull;
+    }
     return h ^ n;
 }
+
+#define MAX_SPANS 64
 
 // Buffer textures: linear texels straight from guest memory, re-checked every frame (the UI rewrites its
 // vertex data in them).
@@ -346,11 +358,18 @@ static void upload_buffer_texture(NvnTexture *t, TexBackend *b, id<MTLBlitComman
     b->checked_frame = g_frame_counter;
     uint32_t bpb = nvn_format_info(t->format)->bpb;
     uint64_t n = (uint64_t)t->width * bpb;
-    uint8_t *tmp;
-    const uint8_t *mem = nvn_texture_data(t, n, &tmp);
-    if (!mem || !n) return;
-    uint64_t h = hash_full(mem, n);
+    NvnSpan sp[MAX_SPANS];
+    int ns = n ? nvn_texture_spans(t, n, sp, MAX_SPANS) : 0;
+    if (!ns) return;
+    uint8_t *tmp = NULL;
+    const uint8_t *mem = NULL;
+    if (ns < 0) {  // too many runs: hash the gathered copy
+        if (!(mem = nvn_texture_data(t, n, &tmp))) return;
+        sp[0] = (NvnSpan){mem, n}; ns = 1;
+    }
+    uint64_t h = hash_full(sp, ns, n);
     if (b->uploaded && h == b->data_hash) { free(tmp); return; }
+    if (!mem && !(mem = nvn_texture_data(t, n, &tmp))) return;
     b->data_hash = h;
     b->uploaded = true;
     id<MTLCommandBuffer> own_cb = nil;
@@ -383,16 +402,24 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
     b->checked_frame = g_frame_counter;
     if (t->flags & 0x10) b->dynamic = true;  // linear textures are the CPU-written kind
     if (full_hash_budget_frame != g_frame_counter) { full_hash_budget_frame = g_frame_counter; full_hash_budget = 4 << 20; }
-    uint8_t *tmp;
-    const uint8_t *mem = nvn_texture_data(t, total, &tmp);  // (virtual pools: NULL until mapped)
-    if (!mem) return;
+    // hashed in place; gathered (virtual pools over separate physical ranges) only to upload
+    NvnSpan sp[MAX_SPANS];
+    int ns = nvn_texture_spans(t, total, sp, MAX_SPANS);  // (virtual pools: 0 until mapped)
+    if (!ns) return;
+    uint8_t *tmp = NULL;
+    const uint8_t *mem = NULL;
+    if (ns < 0) {
+        if (!(mem = nvn_texture_data(t, total, &tmp))) return;
+        sp[0] = (NvnSpan){mem, total}; ns = 1;
+    }
     bool full = b->dynamic || !b->uploaded || ENV("FIFA_TEX_FULLHASH");
     if (!full && g_frame_counter - b->full_frame >= 120 && full_hash_budget >= total) { full = true; full_hash_budget -= total; }
-    if (!full && fnv_sample(mem, total) == b->sample_hash) { free(tmp); return; }
-    uint64_t h = hash_full(mem, total);
+    if (!full && fnv_sample(sp, ns, total) == b->sample_hash) { free(tmp); return; }
+    uint64_t h = hash_full(sp, ns, total);
     b->full_frame = g_frame_counter;
-    b->sample_hash = fnv_sample(mem, total);
+    b->sample_hash = fnv_sample(sp, ns, total);
     if (b->uploaded && h == b->data_hash) { free(tmp); return; }
+    if (!mem && !(mem = nvn_texture_data(t, total, &tmp))) return;
     if (b->uploaded) b->dynamic = true;
     b->data_hash = h;
     b->uploaded = true;

@@ -179,6 +179,23 @@ static _Atomic int profile_mode = -1;
 int input_profile_mode(void) { return atomic_load(&profile_mode); }
 static _Atomic int blits_mode = 1;
 int input_blits(void) { return atomic_load(&blits_mode); }
+// Frame cap (FIFA_FPS, control `fps <n>`): -1 the game's own (30), 0 none, else n fps. The frame pacer's period goes
+// through host_frame_period_ms (a patch in recomp/build.py).
+static _Atomic int fps_cap = -2;
+static int fps_cap_now(void) {
+    int v = atomic_load(&fps_cap);
+    if (v == -2) {
+        const char *e = getenv("FIFA_FPS");
+        int want = e ? atoi(e) : -1, expect = -2;
+        atomic_compare_exchange_strong(&fps_cap, &expect, want);
+        v = atomic_load(&fps_cap);
+    }
+    return v;
+}
+double host_frame_period_ms(double game_ms) {
+    int v = fps_cap_now();
+    return v < 0 ? game_ms : v == 0 ? 0.0 : 1000.0 / v;
+}
 static _Atomic int csdump_req;
 int input_take_csdump(void) { return atomic_exchange(&csdump_req, 0); }
 void input_shot_done(void) { atomic_fetch_add(&shots_done, 1); }
@@ -217,6 +234,8 @@ static void control_command(char *cmd) {
         atomic_store(&profile_mode, (int)n);
     } else if (!strcmp(a, "blits") && sscanf(cmd, "%*s %ld", &n) == 1) {  // buffer copies as GPU blits (1) or drain + CPU (0)
         atomic_store(&blits_mode, (int)n);
+    } else if (!strcmp(a, "fps") && sscanf(cmd, "%*s %ld", &n) == 1) {  // frame cap: -1 the game's, 0 none, n fps
+        atomic_store(&fps_cap, (int)n);
     } else if (!strcmp(a, "shot")) {
         if (sscanf(cmd, "%*s %255s", b) != 1) strcpy(b, "build/live.png");
         uint64_t done = atomic_load(&shots_done);

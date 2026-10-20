@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -31,6 +32,50 @@ static int log_threads(void) {
   static int on = -1;
   if (on < 0) on = getenv("FIFA_LOG_THREADS") != NULL;
   return on;
+}
+
+/* FIFA_LOG_WAITS=1: every 5 s, the timed waits (SleepThread, WaitSynchronization, WaitProcessWideKeyAtomic,
+ * WaitForAddress) by guest call chain: count, mean timeout, thread. Finds the frame limiter. */
+typedef struct { uint64_t chain[6]; uint64_t n, ns, thread; int svc; } WaitSite;
+static WaitSite wait_sites[256];
+static pthread_mutex_t wait_log_lock = PTHREAD_MUTEX_INITIALIZER;
+static void wait_log(CPU *c, int svc, int64_t ns) {
+  static int on = -1;
+  if (on < 0) on = getenv("FIFA_LOG_WAITS") != NULL;
+  if (!on || ns <= 0) return;
+  uint64_t chain[6] = {c->x[30]}, fp = c->x[29];
+  for (int i = 1; i < 6 && fp && fp < GUEST_SPACE - 16; i++) {
+    chain[i] = *(uint64_t *)gptr(fp + 8);
+    fp = *(uint64_t *)gptr(fp);
+  }
+  static double last;
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  double t = now.tv_sec + now.tv_nsec * 1e-9;
+  pthread_mutex_lock(&wait_log_lock);
+  int i = 0;
+  for (; i < 256 && wait_sites[i].n; i++)
+    if (wait_sites[i].svc == svc && !memcmp(wait_sites[i].chain, chain, sizeof chain)) break;
+  if (i < 256) {
+    if (!wait_sites[i].n) { memcpy(wait_sites[i].chain, chain, sizeof chain); wait_sites[i].svc = svc; }
+    wait_sites[i].n++; wait_sites[i].ns += (uint64_t)ns; wait_sites[i].thread = cur_thread ? cur_thread->id : 0;
+  }
+  if (t - last >= 5) {
+    if (last > 0) {
+      HLOG("[waits] %.1f s:\n", t - last);
+      for (int k = 0; k < 256 && wait_sites[k].n; k++) {
+        WaitSite *w = &wait_sites[k];
+        if (w->n < 20) continue;
+        HLOG("  svc %#x n %5llu mean %8.3f ms thread %#llx  %llx < %llx < %llx < %llx < %llx < %llx\n", w->svc,
+             (unsigned long long)w->n, w->ns / 1e6 / w->n, (unsigned long long)w->thread,
+             (unsigned long long)w->chain[0], (unsigned long long)w->chain[1], (unsigned long long)w->chain[2],
+             (unsigned long long)w->chain[3], (unsigned long long)w->chain[4], (unsigned long long)w->chain[5]);
+      }
+    }
+    memset(wait_sites, 0, sizeof wait_sites);
+    last = t;
+  }
+  pthread_mutex_unlock(&wait_log_lock);
 }
 
 /* ---- handles ---- */
@@ -460,6 +505,7 @@ static void svc_dispatch_inner(CPU *c, uint32_t imm, uint64_t pc) {
     pthread_exit(0);
   case 0x0B: {  /* SleepThread(ns) */
     int64_t ns = (int64_t)x[0];
+    wait_log(c, 0x0B, ns);
     if (ns > 0) { struct timespec ts = {ns / 1000000000, ns % 1000000000}; nanosleep(&ts, 0); }
     else sched_yield();
     return;
@@ -522,6 +568,7 @@ static void svc_dispatch_inner(CPU *c, uint32_t imm, uint64_t pc) {
     uint64_t hs = x[1];
     int n = (int)x[2];
     int64_t timeout = (int64_t)x[3];
+    wait_log(c, 0x18, timeout);
     if (host_trace)
       for (int i = 0; i < n && i < 8; i++) HLOG("  handle %#x\n", *u32p(hs + 4 * i));
     pthread_mutex_lock(&klock);
@@ -583,6 +630,7 @@ static void svc_dispatch_inner(CPU *c, uint32_t imm, uint64_t pc) {
     uint64_t maddr = x[0], key = x[1];
     uint32_t tag = (uint32_t)x[2];
     int64_t timeout = (int64_t)x[3];
+    wait_log(c, 0x1C, timeout);
     pthread_mutex_lock(&klock);
     mutex_release(maddr);
     __atomic_store_n(u32p(key), 1, __ATOMIC_SEQ_CST);
@@ -652,6 +700,7 @@ static void svc_dispatch_inner(CPU *c, uint32_t imm, uint64_t pc) {
     uint32_t type = (uint32_t)x[1];
     int32_t value = (int32_t)x[2];
     int64_t timeout = (int64_t)x[3];
+    wait_log(c, 0x34, timeout);
     pthread_mutex_lock(&klock);
     int32_t v = (int32_t)__atomic_load_n(u32p(addr), __ATOMIC_SEQ_CST);
     uint32_t r = RES_OK;

@@ -982,6 +982,34 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     different clocks. Benchmark only at thermal pressure 0, and check `cores.log` P GHz before comparing.
   - Per frame in the slow state every function costs ~2.5x (guest code as much as `renderer_texture`): a
     clock, not work, difference. Same draws per frame, same blits per frame (~7).
+- CPU cost per frame, first round (2026-10-20, runs `build/b5` baseline, `b7`; compare runs with
+  `python3 -I tools/benchsum.py build/b5 build/b7`: giga-instructions, CPU ms and GPU ms per frame, which hold up
+  under throttling far better than fps; the game sits at its 30 fps cap anyway). `sample` in open play (b5): ~1.9
+  cores busy, of the busy samples ~19% `a64_call`, ~8% `renderer_texture`, ~5% `memmove`. Fixed:
+  - `a64_call`: every indirect call (vtables, function pointers) binary-searched the 340k-entry function table
+    (5 MB, ~19 dependent misses). A 64k-slot direct-mapped cache in front (`fn_cache`, one atomic word per slot:
+    address << 32 | index + 1, shared by all threads without locks).
+  - Texture change checks hashed virtual-pool textures through `nvn_texture_data`, which gathers (mallocs and
+    copies) the whole texture when it spans separate physical ranges, even for the 4,096-byte sample.
+    `nvn_texture_spans` hands out the mapped runs in place; the hashes walk them (same values as before) and the
+    gather happens only to upload.
+  - The 64 MB uniform ring was only reset by `renderer_flush`, which blits made rare, so each wrap allocated a fresh
+    shared buffer (zero-fill faults on first touch). Full rings now wait in `ring_spare` until their submission
+    completes (`g_done_seq`) and are reused: `rings <wraps>/<new>` in the stats line shows ~1-9 wraps and 0 new
+    per 2 s (so ~10 MB of uniform snapshots per frame go through `ring_alloc`).
+  - `bind_cbufs` rebuilt and copied the driver-constant table (up to 0x800 bytes) and the compiler constants for
+    each stage of every draw; the last copy is reused while it's the same (`drv_last`, `const_last`, `ring_gen`).
+  - Result at the cap, same thermal state (pressure 0-1): 0.363-0.367 -> 0.314 Gi/frame (-14%), 65 -> 52.5 CPU
+    ms/frame (-19%); fence waits 8.5 -> 0.9 ms/frame.
+- The 30 fps cap (2026-10-20, `FIFA_LOG_WAITS=1` logs timed waits by guest call chain every 5 s): the frame pacer
+  `F_0ad4a030` (its own thread) picks 33.3 ms or 16.7 ms by a mode flag (`fcsel d0, d10, d9, ne` at `ad4b4d8`) and
+  sleeps the rest of the period each frame (in open play ~18 ms on 60-100 of 150 frames). `recomp/build.py` now has
+  `PATCHES` (address -> expected word, C); that `fcsel` goes through `host_frame_period_ms`, set by `FIFA_FPS=<n>` or
+  the control command `fps <n>` (-1 the game's, default; 0 none). Findings (b7): `fps 60` still gives exactly 30
+  fps, so something else holds 30 too (probably the simulation rate: the image has `SimRate_Locked`,
+  `SimulationTime.ForceSimRate 30.0f`, `TargetFpsIs60`); `fps 0` stops the pacer sleeping and costs ~2x CPU and GPU
+  per frame (0.55 Gi, 131 ms CPU) for ~20 fps, and heats the machine into throttling. So the cap stays the game's.
+  Other timed waits are polling threads with fixed sleeps (2, 2.7, 4, 5, 16, 30, 50 ms), ~3k wakeups/s.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -1130,9 +1158,14 @@ round") and blits on by default ("Blits", "Match profile"). In order:
 1. ~~`16dff9100`~~ done (divergent barriers, SR_LANEID / lane masks).
 2. Then the remaining performance items from the second round: ~~GPU drains
    on `CMD_COPY_BUFFER_TO_BUFFER` / `CMD_COPY_TEXTURE_TO_BUFFER`~~ (blits,
-   on by default), `upload_texture`'s per-frame change checks, `gfind`'s
-   window scan, structured loops instead of `switch (pc)` for simple
-   back-edges. Profile with `prof 1` / `prof 2` after each.
+   on by default), ~~`a64_call` lookups, texture gathers, ring allocation,
+   constant copies~~ ("CPU cost per frame, first round"), `upload_texture`'s
+   per-frame change checks, `gfind`'s window scan, the ~10 MB/frame of
+   uniform snapshots, structured loops instead of `switch (pc)` for simple
+   back-edges. Measure each with `tools/bench.py` + `tools/benchsum.py`
+   (cost per frame), never while building.
+   The second 30 fps lock (see "The 30 fps cap"): find it with `fps 60` and
+   `FIFA_LOG_WAITS=1`, if uncapping is still wanted.
 3. ~~The black 3D scene for part of the first half~~ fixed by the lane
    masks. ~~The 32^3 3D texture sampled as 2D~~ is the game's own stale
    binding, harmless (see "Blits").

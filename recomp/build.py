@@ -21,6 +21,15 @@ from a64 import translate, Unsupported, bits, sx  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PC_RELATIVE = {'adr', 'adrp', 'ldr_lit', 'ldrsw_lit', 'ldr_lit_v', 'svc'}
+
+# Instructions replaced by C of our own: {address: (expected word, C)}. The word check keeps a patch from landing on
+# other code if the image changes.
+PATCHES = {
+    # The frame pacer's period: `fcsel d0, d10, d9, ne` picks 33.3 ms (30 Hz) or 16.7 ms by a mode flag, then sleeps
+    # what's left of it each frame. host_frame_period_ms applies FIFA_FPS / the `fps` control command.
+    0x0ad4b4d8: (0x1e691d40, '{ extern double host_frame_period_ms(double); V128 R = {0}; R.fd[0] = host_frame_period_ms(!F.zf ? c->v[10].fd[0] : c->v[9].fd[0]); '
+                             'c->v[0] = R; }'),
+}
 BUCKET_SHIFT = 18  # 256 KB of code per translation unit
 ROOT = os.path.dirname(HERE)
 RO_MODULES = {'nro'}  # loaded through nn::ro::LoadModule
@@ -142,6 +151,12 @@ class Program:
 
     def insn(self, a):
         r = self.cache.get(a)
+        if r is None and a in PATCHES:
+            w, code = PATCHES[a]
+            if self.word(a) != w:
+                sys.exit(f'patch at {a:#x}: word {self.word(a):#x}, expected {w:#x}')
+            from a64 import Insn
+            r = self.cache[a] = Insn('op', code, tag='patch')
         if r is None:
             w = self.word(a)
             r = self.wcache.get(w)

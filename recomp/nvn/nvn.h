@@ -180,6 +180,10 @@ void backend_pool_created(NvnPool *p);    /* wrap its storage for the GPU */
    (gathered into a malloc'd *tmp the caller frees when it spans separate physical ranges). NULL while
    any part is unmapped. */
 const uint8_t *nvn_texture_data(NvnTexture *t, uint64_t size, uint8_t **tmp);
+/* The same memory in place, as up to max runs in order (for hashing without the gather): the number of runs, 0 while
+   any part is unmapped, -1 if it takes more than max. */
+typedef struct { const uint8_t *p; uint64_t n; } NvnSpan;
+int nvn_texture_spans(NvnTexture *t, uint64_t size, NvnSpan *out, int max);
 void backend_pool_destroyed(NvnPool *p);
 void renderer_sync(void);   /* wait for all submitted GPU work */
 void renderer_flush(void);  /* finish all recorded GPU work */

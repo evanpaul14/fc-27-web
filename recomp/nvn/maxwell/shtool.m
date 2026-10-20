@@ -1,6 +1,7 @@
 // Offline Maxwell translator check over shader dumps (FIFA_DUMP_SHADERS: build/shaders/<addr>_s<stage>_code.bin).
 //   cc -O1 -fobjc-arc -o build/shtool recomp/nvn/maxwell/shtool.m recomp/nvn/maxwell/translate.c -framework Metal -framework Foundation
 //   build/shtool [-v] [-c] [-o msl_dir] build/shaders/*_code.bin
+// The scan stops at the compiler constants when the control section dump (<addr>_s<stage>_ctrl.bin) gives them.
 // Prints one line per shader that fails (all of them with -v), then a summary by error with the opcode
 // (top 16 bits) of unknown instructions. -c also compiles the MSL with Metal (there is no offline `metal`
 // without Xcode), -o writes the MSL.
@@ -77,7 +78,8 @@ int main(int argc, char **argv) {
             if (cf) fclose(cf);
         }
         ShaderKey key = {0};
-        ShaderInfo *si = maxwell_translate(code, n, stage, &key);
+        // the compiler constants follow the code: they bound the instruction scan, as in the renderer
+        ShaderInfo *si = maxwell_translate(code, maxwell_consts ? cs[1] : n, stage, &key);
         total++;
         char why[300], k[128];
         if (si->msl && dev) {

@@ -927,6 +927,28 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     game leaves the LUT bound in its slot when the overlay is off (weights
     0), so the dummy texture changes nothing. The only TXQ-only slots
     (typed 2D by guess) are CS `16e11bb00` / `16ee5ac00` t0, not this.
+- Match profile (2026-10-19, run `build/r6`, `/usr/bin/sample` 10 s plus
+  `prof 1`; the Python `sample` on PATH shadows Apple's):
+  - CPU, blits off: three guest threads ~54% busy each, everything else
+    idle. The thread running command lists spends ~29% of its samples in
+    `renderer_flush` from `exec_list`, mostly `CMD_COPY_TEXTURE_TO_BUFFER`
+    readbacks (~1,500 of 6,311) and `CMD_COPY_BUFFER_TO_BUFFER` (~330).
+  - `blits 1` live, same match: ~17-18 fps in open play goes to 28-30 (the
+    game's 30 fps cap); `waits flush` drops from ~0.76 s to 0 per 2 s and
+    the game's own fence waits rise to ~0.5 s. Screenshots with it on look
+    right (open play, a set-piece camera).
+  - With blits on, the render thread is ~70% busy; its largest host costs
+    are `renderer_texture` (~12%: `upload_texture`'s per-texture change
+    checks, `fnv_sample`'s 4,096 strided reads and `hash_full` over
+    ~3,100 live textures, inlined) and `memmove` (~8%).
+  - GPU (`prof 1`, ~57 frames per 2 s): main pass `16f973400` ~9 ms per
+    frame, depth-only passes (1280x720 x3 and 0x0) ~12 ms, `16e6d5200`
+    ~3 ms; the rest is small.
+  - shtool now stops at the compiler constants (control section 0x6FC/
+    0x700) like the renderer: 426/437 translate; the 3b03/bf52/4016/...
+    "unknown instructions" were constant data. Real failures: bindless
+    handles not from c[2] (4 FS, 1 CS), 3a2c (2 CS), surface type 1
+    (2 CS), TXD.B de7a (2 FS).
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below

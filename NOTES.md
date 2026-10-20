@@ -1072,6 +1072,18 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   - `prof 1` misranked: the depth-only passes (~10 ms/frame there) are ~1.6 ms of real work; their own command buffer
     each added the wait to them. `prof 2`'s per-draw passes reload the attachments per draw (glyph quads `16ea35100`:
     11.3 ms/frame there, 0.15 in reality); use it only to rank draws within one pass.
+- GPU busy vs idle (2026-10-20, runs `build/g3`, `g4`; prof 3:120, prof 0:60). `prof 3` now also takes the union of
+  every stage interval (vertex, fragment, compute) per report: `busy` is GPU time with some stage running, `idle between
+  stages` the gaps under 1 ms (longer ones are between frames), and each tag gets the idle right before its stages.
+  **Open play: busy 11.5 ms per frame, idle between stages 1.05 ms** (g3). So the "~6.5 ms of command-buffer time that
+  isn't stage time" above is not idle GPU: command buffers overlap and their GPUStart..GPUEnd includes queueing, and
+  per-pass spans include the next pass's vertex stage running early (tiles). The stats line's `gpu` (sum of command
+  buffer times, 19-20 ms) overstates GPU work; the GPU sits idle ~2/3 of a 33 ms frame and would fit 60 fps.
+  - gmem windows were declared `MTLResourceUsageRead | Write` for every shader using LDG, which makes Metal order
+    later encoders using those pools after it. Now Write only for shaders with STG/ATOM/RED (`uses_gmem_store`, which the
+    MSL STG path never set); `FIFA_GMEM_RW=1` restores the old usage. g3 (new) vs g4 (old): busy 11.5 vs 13.3 ms and
+    idle 1.05 vs 1.43 per frame, but g4's scene drew 23% more (34.8k vs 28.2k draws per 2 s, CPU +15% too); per draw
+    the same (0.025 vs 0.023 ms). Correct, not a measurable win. Open play renders as before.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -1238,8 +1250,8 @@ round") and blits on by default ("Blits", "Match profile"). In order:
    `16e40c500` (texture handle from an indexed `LDC c[2][r + 0x168]` in a
    loop), surface type 1 = buffer images (3 CS, incl. `16eca9800`; needs
    texture buffers bound as images), `3a2c` VMNMX (2 CS), SUATOM.
-   GPU side (see "GPU profile with stage timestamps"): the main pass's vertex stage (2.6 ms; the 287 draws' VS,
-   incl. `gfind`'s window scan for global memory) and fragment stage (3.9 ms), and the waits between passes.
+   GPU side: not a bottleneck (busy ~11.5 ms per frame, ~1 ms idle between stages: "GPU busy vs idle"); the main
+   pass's vertex (2.6 ms, incl. `gfind`) and fragment (3.9 ms) stages only matter for 60 fps.
 6. Why open play is at 12-17 fps in the visible window (was 28-30):
    probably the P-core throttling found in "fps vs blits, benchmarked"; re-measure at thermal pressure 0
    with `tools/bench.py` (visible and hidden).

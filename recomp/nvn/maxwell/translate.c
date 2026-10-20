@@ -1909,6 +1909,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         int size = (int)bits(w, 48, 3);
         int64_t off = sbits(w, 20, 24);
         c->info->uses_gmem = true;
+        if (store) c->info->uses_gmem_store = true;
         char addr[256];
         if (a == RZ) sprintf(addr, "ulong(%lld)", (long long)off);
         else if (wide) sprintf(addr, "((ulong(%s) << 32 | ulong(%s)) + ulong(%lld))", R(a + 1), R(a), (long long)off);

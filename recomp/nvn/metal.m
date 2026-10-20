@@ -59,11 +59,19 @@ void backend_pool_destroyed(NvnPool *p) {
     pthread_mutex_unlock(&pools_lock);
 }
 
+// (under pools_lock) The last 4 pools found on this thread first: a draw's buffers alternate between a few pools.
 static PoolBuf *pool_find(uint64_t addr, uint64_t size) {
-    static __thread int last;
-    if (last < npools && addr >= pools[last].lo && addr + size <= pools[last].hi) return &pools[last];
+    static __thread int recent[4];
+    for (int k = 0; k < 4; k++) {
+        int i = recent[k];
+        if (i < npools && addr >= pools[i].lo && addr + size <= pools[i].hi) return &pools[i];
+    }
     for (int i = 0; i < npools; i++)
-        if (addr >= pools[i].lo && addr + size <= pools[i].hi) { last = i; return &pools[i]; }
+        if (addr >= pools[i].lo && addr + size <= pools[i].hi) {
+            memmove(recent + 1, recent, 3 * sizeof recent[0]);
+            recent[0] = i;
+            return &pools[i];
+        }
     return NULL;
 }
 
@@ -848,7 +856,7 @@ void backend_present(NvnTexture *t) {
         if (last_fps_time > 0)
             LOG("[metal] frame %llu %.1f fps (%s)\n", (unsigned long long)total_frames, frames / (now - last_fps_time),
                 renderer_stats());
-        renderer_profile_report();
+        renderer_profile_report((int)frames);
         frames = 0;
         last_fps_time = now;
     }

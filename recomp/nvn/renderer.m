@@ -101,14 +101,15 @@ const char *renderer_stats(void) {
         LOG("\n");
     }
     extern int g_tex_live;
-    extern uint64_t g_tex_live_bytes, g_tex_samples, g_tex_full, g_tex_full_bytes, g_tex_uploads;
+    extern uint64_t g_tex_live_bytes, g_tex_samples, g_tex_full, g_tex_full_bytes, g_tex_uploads, g_fn_cache_misses;
     struct task_vm_info vmi;
     mach_msg_type_number_t vn = TASK_VM_INFO_COUNT;
     uint64_t foot = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &vn) == KERN_SUCCESS ? vmi.phys_footprint : 0;
-    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped (%llu/%llu/%llu/%llu/%llu/%llu), %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms wait %.0fms, fbcopy %llu, blits %llu/%llu waited, rings %llu/%llu new %.0f MB (%.0f MB reused) | tex %d (%.0f MB) checks %llu sampled %llu full (%.0f MB) %llu uploads, views %d snaps %lu mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu", stat_draws, stat_skipped,
+    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped (%llu/%llu/%llu/%llu/%llu/%llu), %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms wait %.0fms, fbcopy %llu, blits %llu/%llu waited, rings %llu/%llu new %.0f MB (%.0f MB reused) | tex %d (%.0f MB) checks %llu sampled %llu full (%.0f MB) %llu uploads, views %d snaps %lu mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu | fn misses %llu", stat_draws, stat_skipped,
              skip_why[0], skip_why[1], skip_why[2], skip_why[3], skip_why[4], skip_why[5],
              stat_passes, stat_dispatches, stat_flushes, stat_gpu_s * 1000.0, (double)stat_wait_ns / 1e6 * 125.0 / 3.0, stat_compiles, stat_compile_ms, stat_compile_wait_ms, stat_feedback_copies,
-             stat_blits, stat_pend_waits, stat_rings, stat_rings_new, stat_ring_bytes / 1048576.0, stat_snap_reused / 1048576.0, g_tex_live, g_tex_live_bytes / 1048576.0, g_tex_samples, g_tex_full, g_tex_full_bytes / 1048576.0, g_tex_uploads, g_views_live, (unsigned long)(g_snap_copies ? g_snap_copies.count : 0), foot / 1048576.0, stat_wait_by[0] / 24e3, (unsigned long long)stat_wait_n[0], stat_wait_by[1] / 24e3, (unsigned long long)stat_wait_n[1], stat_wait_by[2] / 24e3, (unsigned long long)stat_wait_n[2]);
+             stat_blits, stat_pend_waits, stat_rings, stat_rings_new, stat_ring_bytes / 1048576.0, stat_snap_reused / 1048576.0, g_tex_live, g_tex_live_bytes / 1048576.0, g_tex_samples, g_tex_full, g_tex_full_bytes / 1048576.0, g_tex_uploads, g_views_live, (unsigned long)(g_snap_copies ? g_snap_copies.count : 0), foot / 1048576.0, stat_wait_by[0] / 24e3, (unsigned long long)stat_wait_n[0], stat_wait_by[1] / 24e3, (unsigned long long)stat_wait_n[1], stat_wait_by[2] / 24e3, (unsigned long long)stat_wait_n[2], g_fn_cache_misses);
+    g_fn_cache_misses = 0;
     stat_compiles = 0;
     g_tex_samples = g_tex_full = g_tex_full_bytes = g_tex_uploads = 0;
     stat_feedback_copies = stat_blits = stat_pend_waits = stat_rings = stat_rings_new = stat_ring_bytes = stat_snap_reused = 0;
@@ -262,7 +263,7 @@ static void drain_gone(void) {
 
 #define PROF_N 512
 // s: seconds (levels 1, 2) or GPU timestamp ticks (level 3, with v/f the vertex and fragment stages' ticks)
-static struct { char tag[64]; double s, v, f; int n; } prof[PROF_N];
+static struct { char tag[64]; double s, v, f, g; int n; } prof[PROF_N];  // g: GPU idle right before its stages (level 3)
 static int nprof;
 static pthread_mutex_t prof_lock = PTHREAD_MUTEX_INITIALIZER;
 static void prof_add3(const char *tag, double s, double v, double f) {
@@ -271,11 +272,23 @@ static void prof_add3(const char *tag, double s, double v, double f) {
     while (i < nprof && strcmp(prof[i].tag, tag)) i++;
     if (i == nprof && nprof < PROF_N) {
         snprintf(prof[nprof].tag, sizeof prof[0].tag, "%s", tag);
-        prof[nprof].s = prof[nprof].v = prof[nprof].f = 0;
+        prof[nprof].s = prof[nprof].v = prof[nprof].f = prof[nprof].g = 0;
         prof[nprof++].n = 0;
     }
     if (i < nprof) { prof[i].s += s; prof[i].v += v; prof[i].f += f; prof[i].n++; }
     pthread_mutex_unlock(&prof_lock);
+}
+// Level 3: every stage interval (vertex, fragment, compute) since the last report, with its tag, for the GPU's busy
+// time (their union) and the idle gaps; each gap is charged to the tag whose stage ends it.
+#define SPAN_N 65536
+static struct span { uint64_t lo, hi; char tag[56]; } spans[SPAN_N];
+static int nspans;
+static void span_add(uint64_t lo, uint64_t hi, const char *tag) {  // (under prof_lock)
+    if (nspans < SPAN_N && hi > lo) { spans[nspans].lo = lo; spans[nspans].hi = hi; memcpy(spans[nspans].tag, tag, 56); nspans++; }
+}
+static int span_cmp(const void *a, const void *b) {
+    uint64_t x = ((const struct span *)a)->lo, y = ((const struct span *)b)->lo;
+    return x < y ? -1 : x > y;
 }
 static void prof_add(const char *tag, double s) { prof_add3(tag, s, 0, 0); }
 
@@ -371,6 +384,12 @@ static void ts_resolve(struct ts_ent *e, int n) {
             lo = t[0].timestamp; hi = t[1].timestamp;
         }
         if (hi > lo) prof_add3(e[k].tag, hi - lo, v, f);
+        pthread_mutex_lock(&prof_lock);
+        if (e[k].n == 4) {
+            if (v) span_add(t[0].timestamp, t[1].timestamp, e[k].tag);
+            if (f) span_add(t[2].timestamp, t[3].timestamp, e[k].tag);
+        } else if (hi > lo) span_add((uint64_t)lo, (uint64_t)hi, e[k].tag);
+        pthread_mutex_unlock(&prof_lock);
     }
 }
 
@@ -379,9 +398,33 @@ static int prof_cmp(const void *a, const void *b) {
     return x < y ? 1 : x > y ? -1 : 0;
 }
 
-void renderer_profile_report(void) {
+void renderer_profile_report(int frames) {
     if (!gpu_profile()) return;
     pthread_mutex_lock(&prof_lock);
+    // busy = union of the stage intervals; a gap shorter than 1 ms is idle inside a frame (longer: between frames,
+    // the CPU's turn, not counted)
+    double busy = 0, idle = 0;
+    if (nspans) {
+        qsort(spans, nspans, sizeof spans[0], span_cmp);
+        uint64_t end = spans[0].hi;
+        busy = (double)(spans[0].hi - spans[0].lo);
+        for (int i = 1; i < nspans; i++) {
+            if (spans[i].lo > end) {
+                uint64_t gap = spans[i].lo - end;
+                if (gap < 1000000) {
+                    idle += (double)gap;
+                    for (int k = 0; k < nprof; k++)
+                        if (!strcmp(prof[k].tag, spans[i].tag)) { prof[k].g += (double)gap; break; }
+                }
+                busy += (double)(spans[i].hi - spans[i].lo);
+                end = spans[i].hi;
+            } else if (spans[i].hi > end) {
+                busy += (double)(spans[i].hi - end);
+                end = spans[i].hi;
+            }
+        }
+        nspans = 0;
+    }
     qsort(prof, nprof, sizeof prof[0], prof_cmp);
     if (gpu_profile() == 3 && ts_buf) {
         // GPU ticks -> seconds: against the CPU clock (ns) since ts_init; 1 ns per tick on Apple silicon
@@ -390,10 +433,12 @@ void renderer_profile_report(void) {
         double sc = g1 > ts_gpu0 ? (double)(c1 - ts_cpu0) * 1e-9 / (double)(g1 - ts_gpu0) : 1e-9;
         double tot = 0;
         for (int i = 0; i < nprof; i++) tot += prof[i].s;
-        LOG("[prof] stage timestamps: %.1f ms summed over %d tags (%.3g ns/tick)\n", tot * sc * 1e3, nprof, sc * 1e9);
+        LOG("[prof] stage timestamps: %.1f ms summed over %d tags (%.3g ns/tick); per frame (%d): busy %.2f ms, idle "
+            "between stages %.2f ms\n", tot * sc * 1e3, nprof, sc * 1e9, frames, frames ? busy * sc * 1e3 / frames : 0,
+            frames ? idle * sc * 1e3 / frames : 0);
         for (int i = 0; i < nprof && i < 40; i++)
-            LOG("[prof] %6.1f ms %5d x  %-44s vtx %5.1f frag %5.1f\n", prof[i].s * sc * 1e3, prof[i].n, prof[i].tag,
-                prof[i].v * sc * 1e3, prof[i].f * sc * 1e3);
+            LOG("[prof] %6.1f ms %5d x  %-44s vtx %5.1f frag %5.1f idle before %5.1f\n", prof[i].s * sc * 1e3, prof[i].n,
+                prof[i].tag, prof[i].v * sc * 1e3, prof[i].f * sc * 1e3, prof[i].g * sc * 1e3);
     } else
     for (int i = 0; i < nprof && i < (gpu_profile() == 2 ? 40 : 12); i++) LOG("[prof] %6.1f ms %5d x  %s\n", prof[i].s * 1e3, prof[i].n, prof[i].tag);
     nprof = 0;
@@ -1707,6 +1752,12 @@ static CsProg *compute_program(NvnProgram *p) {
 // buffer; shaders read zeros outside it. win = {GPU address of the pool buffer, its guest address, its size, 0}.
 // gfind windows (GMEM_WINDOWS, shader.h): the memory pools of the stage's storage buffers, then of its uniform
 // buffers; unused entries have size 0. Returns the count; bufs gets the pool buffers (for useResource).
+// FIFA_GMEM_RW=1: declare the windows written even for shaders without STG/ATOM/RED (the old behaviour, for A/B runs)
+static MTLResourceUsage gmem_usage(ShaderInfo *si) {
+    static int rw = -1;
+    if (rw < 0) rw = getenv("FIFA_GMEM_RW") != NULL;
+    return si->uses_gmem_store || rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead;
+}
 static int gmem_windows(int stage, uint64_t win[GMEM_WINDOWS][4], __unsafe_unretained id<MTLBuffer> bufs[GMEM_WINDOWS]) {
     memset(win, 0, sizeof(uint64_t) * 4 * GMEM_WINDOWS);
     int n = 0;
@@ -1876,7 +1927,9 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         uint64_t win[GMEM_WINDOWS][4];
         __unsafe_unretained id<MTLBuffer> bufs[GMEM_WINDOWS];
         int n = gmem_windows(5, win, bufs);
-        for (int k = 0; k < n; k++) [ce useResource:bufs[k] usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        // (Write only with STG: a write makes Metal's hazard tracking order later encoders using that pool after it)
+        MTLResourceUsage u = gmem_usage(si);
+        for (int k = 0; k < n; k++) [ce useResource:bufs[k] usage:u];
         [ce setBytes:win length:sizeof win atIndex:GMEM_BUFFER_INDEX];
     }
     CST("textures");
@@ -2553,8 +2606,9 @@ static void draw(CmdRec *r, bool indexed) {
         uint64_t win[GMEM_WINDOWS][4];
         __unsafe_unretained id<MTLBuffer> bufs[GMEM_WINDOWS];
         int n = gmem_windows(sg, win, bufs);
+        MTLResourceUsage u = gmem_usage(sg ? pr->fi : pr->vi);
         for (int k = 0; k < n; k++)
-            [enc useResource:bufs[k] usage:MTLResourceUsageRead | MTLResourceUsageWrite stages:sg ? MTLRenderStageFragment : MTLRenderStageVertex];
+            [enc useResource:bufs[k] usage:u stages:sg ? MTLRenderStageFragment : MTLRenderStageVertex];
         if (sg) [enc setFragmentBytes:win length:sizeof win atIndex:GMEM_BUFFER_INDEX];
         else [enc setVertexBytes:win length:sizeof win atIndex:GMEM_BUFFER_INDEX];
     }

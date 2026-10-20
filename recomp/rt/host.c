@@ -92,6 +92,7 @@ uint64_t host_symbol_addr(const char *name, uint64_t lo, uint64_t hi) {
  * the program's text spans well under 8 GB), so a hit is one load and threads share it without locks. */
 #define FN_CACHE_BITS 16
 static _Atomic uint64_t fn_cache[1u << FN_CACHE_BITS];
+uint64_t g_fn_cache_misses;  /* (stats line; racy, approximate) */
 
 static const A64Fn *find_fn(uint64_t t) {
   unsigned lo = 0, hi = a64_fn_count;
@@ -106,6 +107,7 @@ static A64Func cached_fn(uint64_t t) {
   uint32_t slot = (uint32_t)((t >> 2) ^ (t >> (2 + FN_CACHE_BITS))) & ((1u << FN_CACHE_BITS) - 1);
   uint64_t e = atomic_load_explicit(&fn_cache[slot], memory_order_relaxed);
   if (e >> 32 == t && t) return (A64Func)((intptr_t)a64_call + (intptr_t)(int32_t)(uint32_t)e * 4);
+  g_fn_cache_misses++;
   const A64Fn *f = find_fn(t);
   if (!f) return 0;
   intptr_t d = ((intptr_t)f->fn - (intptr_t)a64_call) / 4;

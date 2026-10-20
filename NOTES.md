@@ -291,8 +291,8 @@ notice, the favourite-team setup and reaches the main menu (FC News,
 Ultimate Team, Kick Off, ...) at 30 fps on the Metal executor, driven by
 keyboard, gamepad, `FIFA_PRESS` scripts or `FIFA_CONTROL` (see "Input"
 below). Kick Off plays a full match (Bournemouth v Brighton: 3D scene, HUD,
-half-time) at ~3-4 fps, GPU-bound on one compute shader (see "Match
-performance, second round"). The
+half-time) at 28-30 fps in open play (the game's 30 fps cap) with buffer
+copies and readbacks as GPU blits (see "Blits" and "Match profile"). The
 worker-thread crashes were an exclusive-store ordering bug (see "Worker
 thread crashes" below); 8 runs of 2-3 minutes since, none crashed. The rest of
 this section is the history that led here, oldest first.
@@ -558,7 +558,8 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   Keyboard and gamepad paths are untested so far (runs were hidden).
   `FIFA_CONTROL=<fifo>` drives a running game: `echo 'down 4; a; wait 60;
   shot' > fifo` (commands in `input.m`: `<button> [n]`, `hold`, `stick`,
-  `wait`, `shot [path]`, default `build/live.png`, `debug`), so menus can be
+  `wait`, `shot [path]`, default `build/live.png`, `debug`, `prof <n>`,
+  `csdump [n]`, `blits <0|1>`), so menus can be
   walked one screenshot at a time without rebooting; `tools/tomatch.py`
   drives it from boot to Kick Off's match.
 - Kick Off (2026-10-19): main menu -> Kick Off -> welcome pages -> gameplay
@@ -916,10 +917,12 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   readbacks as in-order GPU blits (`blit_buffer`, pending ranges checked by
   `renderer_cpu_access` before the renderer's own CPU reads/writes of guest
   memory). On by default since the profile below (17 -> 30 fps); the
-  control command `blits 0` restores the drain + CPU copy. With blits off the match runs at
-  ~17 fps in open play (gpu ~1.1 s and `waits flush` ~0.76 s/105 per 2 s;
-  stats now print `blits <n>/<drains> waited`). Each run still shows ~4,300
-  skipped draws per 2 s, all reason 1 (program not ready).
+  control command `blits 0` restores the drain + CPU copy. With blits off
+  the match runs at ~17 fps in open play (gpu ~1.1 s and `waits flush` ~0.76 s/105 per 2 s;
+  stats now print `blits <n>/<drains> waited`). With blits off each run
+  showed ~4,300 skipped draws per 2 s, all reason 1 (no program: failed
+  translation or not compiled); with blits on in the same match ~120, not
+  explained yet.
   - The `[tex] type mismatch: want 2 have 7 (32x32x32 ...)` line now names
     the program and slot: FS `16ebcaf00` t2 (separate texture 1, c[2]
     0x170). The FS computes `t2.rgb * cb3[4].y + lut * (1 - t2.a *
@@ -1091,8 +1094,8 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
 ## Next steps
 
 Kick Off plays a full match (loading cards, line-ups, 3D scene, HUD,
-half-time) at ~12 fps since the barrier fix ("Match performance, third
-round"). In order:
+half-time) at 28-30 fps since the barrier fix ("Match performance, third
+round") and blits on by default ("Blits", "Match profile"). In order:
 
 1. ~~`16dff9100`~~ done (divergent barriers, SR_LANEID / lane masks).
 2. Then the remaining performance items from the second round: ~~GPU drains
@@ -1105,11 +1108,11 @@ round"). In order:
    binding, harmless (see "Blits").
 4. Visual pass over the match: shadows, reflections, the remaining ~10
    skipped draws per frame (`16fd3ac00`, `171855700` TXD.B).
-5. Shader coverage (`build/shtool` over the dumps): 407/437 translate; the
-   rest are unknown 3b03 (7 FS), bindless handles not from c[2] (4 FS, 1
-   CS: indexed `LDC c[2][r + ...]`), TXD.B `de7a` (2), surface type 1 (2
-   CS), 3a2c (2 CS), SUATOM, and a few words that are probably constant
-   data past the code (bf52, bf82, 4016, ...).
+5. Shader coverage (`build/shtool` over the dumps, now bounded by the
+   compiler constants): 426/437 translate; the rest are bindless handles
+   not from c[2] (4 FS `16e40c500` `16fcd1300` `16fd3ac00` `171838a00`,
+   1 CS: indexed `LDC c[2][r + ...]`), TXD.B `de7a` (2 FS), surface type 1
+   (2 CS), 3a2c (2 CS), SUATOM.
 6. Try the keyboard and a gamepad in the visible window; audio output for
    `audout.c`'s sink thread; the dark Continue button on the accessibility
    screen (seen before the threading fix; check if it still happens).

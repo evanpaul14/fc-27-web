@@ -31,7 +31,7 @@ static uint64_t skip_why[6];  // no program, program not ready, pipeline compili
 static void skip_log(int n);
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
 static uint64_t stat_blits, stat_pend_waits;  // copies run as blits in command order; drains because the CPU touched one
-static uint64_t stat_rings, stat_rings_new;  // uniform rings started (wraps), of them newly allocated
+static uint64_t stat_rings, stat_rings_new, stat_ring_bytes, stat_snap_reused;  // uniform rings started (wraps), newly allocated; bytes copied
 static _Atomic uint64_t g_done_seq;  // highest submission whose command buffer has completed
 static double stat_gpu_s;
 static uint64_t g_gpu_total_ns;  // GPU time of all completed command buffers
@@ -43,7 +43,7 @@ static NvnTexture *snap_tex[8];
 static bool snap_ok[8];
 static uint64_t op_counts[CMD_COUNT];
 extern bool g_debug_frame;
-static char stats_text[320];
+static char stats_text[2048];
 
 // ------------------------------------------------------------------ state
 typedef struct {
@@ -101,16 +101,17 @@ const char *renderer_stats(void) {
         LOG("\n");
     }
     extern int g_tex_live;
-    extern uint64_t g_tex_live_bytes;
+    extern uint64_t g_tex_live_bytes, g_tex_samples, g_tex_full, g_tex_full_bytes, g_tex_uploads;
     struct task_vm_info vmi;
     mach_msg_type_number_t vn = TASK_VM_INFO_COUNT;
     uint64_t foot = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &vn) == KERN_SUCCESS ? vmi.phys_footprint : 0;
-    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped (%llu/%llu/%llu/%llu/%llu/%llu), %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms wait %.0fms, fbcopy %llu, blits %llu/%llu waited, rings %llu/%llu new | tex %d (%.0f MB) views %d snaps %lu mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu", stat_draws, stat_skipped,
+    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped (%llu/%llu/%llu/%llu/%llu/%llu), %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms wait %.0fms, fbcopy %llu, blits %llu/%llu waited, rings %llu/%llu new %.0f MB (%.0f MB reused) | tex %d (%.0f MB) checks %llu sampled %llu full (%.0f MB) %llu uploads, views %d snaps %lu mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu", stat_draws, stat_skipped,
              skip_why[0], skip_why[1], skip_why[2], skip_why[3], skip_why[4], skip_why[5],
              stat_passes, stat_dispatches, stat_flushes, stat_gpu_s * 1000.0, (double)stat_wait_ns / 1e6 * 125.0 / 3.0, stat_compiles, stat_compile_ms, stat_compile_wait_ms, stat_feedback_copies,
-             stat_blits, stat_pend_waits, stat_rings, stat_rings_new, g_tex_live, g_tex_live_bytes / 1048576.0, g_views_live, (unsigned long)(g_snap_copies ? g_snap_copies.count : 0), foot / 1048576.0, stat_wait_by[0] / 24e3, (unsigned long long)stat_wait_n[0], stat_wait_by[1] / 24e3, (unsigned long long)stat_wait_n[1], stat_wait_by[2] / 24e3, (unsigned long long)stat_wait_n[2]);
+             stat_blits, stat_pend_waits, stat_rings, stat_rings_new, stat_ring_bytes / 1048576.0, stat_snap_reused / 1048576.0, g_tex_live, g_tex_live_bytes / 1048576.0, g_tex_samples, g_tex_full, g_tex_full_bytes / 1048576.0, g_tex_uploads, g_views_live, (unsigned long)(g_snap_copies ? g_snap_copies.count : 0), foot / 1048576.0, stat_wait_by[0] / 24e3, (unsigned long long)stat_wait_n[0], stat_wait_by[1] / 24e3, (unsigned long long)stat_wait_n[1], stat_wait_by[2] / 24e3, (unsigned long long)stat_wait_n[2]);
     stat_compiles = 0;
-    stat_feedback_copies = stat_blits = stat_pend_waits = stat_rings = stat_rings_new = 0;
+    g_tex_samples = g_tex_full = g_tex_full_bytes = g_tex_uploads = 0;
+    stat_feedback_copies = stat_blits = stat_pend_waits = stat_rings = stat_rings_new = stat_ring_bytes = stat_snap_reused = 0;
     stat_compile_ms = stat_compile_wait_ms = 0;
     memset(skip_why, 0, sizeof skip_why);
     stat_draws = stat_skipped = stat_passes = stat_dispatches = stat_flushes = stat_wait_ns = 0;
@@ -779,11 +780,28 @@ static uint64_t ring_alloc(const void *data, uint64_t size) {
         aligned = 0;
     }
     memcpy((uint8_t *)ring.contents + aligned, data, size);
+    stat_ring_bytes += size;
     ring_off = aligned + size;
     return aligned;
 }
 
 static void ring_reset(void) { ring_off = 0; ring_gen++; }
+
+// A snapshot of guest uniforms: reuses the last copy of the same range in this ring while the memory still matches it
+// (draws rebind the same per-frame / per-view constants many times).
+#define SNAP_SLOTS 4096
+static struct { uint64_t addr, size, gen, off; } snap_last[SNAP_SLOTS];
+static uint64_t ring_snapshot(uint64_t addr, uint64_t size) {
+    const uint8_t *p = gptr(addr);
+    typeof(snap_last[0]) *e = &snap_last[((addr >> 4) ^ (addr >> 16) ^ size) & (SNAP_SLOTS - 1)];
+    if (e->gen == ring_gen && ring && e->addr == addr && e->size == size) {
+        cpu_read_ptr(p, size);  // (blits writing it land first)
+        if (!memcmp(p, (const uint8_t *)ring.contents + e->off, size)) { stat_snap_reused += size; return e->off; }
+    }
+    uint64_t off = ring_alloc(p, size);
+    *e = (typeof(*e)){addr, size, ring_gen, off};
+    return off;
+}
 
 // Bind guest memory [addr, addr+size) as a buffer: zero-copy inside a memory pool, copied otherwise.
 static void bind_guest(id<MTLRenderCommandEncoder> e, bool vertex_stage, uint64_t addr, uint64_t size, int index) {
@@ -1508,7 +1526,7 @@ static void bind_cbufs(int stage, ShaderInfo *si) {
         if ((si->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;  // indexed: whole buffer
         if (size > r.size && r.size) size = r.size;
         if (size < 16) size = 16;
-        uint64_t off = ring_alloc(gptr(r.addr), size);  // snapshot, as later CPU writes must not leak in
+        uint64_t off = ring_snapshot(r.addr, size);  // snapshot, as later CPU writes must not leak in
         if (stage == 0) [enc setVertexBuffer:ring offset:off atIndex:k];
         else [enc setFragmentBuffer:ring offset:off atIndex:k];
     }
@@ -1717,7 +1735,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
                 if ((si->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;
                 if (size > r.size && r.size) size = r.size;
                 if (size < 16) size = 16;
-                off = ring_alloc(gptr(r.addr), size);
+                off = ring_snapshot(r.addr, size);
             } else {
                 static const uint8_t zeros[0x10000];
                 off = ring_alloc(zeros, size);

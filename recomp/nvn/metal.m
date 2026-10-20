@@ -316,6 +316,7 @@ void backend_texture_destroyed(NvnTexture *t) {
 }
 
 static uint64_t g_frame_counter;  // presents so far (texture change detection runs once per frame)
+uint64_t g_tex_samples, g_tex_full, g_tex_full_bytes, g_tex_uploads;  // change checks since the last stats line
 static uint64_t full_hash_budget, full_hash_budget_frame;
 
 // Both hash a texture's runs in place (nvn_texture_spans); runs other than the last are whole pages, so the value
@@ -336,15 +337,29 @@ static uint64_t hash_full(const NvnSpan *s, int ns, uint64_t n) {
     return h;
 }
 
+// Cheap change detector: hash 512 cache lines spread over the data (a strided sample of single bytes touched 4,096
+// lines, each a cache and often a TLB miss; a rewrite of a texture changes many of these lines too).
 static uint64_t fnv_sample(const NvnSpan *s, int ns, uint64_t n) {
-    // cheap change detector: hash a strided sample of the data
     uint64_t h = 1469598103934665603ull;
-    uint64_t step = n > 4096 ? n / 4096 : 1, base = 0;
+    uint64_t lines = n / 64 < 512 ? n / 64 : 512;
+    uint64_t step = lines ? (n / lines) & ~63ull : n, base = 0;
+    if (!lines) lines = 1;
     int k = 0;
-    for (uint64_t i = 0; i < n; i += step) {
+    for (uint64_t i = 0, l = 0; l < lines && i < n; l++, i += step) {
         while (k < ns && i >= base + s[k].n) base += s[k++].n;
         if (k == ns) break;
-        h ^= s[k].p[i - base]; h *= 1099511628211ull;
+        const uint8_t *p = s[k].p + (i - base);
+        uint64_t m = base + s[k].n - i;
+        if (m > 64) m = 64;
+        if (m == 64) {
+            for (int j = 0; j < 8; j++) {
+                uint64_t v;
+                memcpy(&v, p + 8 * j, 8);
+                h = (h ^ v) * 1099511628211ull;
+            }
+        } else {
+            for (uint64_t j = 0; j < m; j++) h = (h ^ p[j]) * 1099511628211ull;
+        }
     }
     return h ^ n;
 }
@@ -414,13 +429,16 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
     }
     bool full = b->dynamic || !b->uploaded || ENV("FIFA_TEX_FULLHASH");
     if (!full && g_frame_counter - b->full_frame >= 120 && full_hash_budget >= total) { full = true; full_hash_budget -= total; }
+    if (!full) g_tex_samples++;
     if (!full && fnv_sample(sp, ns, total) == b->sample_hash) { free(tmp); return; }
+    g_tex_full++; g_tex_full_bytes += total;
     uint64_t h = hash_full(sp, ns, total);
     b->full_frame = g_frame_counter;
     b->sample_hash = fnv_sample(sp, ns, total);
     if (b->uploaded && h == b->data_hash) { free(tmp); return; }
     if (!mem && !(mem = nvn_texture_data(t, total, &tmp))) return;
     if (b->uploaded) b->dynamic = true;
+    g_tex_uploads++;
     b->data_hash = h;
     b->uploaded = true;
     // callers without an encoder get a private upload command buffer, created only when needed

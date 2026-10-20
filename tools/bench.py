@@ -124,6 +124,7 @@ for i, seg in enumerate(plan.split(',')):
     else:
         time.sleep(int(secs))
     send('shot %s' % os.path.join(out, 'seg%d.png' % i))
+time.sleep(3)  # (the last shot is written by the next present)
 mark('end')
 stop = True
 game.kill()

@@ -1010,6 +1010,16 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   `SimulationTime.ForceSimRate 30.0f`, `TargetFpsIs60`); `fps 0` stops the pacer sleeping and costs ~2x CPU and GPU
   per frame (0.55 Gi, 131 ms CPU) for ~20 fps, and heats the machine into throttling. So the cap stays the game's.
   Other timed waits are polling threads with fixed sleeps (2, 2.7, 4, 5, 16, 30, 50 ms), ~3k wakeups/s.
+  Second lock (b8, b9): with `fps 60` the pacer does tick at 60 Hz (and polls 1 ms waits at `ad4b4bc` for the frame
+  to finish), the main loop thread (`1202ec18`, which slept ~7.7 ms per frame at the cap) no longer sleeps, and frames
+  still land on 30; `fps 40` gives 29.7. The critical path is the three job workers: command-list submission
+  (`nvnQueueSubmitCommands` -> `exec_list`) on them, plus ~1,900 of ~19k samples in `nvnSyncWait` on the GPU.
+- CPU cost per frame, second round (b9 counters, b10): per 2 s ~460-2,400 sampled texture checks, 8-317 full
+  hashes (1-55 MB), ~0-1 uploads; 240-760 MB through `ring_alloc`. `fnv_sample` now hashes 512 whole cache lines
+  instead of 4,096 bytes on 4,096 lines, and uniform snapshots reuse the last copy of the same range in the ring
+  while the memory still matches it (`ring_snapshot`: ~270 of ~560 MB per 2 s reused). Result: 0.308-0.325 Gi and
+  52.7-53.7 CPU ms per frame, within noise of b7 (0.314 / 52.5). Next: line-level profile of `renderer_texture`
+  (b8: ~1,450 of 6,261 samples on the busiest worker, under `bind_textures`).
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below

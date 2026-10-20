@@ -28,11 +28,11 @@ def load(d):
     end = [t for t, s in marks if s == 'end']
     bounds = [(t, segs[i + 1][0] if i + 1 < len(segs) else (end[0] if end else 1e9), s) for i, (t, s) in enumerate(segs)]
     fps = []  # (t, frame, gpu ms, wait fence, wait flush)
-    rx = re.compile(r'^([\d.]+) \[metal\] frame (\d+) [\d.]+ fps .*?gpu (\d+)ms.*?mem (\d+) MB.*?waits fence (\d+)ms/\d+ flush (\d+)ms')
+    rx = re.compile(r'^([\d.]+) \[metal\] frame (\d+) [\d.]+ fps .*?gpu (\d+)ms.*?mem (\d+) MB(?:.*?waits fence (\d+)ms/\d+ flush (\d+)ms)?')
     for line in open(os.path.join(d, 'game.log'), errors='replace'):
         m = rx.match(line)
         if m:
-            fps.append(tuple(float(x) for x in m.groups()))
+            fps.append(tuple(float(x) if x is not None else 0.0 for x in m.groups()))
     cores = []
     cx = re.compile(r'^([\d.]+) cpu ([\d.]+) P ([\d.]+) E ([\d.]+) .*?Ginst ([\d.]+) P ([\d.]+) .*?GHz all [\d.]+ P ([\d.]+)(?:.*thermal (\d+))?')
     path = os.path.join(d, 'cores.log')

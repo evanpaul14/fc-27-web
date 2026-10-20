@@ -4,7 +4,8 @@
   python3 -I tools/benchsum.py build/b5 [build/b6 ...] [--skip S]
 
 Per segment (from marks.log), skipping its first S seconds (default 10): fps, giga-instructions per frame (all cores;
-the clock-independent CPU cost), CPU ms per frame and the share on P cores, the P clock, GPU ms per frame and the
+the clock-independent CPU cost), CPU ms per frame and the share on P cores, the P clock, GPU ms per frame (summed command-buffer times, which overlap:
+an upper bound; `prof 3`'s busy time is the real GPU load) and the
 waits from the renderer's stats line, and the last line's live textures / memory.
 """
 import os

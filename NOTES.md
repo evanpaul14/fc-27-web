@@ -284,7 +284,7 @@ from the roots (215k functions), which rewrites every unit and costs a full
   functions that return the next guest address to a driver loop; compile
   time is superlinear in function size otherwise.
 
-## Status (2026-10-19)
+## Status (2026-10-20)
 
 Current state: with the update (`FIFA_ROMFS=extracted/update/romfs_program.json`)
 the game plays the EA SPORTS intro, the title ("Let's Play!"), the offline
@@ -293,7 +293,10 @@ Ultimate Team, Kick Off, ...) at 30 fps on the Metal executor, driven by
 keyboard, gamepad, `FIFA_PRESS` scripts or `FIFA_CONTROL` (see "Input"
 below). Kick Off plays a full match (Bournemouth v Brighton: 3D scene, HUD,
 half-time) at 28-30 fps in open play (the game's 30 fps cap) with buffer
-copies and readbacks as GPU blits (see "Blits" and "Match profile"). The
+copies and readbacks as GPU blits (see "Blits" and "Match profile"). Per frame
+in open play (hidden, no thermal pressure) the CPU takes ~28-30 ms and the GPU
+is busy ~11.5 ms of the 33 ms ("GPU busy vs idle", "Host thunks in
+`a64_call`"). The
 worker-thread crashes were an exclusive-store ordering bug (see "Worker
 thread crashes" below); 8 runs of 2-3 minutes since, none crashed. The rest of
 this section is the history that led here, oldest first.
@@ -1068,7 +1071,8 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   - Gaps: several passes span far more than their stages (0x0 depth 4.8 ms span for 0.96 of work, 1280x720 depth
     5.3 for 0.64, `16e6d5200` 2.4 for 0.08, `16fc74000` 0.73 for 0.02): they wait for earlier work before starting
     (Metal's hazard tracking on resources written just before, or the blits between passes). With the ~6.5 ms of
-    command-buffer time that isn't stage time, that's the other place to look.
+    command-buffer time that isn't stage time, that's the other place to look. (Superseded by "GPU busy vs idle"
+    below: those spans include stages of other passes running at the same time; the GPU is idle only ~1 ms a frame.)
   - `prof 1` misranked: the depth-only passes (~10 ms/frame there) are ~1.6 ms of real work; their own command buffer
     each added the wait to them. `prof 2`'s per-draw passes reload the attachments per draw (glyph quads `16ea35100`:
     11.3 ms/frame there, 0.15 in reality); use it only to rank draws within one pass.
@@ -1238,18 +1242,24 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
 
 Kick Off plays a full match (loading cards, line-ups, 3D scene, HUD,
 half-time) at 28-30 fps since the barrier fix ("Match performance, third
-round") and blits on by default ("Blits", "Match profile"). In order:
+round") and blits on by default ("Blits", "Match profile"). Performance is
+at the cap with room on both sides (CPU ~28-30 ms, GPU busy ~11.5 ms of 33),
+so the visual pass (4) comes next. In order:
 
 1. ~~`16dff9100`~~ done (divergent barriers, SR_LANEID / lane masks).
 2. Then the remaining performance items from the second round: ~~GPU drains
    on `CMD_COPY_BUFFER_TO_BUFFER` / `CMD_COPY_TEXTURE_TO_BUFFER`~~ (blits,
    on by default), ~~`a64_call` lookups, texture gathers, ring allocation,
    constant copies~~ ("CPU cost per frame, first round"), `upload_texture`'s
-   per-frame change checks, `gfind`'s window scan, the ~10 MB/frame of
-   uniform snapshots, ~~guest registers across guest stores~~ (`restrict`,
-   -O2), ~~structured loops~~ (already gotos), ~~thunk calls missing `a64_call`'s cache~~. What's left is
-   spread thin (~1% each, see "Host thunks in `a64_call`"); the CPU is at ~28-30 ms of the 33 ms frame. Measure each with `tools/bench.py` + `tools/benchsum.py`
-   (cost per frame), never while building.
+   per-frame change checks and the ~10 MB/frame of uniform snapshots (~1%
+   of busy samples each now), ~~guest registers across guest stores~~
+   (`restrict`, -O2), ~~structured loops~~ (already gotos), ~~thunk calls
+   missing `a64_call`'s cache~~. What's left is spread thin (see "Host thunks
+   in `a64_call`"): ~50% guest code over hundreds of functions, `a64_call`'s
+   indirect calls ~6%. A further real gain needs a translator change (e.g.
+   guest registers passed between functions instead of through `CPU`).
+   Measure with `tools/bench.py` + `tools/benchsum.py` (cost per frame; draws
+   per 2 s differ between runs, compare them too), never while building.
    The second 30 fps lock (see "The 30 fps cap"): find it with `fps 60` and
    `FIFA_LOG_WAITS=1`, if uncapping is still wanted.
 3. ~~The black 3D scene for part of the first half~~ fixed by the lane
@@ -1264,9 +1274,9 @@ round") and blits on by default ("Blits", "Match profile"). In order:
    texture buffers bound as images), `3a2c` VMNMX (2 CS), SUATOM.
    GPU side: not a bottleneck (busy ~11.5 ms per frame, ~1 ms idle between stages: "GPU busy vs idle"); the main
    pass's vertex (2.6 ms, incl. `gfind`) and fragment (3.9 ms) stages only matter for 60 fps.
-6. Why open play is at 12-17 fps in the visible window (was 28-30):
-   probably the P-core throttling found in "fps vs blits, benchmarked"; re-measure at thermal pressure 0
-   with `tools/bench.py` (visible and hidden).
+6. Open play at 12-17 fps in the visible window: hidden runs at thermal
+   pressure 0-2 (g2-g4, b17, b18) all hold 29.8-30 fps, so it was the P-core
+   throttling ("fps vs blits, benchmarked"). Not re-measured visible.
 7. Try the keyboard and a gamepad in the visible window; audio output for
    `audout.c`'s sink thread; the dark Continue button on the accessibility
    screen (seen before the threading fix; check if it still happens).

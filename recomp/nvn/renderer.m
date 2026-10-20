@@ -162,7 +162,8 @@ static uint32_t tex_wh[2][64][2];       // per bound texture slot: guest size
 // (inflated more by reloading the attachments per draw; compare programs within a run). FIFA_GPU_PROFILE=3:
 // stage-boundary timestamps on every render pass and compute dispatch, submitted as without profiling, so the
 // times are real; passes also get their vertex and fragment time (tiles: a pass's vertex stage can overlap the
-// previous pass's fragments, so the per-pass totals add up to more than the frame).
+// previous pass's fragments, so the per-pass totals add up to more than the frame). Level 3 also logs per frame the
+// GPU's busy time (union of all stage intervals) and the idle between stages, and per tag the idle right before it.
 // FIFA_CONTROL "prof <n>" changes the level while running.
 static int gpu_profile(void) {
     static int on = -1;

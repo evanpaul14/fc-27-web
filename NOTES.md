@@ -1084,6 +1084,17 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     MSL STG path never set); `FIFA_GMEM_RW=1` restores the old usage. g3 (new) vs g4 (old): busy 11.5 vs 13.3 ms and
     idle 1.05 vs 1.43 per frame, but g4's scene drew 23% more (34.8k vs 28.2k draws per 2 s, CPU +15% too); per draw
     the same (0.025 vs 0.023 ms). Correct, not a measurable win. Open play renders as before.
+- Host thunks in `a64_call` (runs `build/b17`, `b18`; the stats line now ends with `fn misses`: calls that missed
+  `fn_cache`). b17: ~1.13M misses per 2 s (~9k a frame), almost all calls to host thunks (the NVN API through function
+  pointers): they aren't in the function table, so each missed the cache and binary-searched before reaching the thunk
+  check. The thunk range is now tested first. b18: 14k misses per 2 s; 0.189 -> 0.177 Gi and 31.3 -> 29.6 CPU ms per
+  frame (b18's scene drew 3.5% fewer draws, so roughly half of that is the scene). `a64_call` self samples 476 -> 383:
+  the rest is the indirect call. `pool_find` got a 4-entry per-thread MRU (`renderer_pool_window` 58 -> 61 samples:
+  no change, it's the lock).
+- Item 1's "structured loops instead of `switch (pc)`": already the case; only the chunks of functions over ~6,000
+  instructions (1,207 chunks) dispatch with `switch (pc)`. The hottest guest function `F_0fc1e9c0` is the job system's
+  LDXR/STXR work-queue poll (spinning, not work). Busy samples (b17): ~50% guest code over hundreds of functions,
+  `a64_call` 6-8%, every runtime piece (texture checks, ring snapshots, pool lookups, objc) ~1% each.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -1236,7 +1247,8 @@ round") and blits on by default ("Blits", "Match profile"). In order:
    constant copies~~ ("CPU cost per frame, first round"), `upload_texture`'s
    per-frame change checks, `gfind`'s window scan, the ~10 MB/frame of
    uniform snapshots, ~~guest registers across guest stores~~ (`restrict`,
-   -O2), structured loops instead of `switch (pc)` for simple back-edges. Measure each with `tools/bench.py` + `tools/benchsum.py`
+   -O2), ~~structured loops~~ (already gotos), ~~thunk calls missing `a64_call`'s cache~~. What's left is
+   spread thin (~1% each, see "Host thunks in `a64_call`"); the CPU is at ~28-30 ms of the 33 ms frame. Measure each with `tools/bench.py` + `tools/benchsum.py`
    (cost per frame), never while building.
    The second 30 fps lock (see "The 30 fps cap"): find it with `fps 60` and
    `FIFA_LOG_WAITS=1`, if uncapping is still wanted.

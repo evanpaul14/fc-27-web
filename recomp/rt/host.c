@@ -117,13 +117,15 @@ static A64Func cached_fn(uint64_t t) {
 }
 
 void a64_call(CPU *c, uint64_t t) {
-  A64Func fn = cached_fn(t);
-  if (fn) { fn(c); return; }
-  if (t >= HOST_THUNK_BASE && t < HOST_THUNK_BASE + 16 * n_thunks && !(t & 15)) {
+  /* Host thunks first: they aren't in the function table, so they would miss the cache and binary-search on every
+   * call (the NVN API is called through function pointers: ~9k a frame in a match). */
+  if (t - HOST_THUNK_BASE < 16ull * n_thunks && !(t & 15)) {
     host_thunk_name = thunks[(t - HOST_THUNK_BASE) / 16].name;
     thunks[(t - HOST_THUNK_BASE) / 16].fn(c);
     return;
   }
+  A64Func fn = cached_fn(t);
+  if (fn) { fn(c); return; }
   if (t >= MISSING_BASE && t < MISSING_END) {
     for (unsigned i = 0; i < a64_missing_count; i++)
       if (a64_missing[i].addr == t) HDIE("call to unresolved import %s (lr %#llx)\n", a64_missing[i].name, (unsigned long long)c->x[30]);

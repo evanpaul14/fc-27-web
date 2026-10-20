@@ -60,13 +60,20 @@ int main(int argc, char **argv) {
         size_t n = fread(code, 1, 0x10000, f);
         fclose(f);
         maxwell_shared_size = 0;  // compute: from the control section dump, as the renderer does
+        maxwell_consts = NULL;    // compiler constants (BRX jump tables): offset and size from the control section
+        uint32_t cs[2] = {0};
         char cpath[1024];
         snprintf(cpath, sizeof cpath, "%s", path);
         char *cc = strstr(cpath, "_code.bin");
-        if (stage == STAGE_COMPUTE && cc) {
+        if (cc) {
             memcpy(cc, "_ctrl", 5);
             FILE *cf = fopen(cpath, "rb");
-            if (cf && fseek(cf, 0x754, SEEK_SET) == 0 && fread(&maxwell_shared_size, 4, 1, cf) != 1) maxwell_shared_size = 0;
+            if (stage == STAGE_COMPUTE && cf && fseek(cf, 0x754, SEEK_SET) == 0 && fread(&maxwell_shared_size, 4, 1, cf) != 1)
+                maxwell_shared_size = 0;
+            if (cf && fseek(cf, 0x6FC, SEEK_SET) == 0 && fread(cs, 4, 2, cf) == 2 && cs[1] && cs[1] + cs[0] <= n) {
+                maxwell_consts = code + cs[1];
+                maxwell_consts_size = cs[0];
+            }
             if (cf) fclose(cf);
         }
         ShaderKey key = {0};

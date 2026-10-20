@@ -1018,6 +1018,8 @@ static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
     // the compiler constants follow the code, so they bound the instruction scan
     size_t vmax = p->stages[0].const_offset ? p->stages[0].const_offset : 0x10000;
     size_t fmax = p->stages[1].const_offset ? p->stages[1].const_offset : 0x10000;
+    maxwell_consts = p->stages[0].const_offset ? (const uint8_t *)gptr(p->stages[0].code_addr + p->stages[0].const_offset) : NULL;
+    maxwell_consts_size = p->stages[0].const_size;
     pr->vi = maxwell_translate(gptr(p->stages[0].code_addr), vmax, STAGE_VERTEX, vkey);
     if (!pr->vi->msl) {
         LOG("[shader] VS translate failed: %s (code %llx)\n", pr->vi->error, p->stages[0].code_addr);
@@ -1029,6 +1031,8 @@ static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
         return nil;
     }
     fkey->vs_out_mask = pr->vi->out_mask;
+    maxwell_consts = p->stages[1].const_offset ? (const uint8_t *)gptr(p->stages[1].code_addr + p->stages[1].const_offset) : NULL;
+    maxwell_consts_size = p->stages[1].const_size;
     pr->fi = maxwell_translate(gptr(p->stages[1].code_addr), fmax, STAGE_FRAGMENT, fkey);
     if (!pr->fi->msl) { LOG("[shader] FS translate failed: %s\n", pr->fi->error); pr->failed = true; return nil; }
     if (getenv("FIFA_SAVE_MSL")) {
@@ -1425,6 +1429,8 @@ static CsProg *compute_program(NvnProgram *p) {
     dump_program(p);
     ShaderKey k = {0};
     maxwell_shared_size = ss->control ? *(const uint32_t *)(ss->control + 0x754) : 0;  // (next to the local size)
+    maxwell_consts = ss->const_offset ? (const uint8_t *)gptr(ss->code_addr + ss->const_offset) : NULL;
+    maxwell_consts_size = ss->const_size;
     cp->si = maxwell_translate(gptr(ss->code_addr), ss->const_offset ? ss->const_offset : 0x10000, STAGE_COMPUTE, &k);
     if (!cp->si->msl) { LOG("[compute] translate failed: %s (code %llx)\n", cp->si->error, ss->code_addr); cp->failed = true; return NULL; }
     for (int i = 0; i < 3; i++) {

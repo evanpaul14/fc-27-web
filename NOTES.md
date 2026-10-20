@@ -798,6 +798,23 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     `lldb -p $(pgrep -x fifa) --batch -o "p/x st.program->stages[0].code_addr"
     -o "p/x st.program->stages[1].code_addr" -o detach` reads it from the
     frozen process.
+  - Why those pipelines were slow: not the FS (`16fb79200` alone builds a
+    pipeline in 0.2 s) but BRX. GLSLC compiles a `switch` to `LDC
+    c[1][index + table]` + BRX (target = the loaded offset), and the
+    translator made every instruction a `case` for a BRX: 79 of the cached
+    VS (skinning-style switches near the top) had 800-860 cases, 2922 for
+    the biggest FS. Such a VS took 1.2 s to compile and 6.4 s for the
+    pipeline with `16fb79200` (macOS, one at a time; the game builds many at
+    once); with labels only where branches go, 0.2 s + 0.3 s. Every
+    instruction being a block start also costs at runtime (each `case`
+    commits all late writes). The translator now reads the table from the
+    program's compiler constants (`maxwell_consts`, c[1] at `const_offset`,
+    set per stage before translating; shtool reads 0x6FC/0x700 from the
+    control dump) and labels its entries only (`brx_targets`; falls back to
+    every instruction if the LDC isn't in the BRX's block). All 68 BRX
+    programs among the dumps find their tables (e.g. 856 -> 14 cases) and
+    compile; the other 339 translate byte-identically. Not yet confirmed
+    in a run that `1e3ec9400` is one of them.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -947,8 +964,9 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   match renders" in Status). Next: performance (see "Match performance" in
   Status): run with the 1D-rows fix and confirm `16dff9100` drops from ~98
   ms (needs getting past the 10+ minute pipeline builds after translator
-  changes: find what makes `16fb79200`'s pipeline so slow, likely the
-  `switch (pc)` form; structured control flow would help both), then
+  changes: BRX made every instruction a `case`, now fixed, see "Why those
+  pipelines were slow"; confirm in a run; structured control flow would
+  still help the guard loop), then
   profile again with `FIFA_GPU_PROFILE=2`; the occasional e_prev = 0 exposure readback, and a visual pass over the
   match (shadows, reflections, the remaining ~10 skipped draws per frame:
   `16fd3ac00`, `171855700` TXD.B). Shader coverage (`build/shtool` over

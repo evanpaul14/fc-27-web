@@ -32,6 +32,8 @@ const uint8_t *maxwell_dbg_vs;
 #define RZ 255
 #define LMEM_WORDS 256  // local memory per invocation (1 KB)
 uint32_t maxwell_shared_size;
+const uint8_t *maxwell_consts;
+uint32_t maxwell_consts_size;
 
 // Iteration cap of the `switch (pc)` loop (a program that never exits stops there); FIFA_SHADER_GUARD overrides it.
 static unsigned guard_limit(void) {
@@ -2079,6 +2081,38 @@ static bool is_branch_target_op(uint64_t w) {
     return ((w & 0xfff0000000000020ull) == 0xe240000000000000ull);
 }
 
+// BRX targets from the jump table in the compiler constants: GLSLC loads the target with LDC c[1][index + table]
+// right before the BRX. Marks the entries from the table's start up to the first that isn't an instruction in
+// the program (a following table only adds labels). False when the table isn't found: then any instruction may
+// be a target, and every one becomes a `case` (hundreds of them make Metal's pipeline builds take seconds).
+// `blocks` are the labels from direct branches (the LDC must be in the BRX's block); targets go into `label`.
+static bool brx_targets(const uint64_t *code, size_t end, size_t i, const uint8_t *blocks, uint8_t *label) {
+    uint64_t w = code[i];
+    int a = (int)bits(w, 8, 8);
+    if (!maxwell_consts || a == RZ) return false;
+    size_t j = i;
+    for (;;) {
+        if (j <= 1 || i - j > 64) return false;
+        if (--j % 4 == 0) continue;
+        if (writes_reg(code[j], a)) break;
+        uint8_t top = (uint8_t)(code[j] >> 56);
+        if (top == 0xe2 || top == 0xe3 || blocks[j]) return false;  // (another path may set the register)
+    }
+    uint64_t x = code[j];
+    if ((x & 0xfff8000000000000ull) != 0xef90000000000000ull || bits(x, 36, 5) != 1 || bits(x, 48, 3) != 4 ||
+        (int)bits(x, 0, 8) != a || bits(x, 16, 4) != PT)  // (unpredicated)
+        return false;
+    uint32_t off = (uint32_t)bits(x, 20, 16), n = 0;
+    for (; off + 4 <= maxwell_consts_size && n < 1024; off += 4, n++) {
+        uint32_t v;
+        memcpy(&v, maxwell_consts + off, 4);
+        uint32_t t = norm_target((int64_t)i * 8 + 8 + v + sbits(w, 20, 24));
+        if (t % 8 || t / 8 >= end) break;
+        label[t / 8] = 1;
+    }
+    return n > 0;
+}
+
 // ------------------------------------------------------------------ GLSL output
 static bool id_start(char ch) { return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_'; }
 static bool id_char(char ch) { return id_start(ch) || (ch >= '0' && ch <= '9'); }
@@ -2419,15 +2453,20 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             if (t >= 0 && (size_t)(t / 8) < end) label[t / 8] = 1;
             any_branch = true;
         }
-        if ((w & 0xfff0000000000000ull) == 0xe250000000000000ull) {  // BRX: any instruction may be a target
-            any_branch = true;
-            memset(label, 1, end);
-        }
+        if ((w & 0xfff0000000000000ull) == 0xe250000000000000ull) any_branch = true;  // BRX (targets below)
         if ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull || (w & 0xfff0000000000000ull) == 0xe340000000000000ull ||
             (w & 0xfff0000000000000ull) == 0xe350000000000000ull)
             any_branch = true;
         (void)is_branch_target_op;
     }
+    // BRX targets, once the other labels (block starts for brx_targets) are known
+    uint8_t *flow_label = malloc(end + 4);
+    memcpy(flow_label, label, end + 4);
+    for (size_t i = 0; i < end; i++) {
+        if (i % 4 == 0 || (((const uint64_t *)code)[i] & 0xfff0000000000000ull) != 0xe250000000000000ull) continue;
+        if (!brx_targets((const uint64_t *)code, end, i, flow_label, label)) { memset(label, 1, end); break; }
+    }
+    free(flow_label);
     // translate
     bool dbg = maxwell_dbg_code && blob == maxwell_dbg_code && stage == STAGE_FRAGMENT;
     static int annotate = -1;

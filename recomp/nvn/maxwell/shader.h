@@ -97,6 +97,9 @@ typedef struct {
 extern uint64_t maxwell_gmem_base, maxwell_gmem_size;
 // Compute: bytes of shared memory (LDS/STS) the program declares; 0 = Metal's maximum (32 KB).
 extern uint32_t maxwell_shared_size;
+// The program's compiler constants (c[1]; NULL: unknown), read for BRX jump tables. Set before each translation.
+extern const uint8_t *maxwell_consts;
+extern uint32_t maxwell_consts_size;
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
 // maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).
 extern const uint8_t *maxwell_dbg_code;

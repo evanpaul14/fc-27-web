@@ -912,11 +912,11 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   - `prof 1` top entries: depth-only passes (`pass 0x0 fs 0`, ~5.5 ms each,
     ~3 per frame), 1280x720 FS `16ff87600` (~17 ms each), `170a27300`,
     `16ffd7600`; `16dff9100` is gone from the list.
-- Blits off by default (2026-10-19, run `build/r5`): buffer copies, clears
-  and pool readbacks as in-order GPU blits (`blit_buffer`, pending ranges
-  checked by `renderer_cpu_access` before the renderer's own CPU reads/
-  writes of guest memory) are behind the control command `blits 1`; the
-  default (0) is the old drain + CPU copy. With blits off the match runs at
+- Blits (2026-10-19, run `build/r5`): buffer copies, clears and pool
+  readbacks as in-order GPU blits (`blit_buffer`, pending ranges checked by
+  `renderer_cpu_access` before the renderer's own CPU reads/writes of guest
+  memory). On by default since the profile below (17 -> 30 fps); the
+  control command `blits 0` restores the drain + CPU copy. With blits off the match runs at
   ~17 fps in open play (gpu ~1.1 s and `waits flush` ~0.76 s/105 per 2 s;
   stats now print `blits <n>/<drains> waited`). Each run still shows ~4,300
   skipped draws per 2 s, all reason 1 (program not ready).
@@ -1095,13 +1095,14 @@ half-time) at ~12 fps since the barrier fix ("Match performance, third
 round"). In order:
 
 1. ~~`16dff9100`~~ done (divergent barriers, SR_LANEID / lane masks).
-2. Then the remaining performance items from the second round: GPU drains
-   on `CMD_COPY_BUFFER_TO_BUFFER` / `CMD_COPY_TEXTURE_TO_BUFFER`, `gfind`'s
+2. Then the remaining performance items from the second round: ~~GPU drains
+   on `CMD_COPY_BUFFER_TO_BUFFER` / `CMD_COPY_TEXTURE_TO_BUFFER`~~ (blits,
+   on by default), `upload_texture`'s per-frame change checks, `gfind`'s
    window scan, structured loops instead of `switch (pc)` for simple
    back-edges. Profile with `prof 1` / `prof 2` after each.
 3. ~~The black 3D scene for part of the first half~~ fixed by the lane
    masks. ~~The 32^3 3D texture sampled as 2D~~ is the game's own stale
-   binding, harmless (see "Blits off by default").
+   binding, harmless (see "Blits").
 4. Visual pass over the match: shadows, reflections, the remaining ~10
    skipped draws per frame (`16fd3ac00`, `171855700` TXD.B).
 5. Shader coverage (`build/shtool` over the dumps): 407/437 translate; the

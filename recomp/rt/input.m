@@ -177,7 +177,7 @@ static _Atomic bool debug_req;
 bool input_take_debug(void) { return atomic_exchange(&debug_req, false); }
 static _Atomic int profile_mode = -1;
 int input_profile_mode(void) { return atomic_load(&profile_mode); }
-static _Atomic int blits_mode = 0;
+static _Atomic int blits_mode = 1;
 int input_blits(void) { return atomic_load(&blits_mode); }
 static _Atomic int csdump_req;
 int input_take_csdump(void) { return atomic_exchange(&csdump_req, 0); }

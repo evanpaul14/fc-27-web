@@ -781,6 +781,10 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     texels; MSL declares them `texture2d` and wraps them in `rows1d<T>`
     (same `.read(x)` / `.sample(s, u)` / `.get_width()` syntax). The
     guard is `FIFA_SHADER_GUARD` (to confirm: the cost should scale with it).
+    Buffer uploads copy whole rows (staging padded). Limits: only the MSL
+    path has `rows1d` (the GLSL dialect still declares 1D samplers); a real
+    1D texture wider than 16384 reads fine but samples only its first row;
+    1D images (SULD/SUST) use the same wrapper (`write(v, x)`).
   - LOP3 `.P` (register form: predicate op bits 36-37, predicate 48-50)
     wrote no predicate; in `16dff9100` the contour emit was dead code
     behind a stale P0. 5 programs use it.
@@ -790,7 +794,10 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     one-shot target: Player Career's screen, and the match's VS `1e3ec9400`
     / FS `16fb79200` (FS is 2784 lines, 44 cases; the library compiles in
     0.3 s, the pipeline back-end is the slow part). The game looks frozen.
-    `[metal] waiting > 2 s for ...` now names the program.
+    `[metal] waiting > 2 s for ...` now names the program. On an older build,
+    `lldb -p $(pgrep -x fifa) --batch -o "p/x st.program->stages[0].code_addr"
+    -o "p/x st.program->stages[1].code_addr" -o detach` reads it from the
+    frozen process.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below

@@ -3,6 +3,8 @@
 
   python3 -I tools/tomatch.py <fifo> [--shot build/live.png] [--from-menu] [--classify PNG...]
 
+The game is started with FIFA_CONTROL=<fifo> FIFA_ROMFS=extracted/update/romfs_program.json ./build/fifa (mkfifo first).
+
 --from-menu: the game is already past boot (skips the initial 1200-frame wait).
 
 Fixed timings alone don't work: the "sign in to the EA Servers" notice turns up at a different point in each run

@@ -196,8 +196,13 @@ memory is `mem + addr`; with `mem = 0` guest pointers are host pointers.
 python3 -I recomp/image.py extracted/code build      # relocated main.img + sdk.img, layout.json, symbols.tsv
 python3 -I recomp/build.py build --all                # C for all 338k functions -> build/gen (2.6 GB)
 make -C recomp -j6                                    # build/fifa (native, AArch64 host)
-./build/fifa                                          # FIFA_TRACE=1 logs svcs
+FIFA_ROMFS=extracted/update/romfs_program.json ./build/fifa   # FIFA_TRACE=1 logs svcs
 ```
+
+The build is of the update (`image.py extracted/update/code build`, see
+Setup), so runs need the update's RomFS: without `FIFA_ROMFS` the base
+RomFS's RenderCore2 NRO doesn't match and boot dies with `ro: LoadModule of
+an NRO that isn't in the build`.
 
 Always pass `--all`: without it `build.py` emits only the closure reachable
 from the roots (215k functions), which rewrites every unit and costs a full
@@ -278,13 +283,16 @@ from the roots (215k functions), which rewrites every unit and costs a full
   functions that return the next guest address to a driver loop; compile
   time is superlinear in function size otherwise.
 
-## Status (2026-10-18)
+## Status (2026-10-19)
 
 Current state: with the update (`FIFA_ROMFS=extracted/update/romfs_program.json`)
 the game plays the EA SPORTS intro, the title ("Let's Play!"), the offline
 notice, the favourite-team setup and reaches the main menu (FC News,
 Ultimate Team, Kick Off, ...) at 30 fps on the Metal executor, driven by
-keyboard, gamepad or `FIFA_PRESS` scripts (see "Input" below). The
+keyboard, gamepad, `FIFA_PRESS` scripts or `FIFA_CONTROL` (see "Input"
+below). Kick Off plays a full match (Bournemouth v Brighton: 3D scene, HUD,
+half-time) at ~3-4 fps, GPU-bound on one compute shader (see "Match
+performance, second round"). The
 worker-thread crashes were an exclusive-store ordering bug (see "Worker
 thread crashes" below); 8 runs of 2-3 minutes since, none crashed. The rest of
 this section is the history that led here, oldest first.

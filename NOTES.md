@@ -968,6 +968,20 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     arms, legs and hands (skin) in the walkout/handshake and close-ups,
     a black sky, and 12-17 fps in open play with the window shown
     (28-30 above was with blits; not re-measured hidden).
+- fps vs blits, benchmarked (2026-10-20, runs `build/b1`..`b4`, hidden, `tools/bench.py`: boots, tomatch,
+  waits 120 s, then timed `blits` segments; logs fps, P/E-core time and clocks every 2 s). The "blits on later
+  is lower than toggling it on" result was **thermal throttling of the P cores**, not blits:
+  - Open play, same run (b1): blits 0 ~26 fps, blits 1 ~29 (GPU fence waits replace `waits flush`). A real
+    but small gain (~+12%), not 17 -> 30.
+  - The slow runs (b2-b4, back to back after b1) start at 29-30 and slide to 12-14 fps over 1-2 minutes. The
+    P-core clock (`proc_pid_rusage` v6 `ri_pcycles / ri_user_ptime`) falls from ~2.95 GHz to a flat 0.83 GHz
+    with IPC unchanged (~2.0-2.1), and the scheduler moves part of the work to E cores; fps tracks the clock.
+    It recovers over ~5 minutes to 2.7 GHz / 30 fps whatever `blits` is (b4: `blits 0` at 0.83-1.1 GHz gave
+    16 fps). `notifyutil -g com.apple.system.thermalpressurelevel` read 2 (heavy) with the game closed.
+  - So the earlier 17 -> 30 "toggle" and the 12-17 fps "visible window" numbers were probably taken at
+    different clocks. Benchmark only at thermal pressure 0, and check `cores.log` P GHz before comparing.
+  - Per frame in the slow state every function costs ~2.5x (guest code as much as `renderer_texture`): a
+    clock, not work, difference. Same draws per frame, same blits per frame (~7).
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -1130,7 +1144,8 @@ round") and blits on by default ("Blits", "Match profile"). In order:
    loop), surface type 1 = buffer images (3 CS, incl. `16eca9800`; needs
    texture buffers bound as images), `3a2c` VMNMX (2 CS), SUATOM.
 6. Why open play is at 12-17 fps in the visible window (was 28-30):
-   re-measure with `FIFA_HIDDEN=1` and `prof 1` / `prof 2`.
+   probably the P-core throttling found in "fps vs blits, benchmarked"; re-measure at thermal pressure 0
+   with `tools/bench.py` (visible and hidden).
 7. Try the keyboard and a gamepad in the visible window; audio output for
    `audout.c`'s sink thread; the dark Continue button on the accessibility
    screen (seen before the threading fix; check if it still happens).

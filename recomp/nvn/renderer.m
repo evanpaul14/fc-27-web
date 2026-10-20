@@ -29,6 +29,7 @@ static uint64_t skip_why[6];  // no program, program not ready, pipeline compili
 #define SKIP(n) (stat_skipped++, skip_why[n]++, skip_log(n))
 static void skip_log(int n);
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
+static uint64_t stat_blits, stat_pend_waits;  // copies run as blits in command order; drains because the CPU touched one
 static double stat_gpu_s;
 static uint64_t g_gpu_total_ns;  // GPU time of all completed command buffers
 // (forward: texture-lifetime cleanup and stats, defined further down)
@@ -101,12 +102,12 @@ const char *renderer_stats(void) {
     struct task_vm_info vmi;
     mach_msg_type_number_t vn = TASK_VM_INFO_COUNT;
     uint64_t foot = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmi, &vn) == KERN_SUCCESS ? vmi.phys_footprint : 0;
-    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped (%llu/%llu/%llu/%llu/%llu/%llu), %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms wait %.0fms, fbcopy %llu | tex %d (%.0f MB) views %d snaps %lu mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu", stat_draws, stat_skipped,
+    snprintf(stats_text, sizeof stats_text, "%llu draws, %llu skipped (%llu/%llu/%llu/%llu/%llu/%llu), %llu passes, %llu dispatches, %llu flushes, gpu %.0fms, wait %.0fms, compile %d/%.0fms wait %.0fms, fbcopy %llu, blits %llu/%llu waited | tex %d (%.0f MB) views %d snaps %lu mem %.0f MB | waits fence %.0fms/%llu flush %.0fms/%llu all %.0fms/%llu", stat_draws, stat_skipped,
              skip_why[0], skip_why[1], skip_why[2], skip_why[3], skip_why[4], skip_why[5],
              stat_passes, stat_dispatches, stat_flushes, stat_gpu_s * 1000.0, (double)stat_wait_ns / 1e6 * 125.0 / 3.0, stat_compiles, stat_compile_ms, stat_compile_wait_ms, stat_feedback_copies,
-             g_tex_live, g_tex_live_bytes / 1048576.0, g_views_live, (unsigned long)(g_snap_copies ? g_snap_copies.count : 0), foot / 1048576.0, stat_wait_by[0] / 24e3, (unsigned long long)stat_wait_n[0], stat_wait_by[1] / 24e3, (unsigned long long)stat_wait_n[1], stat_wait_by[2] / 24e3, (unsigned long long)stat_wait_n[2]);
+             stat_blits, stat_pend_waits, g_tex_live, g_tex_live_bytes / 1048576.0, g_views_live, (unsigned long)(g_snap_copies ? g_snap_copies.count : 0), foot / 1048576.0, stat_wait_by[0] / 24e3, (unsigned long long)stat_wait_n[0], stat_wait_by[1] / 24e3, (unsigned long long)stat_wait_n[1], stat_wait_by[2] / 24e3, (unsigned long long)stat_wait_n[2]);
     stat_compiles = 0;
-    stat_feedback_copies = 0;
+    stat_feedback_copies = stat_blits = stat_pend_waits = 0;
     stat_compile_ms = stat_compile_wait_ms = 0;
     memset(skip_why, 0, sizeof skip_why);
     stat_draws = stat_skipped = stat_passes = stat_dispatches = stat_flushes = stat_wait_ns = 0;
@@ -306,6 +307,15 @@ static void commit_cb(const char *tag) {
     }
 }
 
+// Guest ranges (physical-pool addresses) that blits submitted since the last wait read or write: buffer copies,
+// clears and texture readbacks run on the GPU in command order instead of draining it first, so the renderer's
+// own CPU reads of guest memory (uniform snapshots, texture uploads, index conversion) and CPU writes must wait
+// for them when they overlap (renderer_cpu_access). Each blit is committed right away, so that wait never has
+// to commit (an encoder may be open). The game reads results after a fence, as on the Switch.
+#define PEND_N 256
+static struct { uint64_t lo, hi; bool write; } pend[PEND_N];
+static int npend;
+
 // Finish all recorded GPU work (the CPU is about to read GPU results, or reuse the ring).
 void renderer_flush(void) {
     renderer_submit();
@@ -316,6 +326,34 @@ void renderer_flush(void) {
     wait_cb(c);
     g_wait_kind = 0;
     ring_reset();
+    npend = 0;
+}
+
+static uint64_t guest_phys(uint64_t addr, uint64_t size) {
+    return addr >= VPOOL_BASE && addr < VPOOL_END ? nvn_virtual_phys(addr, size) : addr;
+}
+
+// Record a GPU access to [addr, addr+size); false when it can't be tracked (the caller drains instead).
+static bool pend_add(uint64_t addr, uint64_t size, bool write) {
+    uint64_t p = guest_phys(addr, size);
+    if (!p || npend == PEND_N) return false;
+    pend[npend++] = (typeof(pend[0])){p, p + size, write};
+    return true;
+}
+
+// The CPU is about to read (or write) guest memory: wait for pending blits that write it (or read it).
+void renderer_cpu_access(uint64_t addr, uint64_t size, bool write) {
+    if (!npend) return;
+    if (last_cb.status >= MTLCommandBufferStatusCompleted) { npend = 0; return; }  // (all blits are committed)
+    uint64_t p = guest_phys(addr, size);
+    for (int i = 0; p && i < npend; i++)
+        if (p < pend[i].hi && pend[i].lo < p + size && (write || pend[i].write)) p = 0;
+    if (!p) { stat_pend_waits++; renderer_sync(); npend = 0; }
+}
+
+static void cpu_read_ptr(const void *data, uint64_t size) {
+    uint64_t a = (uint64_t)((const uint8_t *)data - mem);
+    if ((const uint8_t *)data >= mem && a < VPOOL_END) renderer_cpu_access(a, size, false);
 }
 
 // Wait for submitted work without committing anything new (nvnSyncWait / QueueFinish).
@@ -695,6 +733,7 @@ static uint64_t ring_off;
 #define RING_SIZE (64u << 20)
 
 static uint64_t ring_alloc(const void *data, uint64_t size) {
+    cpu_read_ptr(data, size);
     if (!ring) ring = [dev newBufferWithLength:RING_SIZE options:MTLResourceStorageModeShared];
     uint64_t aligned = (ring_off + 255) & ~255ull;
     if (aligned + size > RING_SIZE) {
@@ -1153,6 +1192,8 @@ static id<MTLTexture> apply_swizzle(id<MTLTexture> tex, NvnTexture *t, const Nvn
 
 // Upload helper: a separate command buffer, committed now so it runs before the current pass.
 // image: bound for SULD / SUST, so no swizzled view (those can't be written)
+static uint64_t g_bind_prog;  // (for the mismatch log) program and slot being bound
+static int g_bind_slot;
 static id<MTLTexture> sampled_texture(NvnTexture *t, const NvnTextureView *v, bool has_view, int want_type, bool image) {
     // uploads (if the CPU-side contents changed) go into their own command buffer, committed before
     // the current one so they land first
@@ -1174,8 +1215,9 @@ static id<MTLTexture> sampled_texture(NvnTexture *t, const NvnTextureView *v, bo
             tex = view_cached(src, 0x6000000000000000ull | 3, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureTypeCube levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 6)]; });
         else {
             static int nlog;
-            if (nlog++ < 30) LOG("[tex] type mismatch: want %lu have %lu (%ux%ux%u target %u fmt %#x arr %lu)\n", (unsigned long)want,
-                                 (unsigned long)tex.textureType, t->width, t->height, t->depth, t->target, t->format, (unsigned long)tex.arrayLength);
+            if (nlog++ < 30) LOG("[tex] type mismatch: want %lu have %lu (%ux%ux%u target %u fmt %#x arr %lu) program %llx t%d\n", (unsigned long)want,
+                                 (unsigned long)tex.textureType, t->width, t->height, t->depth, t->target, t->format, (unsigned long)tex.arrayLength,
+                                 (unsigned long long)g_bind_prog, g_bind_slot);
             return dummy_texture(want_type);
         }
     }
@@ -1307,6 +1349,7 @@ static void bind_textures(int stage, ShaderInfo *si) {
                 static int n;
                 if (n++ < 40) LOG("[rtw] %s %llx binds it at t%d (image %d)\n", stage ? "fs" : "vs", st.program->stages[stage].code_addr, i, st_->is_image);
             }
+            g_bind_prog = st.program->stages[stage].code_addr, g_bind_slot = i;
             if (e->tex) tex = sampled_texture(e->tex, &e->view, e->has_view, st_->type, st_->is_image);
             if (e->tex && i < 64) {
                 renderer_texture_scale(e->tex, &tex_sc[stage][i][0], &tex_sc[stage][i][1]);
@@ -1641,6 +1684,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
                 static int n;
                 if (n++ < 40) LOG("[rtw] cs %llx binds it at t%d (image %d)\n", st.program->stages[5].code_addr, i, st_->is_image);
             }
+            g_bind_prog = st.program->stages[5].code_addr, g_bind_slot = i;
             if (e->tex) tex = sampled_texture(e->tex, &e->view, e->has_view, st_->type, st_->is_image);
             if (e->tex && i < 64) renderer_texture_scale(e->tex, &tex_sc[0][i][0], &tex_sc[0][i][1]);
             for (int k = 0; k < nfeedback; k++)
@@ -1781,6 +1825,7 @@ static id<MTLBuffer> expand_indices(uint32_t mode, uint32_t count, const void *i
     uint32_t tris = mode == 7 ? count / 4 * 2 : count >= 3 ? count - 2 : 0;
     uint32_t *out = malloc(tris * 3 * 4 + 4);
     uint32_t n = 0;
+    if (indices) cpu_read_ptr(indices, (uint64_t)count << (itype == 0 ? 0 : itype == 1 ? 1 : 2));
 #define IDX(i) (indices ? (itype == 0 ? ((const uint8_t *)indices)[i] : itype == 1 ? ((const uint16_t *)indices)[i] : ((const uint32_t *)indices)[i]) : first + (i))
     if (mode == 7) {  // quads
         for (uint32_t q = 0; q + 3 < count; q += 4) {
@@ -2362,6 +2407,7 @@ static void draw(CmdRec *r, bool indexed) {
             id<MTLBuffer> ib;
             if (native) {  // 8-bit indices: widen
                 uint32_t *w = malloc(count * 4 + 4);
+                renderer_cpu_access(iaddr, count, false);
                 for (uint32_t i = 0; i < count; i++) w[i] = ((const uint8_t *)gptr(iaddr))[i];
                 ib = [dev newBufferWithBytes:w length:count * 4 + 4 options:MTLResourceStorageModeShared];
                 free(w);
@@ -2456,6 +2502,7 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
     uint32_t hb = ((uint32_t)rg[4] + fi->bh - 1) / fi->bh, wb = ((uint32_t)rg[3] + fi->bw - 1) / fi->bw;
     uint64_t mtl_bpb = renderer_pixel_format_bytes(tex.pixelFormat, fi->bpb);
     for (int z = 0; z < (array ? rg[5] : 1); z++) {
+        renderer_cpu_access(src + (uint64_t)z * img, img * (array ? 1 : rg[5]), false);
         const uint8_t *s = gptr(src + (uint64_t)z * img);
         uint64_t out_row = (uint64_t)wb * mtl_bpb;
         uint8_t *data = malloc(out_row * hb * (array ? 1 : rg[5]));
@@ -2572,7 +2619,9 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
                 sourceSize:MTLSizeMake(rg[3], rg[4], array ? 1 : rg[5]) toBuffer:out
          destinationOffset:boff + (uint64_t)z * img destinationBytesPerRow:row destinationBytesPerImage:img];
     [b endEncoding];
-    renderer_flush();  // the CPU may read the result right after the fence
+    // into the pool: the game reads it after a fence; staged: copied out once the GPU is done
+    if (staged || !input_blits() || !pend_add(dst, total, true)) renderer_flush();
+    else renderer_submit();
     if (staged) memcpy(gptr(dst), out.contents, total);
 }
 
@@ -2744,6 +2793,24 @@ static bool drop_unrenderable_targets(void) {
         dropped = true;
     }
     return dropped;
+}
+
+// Buffer copy (fill: clear to a repeated byte) as a blit in command order. False when the ranges aren't inside
+// pool buffers, overlap or can't be tracked: the caller drains the GPU and does it on the CPU.
+static bool blit_buffer(uint64_t src, uint64_t dst, uint64_t n, bool fill, uint8_t value) {
+    uint64_t so = 0, dof;
+    if (!input_blits() || !n || ((src | dst | n) & 3) || npend + 2 > PEND_N) return false;
+    id<MTLBuffer> sb = fill ? nil : renderer_pool_buffer(src, n, &so), db = renderer_pool_buffer(dst, n, &dof);
+    if (!db || (!fill && (!sb || (sb == db && so < dof + n && dof < so + n)))) return false;
+    if ((!fill && !pend_add(src, n, false)) || !pend_add(dst, n, true)) return false;
+    end_pass();
+    id<MTLBlitCommandEncoder> b = [cb() blitCommandEncoder];
+    if (fill) [b fillBuffer:db range:NSMakeRange(dof, n) value:value];
+    else [b copyFromBuffer:sb sourceOffset:so toBuffer:db destinationOffset:dof size:n];
+    [b endEncoding];
+    renderer_submit();
+    stat_blits++;
+    return true;
 }
 
 static void exec_list(uint64_t handle, int depth) {
@@ -2967,6 +3034,7 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_DRAW_ELEMENTS: draw(r, true); break;
         case CMD_UPDATE_UNIFORM_BUFFER:
             // (buffer, size, offset, dataSize, data): apply the update in command order
+            renderer_cpu_access(r->x[0] + r->x[2], r->x[3], true);
             memcpy(gptr(r->x[0] + r->x[2]), x, r->x[3]);
             break;
         case CMD_FENCE_SYNC: {
@@ -3000,14 +3068,17 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_COPY_BUFFER_TO_TEXTURE: copy_buffer_to_texture(r->x[0], x); break;
         case CMD_COPY_TEXTURE_TO_BUFFER: copy_texture_to_buffer(x, r->x[3]); break;
         case CMD_COPY_BUFFER_TO_BUFFER:
+            if (blit_buffer(r->x[0], r->x[1], r->x[2], false, 0)) break;
             renderer_flush();
             memmove(gptr(r->x[1]), gptr(r->x[0]), r->x[2]);
             break;
         case CMD_CLEAR_BUFFER: {  // (address, size, 32-bit value)
-            renderer_flush();
-            uint32_t *u = gptr(r->x[0]), v = (uint32_t)r->x[2];
-            for (uint64_t k = 0; k < r->x[1] / 4; k++) u[k] = v;
+            uint32_t v = (uint32_t)r->x[2];
             if (g_debug_frame) LOG("[clearbuf] %llx size %#llx value %#x\n", (unsigned long long)r->x[0], (unsigned long long)r->x[1], v);
+            if (v == (v & 0xff) * 0x01010101u && blit_buffer(0, r->x[0], r->x[1] & ~3ull, true, (uint8_t)v)) break;
+            renderer_flush();
+            uint32_t *u = gptr(r->x[0]);
+            for (uint64_t k = 0; k < r->x[1] / 4; k++) u[k] = v;
             break;
         }
         default: break;

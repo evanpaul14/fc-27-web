@@ -912,6 +912,21 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   - `prof 1` top entries: depth-only passes (`pass 0x0 fs 0`, ~5.5 ms each,
     ~3 per frame), 1280x720 FS `16ff87600` (~17 ms each), `170a27300`,
     `16ffd7600`; `16dff9100` is gone from the list.
+- Blits off by default (2026-10-19, run `build/r5`): buffer copies, clears
+  and pool readbacks as in-order GPU blits (`blit_buffer`, pending ranges
+  checked by `renderer_cpu_access` before the renderer's own CPU reads/
+  writes of guest memory) are behind the control command `blits 1`; the
+  default (0) is the old drain + CPU copy. With blits off the match runs at
+  ~17 fps in open play (gpu ~1.1 s and `waits flush` ~0.76 s/105 per 2 s;
+  stats now print `blits <n>/<drains> waited`). Each run still shows ~4,300
+  skipped draws per 2 s, all reason 1 (program not ready).
+  - The `[tex] type mismatch: want 2 have 7 (32x32x32 ...)` line now names
+    the program and slot: FS `16ebcaf00` t2 (separate texture 1, c[2]
+    0x170). The FS computes `t2.rgb * cb3[4].y + lut * (1 - t2.a *
+    cb3[4].z)` with the 3D LUT at t1; t2 is a 2D overlay layer, and the
+    game leaves the LUT bound in its slot when the overlay is off (weights
+    0), so the dummy texture changes nothing. The only TXQ-only slots
+    (typed 2D by guess) are CS `16e11bb00` / `16ee5ac00` t0, not this.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -1063,8 +1078,8 @@ round"). In order:
    window scan, structured loops instead of `switch (pc)` for simple
    back-edges. Profile with `prof 1` / `prof 2` after each.
 3. ~~The black 3D scene for part of the first half~~ fixed by the lane
-   masks. Left: the program that samples a 32^3 3D texture as 2D
-   (`[tex] type mismatch: want 2 have 7`).
+   masks. ~~The 32^3 3D texture sampled as 2D~~ is the game's own stale
+   binding, harmless (see "Blits off by default").
 4. Visual pass over the match: shadows, reflections, the remaining ~10
    skipped draws per frame (`16fd3ac00`, `171855700` TXD.B).
 5. Shader coverage (`build/shtool` over the dumps): 407/437 translate; the

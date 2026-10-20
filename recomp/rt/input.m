@@ -177,6 +177,8 @@ static _Atomic bool debug_req;
 bool input_take_debug(void) { return atomic_exchange(&debug_req, false); }
 static _Atomic int profile_mode = -1;
 int input_profile_mode(void) { return atomic_load(&profile_mode); }
+static _Atomic int blits_mode = 0;
+int input_blits(void) { return atomic_load(&blits_mode); }
 static _Atomic int csdump_req;
 int input_take_csdump(void) { return atomic_exchange(&csdump_req, 0); }
 void input_shot_done(void) { atomic_fetch_add(&shots_done, 1); }
@@ -213,6 +215,8 @@ static void control_command(char *cmd) {
         atomic_store(&csdump_req, sscanf(cmd, "%*s %ld", &n) == 1 ? (int)n : 1);
     } else if (!strcmp(a, "prof") && sscanf(cmd, "%*s %ld", &n) == 1) {  // FIFA_GPU_PROFILE level
         atomic_store(&profile_mode, (int)n);
+    } else if (!strcmp(a, "blits") && sscanf(cmd, "%*s %ld", &n) == 1) {  // buffer copies as GPU blits (1) or drain + CPU (0)
+        atomic_store(&blits_mode, (int)n);
     } else if (!strcmp(a, "shot")) {
         if (sscanf(cmd, "%*s %255s", b) != 1) strcpy(b, "build/live.png");
         uint64_t done = atomic_load(&shots_done);

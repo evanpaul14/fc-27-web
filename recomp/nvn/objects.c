@@ -344,6 +344,7 @@ const uint8_t *nvn_texture_data(NvnTexture *t, uint64_t size, uint8_t **tmp) {
     *tmp = NULL;
     NvnPool *p = t->pool;
     if (!p) return NULL;
+    renderer_cpu_access(p->storage + t->pool_offset, size, false);  // after blits that write it
     if (p->storage) return GP(p->storage + t->pool_offset);
     uint64_t lo = t->pool_offset, hi = lo + size;
     int i = 0;

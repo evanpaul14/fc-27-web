@@ -183,6 +183,7 @@ const uint8_t *nvn_texture_data(NvnTexture *t, uint64_t size, uint8_t **tmp);
 void backend_pool_destroyed(NvnPool *p);
 void renderer_sync(void);   /* wait for all submitted GPU work */
 void renderer_flush(void);  /* finish all recorded GPU work */
+void renderer_cpu_access(uint64_t addr, uint64_t size, bool write);  /* before CPU access to guest memory blits may use */
 uint64_t renderer_fence_seq(void);
 void renderer_wait_seq(uint64_t seq);
 

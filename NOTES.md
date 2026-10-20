@@ -1020,6 +1020,14 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   while the memory still matches it (`ring_snapshot`: ~270 of ~560 MB per 2 s reused). Result: 0.308-0.325 Gi and
   52.7-53.7 CPU ms per frame, within noise of b7 (0.314 / 52.5). Next: line-level profile of `renderer_texture`
   (b8: ~1,450 of 6,261 samples on the busiest worker, under `bind_textures`).
+- Buffer textures in place (b11 profile, b12): `renderer_texture`'s self time (~1,160 samples) was `hash_full` over
+  buffer textures (target 10: UI vertex data), re-hashed every frame they're bound, a serial multiply chain. In a
+  physical pool they're now linear textures over the pool's no-copy MTLBuffer (`buffer_texture_in_place`:
+  `newTextureWithDescriptor:offset:bytesPerRow:`, offset and row pitch aligned to
+  `minimumLinearTextureAlignmentForPixelFormat`), so the GPU reads guest memory itself: no hash, no upload. Others
+  fall back to the copy (the first 5 of each kind are logged as `buffer texture in place / copied`). b12 vs b10:
+  0.308-0.325 -> 0.285-0.289 Gi/frame, 52.7-53.7 -> 46.4-47.1 CPU ms/frame; HUD, radar, banners look right. Since the
+  b5 baseline: -22% instructions, -28% CPU time per frame.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below

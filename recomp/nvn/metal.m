@@ -214,6 +214,7 @@ typedef struct {
     bool uploaded;
     bool dynamic;       // contents changed after the first upload: verify fully every frame
     bool presented;     // has been shown by backend_present (a swapchain image)
+    bool zero_copy;     // a buffer texture made over its pool's MTLBuffer: always current, nothing to upload
     uint64_t data_hash, sample_hash;
     uint64_t checked_frame, full_frame;
 } TexBackend;
@@ -244,6 +245,21 @@ static MTLTextureType mtl_tex_type(uint32_t target, uint32_t samples) {
     case 10: return MTLTextureType2D;
     default: return samples > 1 ? MTLTextureType2DMultisample : MTLTextureType2D;
     }
+}
+
+// Buffer textures in a physical pool: a linear texture over the pool's no-copy MTLBuffer, so the GPU reads the guest
+// memory itself (the UI rewrites them every frame; hashing and re-uploading them was the render thread's largest
+// host cost). nil when the alignment or the pool doesn't allow it.
+static id<MTLTexture> buffer_texture_in_place(NvnTexture *t, MTLTextureDescriptor *d, MtlFormat mf) {
+    if (t->target != 10 || mf.expand_rgb || !t->pool || !t->pool->storage) return nil;
+    uint32_t bpb = nvn_format_info(t->format)->bpb;
+    uint64_t row = (uint64_t)d.width * bpb, off;
+    NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:d.pixelFormat];
+    id<MTLBuffer> pb = renderer_pool_buffer(t->pool->storage + t->pool_offset, row * d.height, &off);
+    if (!pb || !align || off % align || row % align) return nil;
+    d.storageMode = MTLStorageModeShared;
+    d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
+    return [pb newTextureWithDescriptor:d offset:off bytesPerRow:row];
 }
 
 static void create_backend_texture(NvnTexture *t, TexBackend *b) {
@@ -280,7 +296,19 @@ static void create_backend_texture(NvnTexture *t, TexBackend *b) {
     if (renderer_format_is_depth(t->format)) d.allowGPUOptimizedContents = NO;
     // (formats without alpha read alpha 1 through the sampled view: renderer.m apply_swizzle. A swizzle on the
     // texture itself isn't allowed with render-target / shader-write usage on Apple GPUs before M2.)
-    id<MTLTexture> tex = [dev newTextureWithDescriptor:d];
+    id<MTLTexture> tex = buffer_texture_in_place(t, d, mf);
+    static int nzero, ncopy;
+    if (t->target == 10 && (tex ? nzero++ : ncopy++) < 5)
+        LOG("[metal] buffer texture %s: fmt %#x %u texels at %#llx (pool %s)\n", tex ? "in place" : "copied", t->format,
+            t->width, (unsigned long long)(t->pool ? t->pool->storage + t->pool_offset : 0),
+            !t->pool ? "none" : t->pool->storage ? "physical" : "virtual");
+    if (tex) b->zero_copy = b->uploaded = true;
+    else {
+        d.storageMode = MTLStorageModePrivate;
+        d.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView | MTLTextureUsageRenderTarget |
+                  MTLTextureUsageShaderWrite;
+        tex = [dev newTextureWithDescriptor:d];
+    }
     if (!tex) {
         LOG("[metal] texture creation failed: fmt %#x %ux%ux%u target %u\n", t->format, t->width, t->height, t->depth,
             t->target);
@@ -369,6 +397,7 @@ static uint64_t fnv_sample(const NvnSpan *s, int ns, uint64_t n) {
 // Buffer textures: linear texels straight from guest memory, re-checked every frame (the UI rewrites its
 // vertex data in them).
 static void upload_buffer_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncoder> blit) {
+    if (b->zero_copy) return;
     if (b->uploaded && b->checked_frame == g_frame_counter) return;
     b->checked_frame = g_frame_counter;
     uint32_t bpb = nvn_format_info(t->format)->bpb;

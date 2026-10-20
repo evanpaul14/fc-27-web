@@ -813,8 +813,52 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     control dump) and labels its entries only (`brx_targets`; falls back to
     every instruction if the LDC isn't in the BRX's block). All 68 BRX
     programs among the dumps find their tables (e.g. 856 -> 14 cases) and
-    compile; the other 339 translate byte-identically. Not yet confirmed
-    in a run that `1e3ec9400` is one of them.
+    compile; the other 339 translate byte-identically. Confirmed in a run
+    (below): no pipeline waits over 2 s from boot to the match.
+- Match performance, second round (2026-10-19, run with the BRX and rows1d
+  fixes, `FIFA_ROMFS=extracted/update/romfs_program.json`; without it the
+  base RomFS's RenderCore2 NRO fails `ro: LoadModule ... isn't in the
+  build`):
+  - BRX fix confirmed: boot to second half compiled 754 programs (47 s of
+    compiles, 12.4 s waited on, at most 6 s in one 2 s window during match
+    load) and logged no `waiting > 2 s`; the old 10+ minute freezes are gone.
+  - Still ~3-4 fps, GPU-bound (gpu ~1.9 s per 2 s). `prof 1` in open play
+    (51:06, broadcast camera): `cs 16dff9100` 1,695 ms of ~1,780 ms (95%),
+    ~120-140 ms per dispatch, 2 per frame; everything else is ~85 ms per
+    2 s (the biggest a 896x504 pass, FS `16fea2400`, ~4 ms/frame). In a
+    half-time close-up it was ~170 ms per dispatch; once (with `prof 2`)
+    ~28 ms. So the rows1d fix did not end the long walk: ~100k guard
+    iterations at ~1 us is the measured cost, so it likely still runs to
+    the guard in most frames. Without it the match would be ~15-20 fps
+    on GPU time alone.
+  - The walk (MSL from `build/shtool -o`): blocks 2584/2760 are thread 0
+    following `smem[512 + (link & 0x3ff)]` until `link == start`, bounded
+    by `cb4[0][1]`. The program's control section says 0x1000 bytes of
+    shared memory (`smem[1024]`), but links sit at byte 2048 + 4 * index
+    with a 10-bit index, so if `cb4[0][1]` > 512 the `& 1023u` wrap reads
+    the low half and a contour never closes. Next: one run with
+    `FIFA_SHADER_GUARD=10000` (cost should drop ~10x if the guard is
+    what ends it) and `FIFA_DBG_CSW=16dff9100` (uniforms: `cb4[0][1]`,
+    the edge count; buffer before/after).
+  - Other costs, in order of what they'd be worth once that is fixed:
+    - Every flush drains the GPU: `CMD_COPY_BUFFER_TO_BUFFER` and
+      `CMD_COPY_TEXTURE_TO_BUFFER` call `renderer_flush` (~2 per frame,
+      `flush 1.9 s/12-14` in the stats), so CPU and GPU never overlap.
+      A buffer-to-buffer copy can be a blit in order; the readback only
+      needs a wait when the CPU reads it (on its fence, like nvnSyncWait).
+    - `gfind()` linearly scans 8 windows on every global load/store;
+      programs that touch one storage buffer could bind the window as a
+      constant, or the scan could start at the last hit.
+    - `switch (pc)` dispatch: each loop iteration goes back through the
+      switch and commits late writes at every case; structured loops for
+      simple back-edges (2584/2760 here, 2952) would let Metal keep values
+      in registers.
+  - The 3D scene was black for a stretch of the first half (HUD fine,
+    ~37:00 to half time) and came back at the half-time cutscene; probably
+    the e_prev = 0 exposure readback (see "The match renders"), not
+    checked. Also 4x `[tex] type mismatch: want 2 have 7 (32x32x32 ...)`:
+    a program samples a 3D LUT as 2D and gets the dummy texture (not the
+    post FS `16de63d00`, which declares `texture3d`).
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -962,12 +1006,14 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   (BOU 0-0 BHA, clock running, radar with moving players, player names,
   "Difficulty changed to Beginner") and the 3D scene renders (see "The
   match renders" in Status). Next: performance (see "Match performance" in
-  Status): run with the 1D-rows fix and confirm `16dff9100` drops from ~98
-  ms (needs getting past the 10+ minute pipeline builds after translator
-  changes: BRX made every instruction a `case`, now fixed, see "Why those
-  pipelines were slow"; confirm in a run; structured control flow would
-  still help the guard loop), then
-  profile again with `FIFA_GPU_PROFILE=2`; the occasional e_prev = 0 exposure readback, and a visual pass over the
+  Status): `16dff9100` is still ~95% of GPU time in open play after the
+  rows1d fix (~120 ms per dispatch, see "second round"): run with
+  `FIFA_SHADER_GUARD=10000 FIFA_DBG_CSW=16dff9100` to confirm the guard and
+  read the edge count against the 4 KB of shared memory; then the
+  flush-drains on buffer copies, `gfind`, structured loops. The BRX
+  pipeline fix is confirmed in a run. The
+  occasional e_prev = 0 exposure readback (seen again: black scene for part
+  of the first half), and a visual pass over the
   match (shadows, reflections, the remaining ~10 skipped draws per frame:
   `16fd3ac00`, `171855700` TXD.B). Shader coverage (`build/shtool` over
   the dumps): 407/437 translate; the rest are unknown 3b03 (7 FS), bindless

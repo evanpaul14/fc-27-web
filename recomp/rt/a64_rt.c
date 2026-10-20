@@ -31,7 +31,7 @@ static uint64_t recpe_core(uint64_t fraction, int e, int bias2) {
   return ((uint64_t)re << 52) | fraction;  /* exponent above the 52-bit fraction */
 }
 
-uint32_t a64_frecpe32(uint32_t x) {
+static uint32_t sw_frecpe32(uint32_t x) {
   uint32_t sign = x & 0x80000000u, exp = (x >> 23) & 0xff, frac = x & 0x7fffff;
   if (exp == 0xff) return frac ? x | 0x400000u : sign;
   if (exp == 0 && frac == 0) return sign | 0x7f800000u;
@@ -39,7 +39,7 @@ uint32_t a64_frecpe32(uint32_t x) {
   uint64_t r = recpe_core((uint64_t)frac << 29, exp, 253);
   return sign | (uint32_t)(((r >> 52) & 0xff) << 23) | (uint32_t)((r & MASK52) >> 29);
 }
-uint64_t a64_frecpe64(uint64_t x) {
+static uint64_t sw_frecpe64(uint64_t x) {
   uint64_t sign = x & (1ull << 63), exp = (x >> 52) & 0x7ff, frac = x & MASK52;
   if (exp == 0x7ff) return frac ? x | (1ull << 51) : sign;
   if (exp == 0 && frac == 0) return sign | 0x7ff0000000000000ull;
@@ -57,7 +57,7 @@ static uint64_t rsqrte_core(uint64_t fraction, int e, int bias3, uint64_t *re_ou
   *re_out = (uint64_t)((bias3 - e) / 2);
   return rsqrt_est(scaled) & 0xff;
 }
-uint32_t a64_frsqrte32(uint32_t x) {
+static uint32_t sw_frsqrte32(uint32_t x) {
   uint32_t sign = x & 0x80000000u, exp = (x >> 23) & 0xff, frac = x & 0x7fffff;
   if (exp == 0xff && frac) return x | 0x400000u;
   if (exp == 0 && frac == 0) return sign | 0x7f800000u;
@@ -66,7 +66,7 @@ uint32_t a64_frsqrte32(uint32_t x) {
   uint64_t re, est = rsqrte_core((uint64_t)frac << 29, exp, 380, &re);
   return (uint32_t)((re & 0xff) << 23) | (uint32_t)(est << 15);
 }
-uint64_t a64_frsqrte64(uint64_t x) {
+static uint64_t sw_frsqrte64(uint64_t x) {
   uint64_t sign = x & (1ull << 63), exp = (x >> 52) & 0x7ff, frac = x & MASK52;
   if (exp == 0x7ff && frac) return x | (1ull << 51);
   if (exp == 0 && frac == 0) return sign | 0x7ff0000000000000ull;
@@ -75,6 +75,22 @@ uint64_t a64_frsqrte64(uint64_t x) {
   uint64_t re, est = rsqrte_core(frac, (int)exp, 3068, &re);
   return ((re & 0x7ff) << 52) | (est << 44);
 }
+
+/* An AArch64 host has the same estimate instructions (bit-identical to the pseudocode above over every float32 and
+ * 200M random float64 inputs, NaNs and subnormals included), and the software FRSQRTE's search loop is slow. */
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#include <string.h>
+uint32_t a64_frecpe32(uint32_t x) { float f; memcpy(&f, &x, 4); f = vrecpes_f32(f); memcpy(&x, &f, 4); return x; }
+uint64_t a64_frecpe64(uint64_t x) { double f; memcpy(&f, &x, 8); f = vrecped_f64(f); memcpy(&x, &f, 8); return x; }
+uint32_t a64_frsqrte32(uint32_t x) { float f; memcpy(&f, &x, 4); f = vrsqrtes_f32(f); memcpy(&x, &f, 4); return x; }
+uint64_t a64_frsqrte64(uint64_t x) { double f; memcpy(&f, &x, 8); f = vrsqrted_f64(f); memcpy(&x, &f, 8); return x; }
+#else
+uint32_t a64_frecpe32(uint32_t x) { return sw_frecpe32(x); }
+uint64_t a64_frecpe64(uint64_t x) { return sw_frecpe64(x); }
+uint32_t a64_frsqrte32(uint32_t x) { return sw_frsqrte32(x); }
+uint64_t a64_frsqrte64(uint64_t x) { return sw_frsqrte64(x); }
+#endif
 
 /* ---- AES ---- */
 static uint8_t sbox[256], isbox[256];

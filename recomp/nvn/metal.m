@@ -255,8 +255,10 @@ static id<MTLTexture> buffer_texture_in_place(NvnTexture *t, MTLTextureDescripto
     uint32_t bpb = nvn_format_info(t->format)->bpb;
     uint64_t row = (uint64_t)d.width * bpb, off;
     NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:d.pixelFormat];
+    if (!align) return nil;
+    if (d.height == 1) row = (row + align - 1) / align * align;  // (one row: the pitch only has to be aligned)
     id<MTLBuffer> pb = renderer_pool_buffer(t->pool->storage + t->pool_offset, row * d.height, &off);
-    if (!pb || !align || off % align || row % align) return nil;
+    if (!pb || off % align || row % align) return nil;
     d.storageMode = MTLStorageModeShared;
     d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
     return [pb newTextureWithDescriptor:d offset:off bytesPerRow:row];
@@ -299,9 +301,10 @@ static void create_backend_texture(NvnTexture *t, TexBackend *b) {
     id<MTLTexture> tex = buffer_texture_in_place(t, d, mf);
     static int nzero, ncopy;
     if (t->target == 10 && (tex ? nzero++ : ncopy++) < 5)
-        LOG("[metal] buffer texture %s: fmt %#x %u texels at %#llx (pool %s)\n", tex ? "in place" : "copied", t->format,
-            t->width, (unsigned long long)(t->pool ? t->pool->storage + t->pool_offset : 0),
-            !t->pool ? "none" : t->pool->storage ? "physical" : "virtual");
+        LOG("[metal] buffer texture %s: fmt %#x %u texels at %#llx (pool %s, align %lu)\n", tex ? "in place" : "copied",
+            t->format, t->width, (unsigned long long)(t->pool ? t->pool->storage + t->pool_offset : 0),
+            !t->pool ? "none" : t->pool->storage ? "physical" : "virtual",
+            (unsigned long)[dev minimumLinearTextureAlignmentForPixelFormat:d.pixelFormat]);
     if (tex) b->zero_copy = b->uploaded = true;
     else {
         d.storageMode = MTLStorageModePrivate;

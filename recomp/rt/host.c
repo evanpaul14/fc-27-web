@@ -87,28 +87,36 @@ uint64_t host_symbol_addr(const char *name, uint64_t lo, uint64_t hi) {
 
 /* ---- dispatch ---- */
 /* Indirect calls (vtables, function pointers) look up their target here. The table has ~340k entries (5 MB), so the
- * binary search is ~19 dependent cache misses; a direct-mapped cache in front holds (addr << 32 | index + 1) in one
- * word, so threads can share it without locks (guest code addresses are below 4 GB). */
+ * binary search is ~19 dependent cache misses; a direct-mapped cache in front holds the guest address and the host
+ * function in one word (addr << 32 | the function's offset from a64_call in 4-byte units: guest code is below 4 GB and
+ * the program's text spans well under 8 GB), so a hit is one load and threads share it without locks. */
 #define FN_CACHE_BITS 16
 static _Atomic uint64_t fn_cache[1u << FN_CACHE_BITS];
 
 static const A64Fn *find_fn(uint64_t t) {
-  uint32_t slot = (uint32_t)((t >> 2) ^ (t >> (2 + FN_CACHE_BITS))) & ((1u << FN_CACHE_BITS) - 1);
-  uint64_t e = atomic_load_explicit(&fn_cache[slot], memory_order_relaxed);
-  if (e >> 32 == t && (uint32_t)e) return &a64_fn_table[(uint32_t)e - 1];
   unsigned lo = 0, hi = a64_fn_count;
   while (lo < hi) {
     unsigned m = (lo + hi) / 2;
     if (a64_fn_table[m].addr < t) lo = m + 1; else hi = m;
   }
-  if (!(lo < a64_fn_count && a64_fn_table[lo].addr == t)) return 0;
-  if (t >> 32 == 0) atomic_store_explicit(&fn_cache[slot], t << 32 | (lo + 1), memory_order_relaxed);
-  return &a64_fn_table[lo];
+  return lo < a64_fn_count && a64_fn_table[lo].addr == t ? &a64_fn_table[lo] : 0;
+}
+
+static A64Func cached_fn(uint64_t t) {
+  uint32_t slot = (uint32_t)((t >> 2) ^ (t >> (2 + FN_CACHE_BITS))) & ((1u << FN_CACHE_BITS) - 1);
+  uint64_t e = atomic_load_explicit(&fn_cache[slot], memory_order_relaxed);
+  if (e >> 32 == t && t) return (A64Func)((intptr_t)a64_call + (intptr_t)(int32_t)(uint32_t)e * 4);
+  const A64Fn *f = find_fn(t);
+  if (!f) return 0;
+  intptr_t d = ((intptr_t)f->fn - (intptr_t)a64_call) / 4;
+  if (t >> 32 == 0 && d == (int32_t)d && ((intptr_t)f->fn & 3) == 0)
+    atomic_store_explicit(&fn_cache[slot], t << 32 | (uint32_t)(int32_t)d, memory_order_relaxed);
+  return f->fn;
 }
 
 void a64_call(CPU *c, uint64_t t) {
-  const A64Fn *f = find_fn(t);
-  if (f) { f->fn(c); return; }
+  A64Func fn = cached_fn(t);
+  if (fn) { fn(c); return; }
   if (t >= HOST_THUNK_BASE && t < HOST_THUNK_BASE + 16 * n_thunks && !(t & 15)) {
     host_thunk_name = thunks[(t - HOST_THUNK_BASE) / 16].name;
     thunks[(t - HOST_THUNK_BASE) / 16].fn(c);

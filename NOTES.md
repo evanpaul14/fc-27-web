@@ -1028,6 +1028,14 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   fall back to the copy (the first 5 of each kind are logged as `buffer texture in place / copied`). b12 vs b10:
   0.308-0.325 -> 0.285-0.289 Gi/frame, 52.7-53.7 -> 46.4-47.1 CPU ms/frame; HUD, radar, banners look right. Since the
   b5 baseline: -22% instructions, -28% CPU time per frame.
+  One-row buffer textures round their pitch up to the alignment (16), so none fall back now (b13).
+- FRECPE / FRSQRTE on an AArch64 host use the host instructions (`vrecpes_f32` etc.): bit-identical to the
+  pseudocode versions over all 2^32 float32 inputs and 200M random float64 ones (NaNs, subnormals), and the software
+  FRSQRTE's search loop was ~200 samples per 10 s. `a64_call`'s cache now holds the host function itself (offset from
+  `a64_call` in 4-byte units) so a hit is one load. b14: 0.274-0.284 Gi, 46.2-46.5 CPU ms per frame (b12: 0.285-0.289,
+  46.4-47.1). What's left on the CPU is mostly guest code (the hottest single function, `F_0e58fab0`, ~700 samples
+  per 10 s, is a 24 KB-stack game function), i.e. translator quality: structured loops, keeping guest registers in
+  host registers across a function.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below

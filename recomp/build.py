@@ -532,6 +532,7 @@ def cname(a):
     return f'F_{a:08x}'
 
 
+RESTRICT = True  # --no-restrict
 CHUNK = 4000  # functions above 1.5x this are split into chunk functions
 
 
@@ -548,7 +549,11 @@ def emit_func(p, fn, built, hle, decls):
             lines.insert(0, f'  goto L_{fn.start:x};')
         jbs = ''.join(f'  jmp_buf JB_{a:x};\n' for a in body
                       if p.insn(a).kind == 'bl' and p.insn(a).target in p.setjmp_calls)
-        return head + f'WEAK void {cname(fn.start)}(CPU *c) {{\n  Flags F = {{0}};\n' + jbs + '\n'.join(lines) + '\n}'
+        # restrict: guest stores (through M) never reach the CPU struct, so guest registers can stay in host
+        # registers between calls. Not with a setjmp: longjmp would bring back host registers cached before it.
+        cq = 'CPU *' if jbs or not RESTRICT else 'CPU *restrict '
+        return (head + f'WEAK void {cname(fn.start)}({cq}c) {{\n  uint8_t *const M = mem;\n  Flags F = {{0}};\n'
+                + jbs + '\n'.join(lines) + '\n}')
     chunks = [body[i:i + CHUNK] for i in range(0, len(body), CHUNK)]
     out = []
     for k, ch in enumerate(chunks):
@@ -558,8 +563,8 @@ def emit_func(p, fn, built, hle, decls):
         if any(p.insn(a).kind == 'bl' and p.insn(a).target in p.setjmp_calls for a in ch):
             raise ValueError(f'setjmp call in chunked function {fn.start:#x}: its jmp_buf would not outlive the chunk')
         cases = ' '.join(f'case {t:#x}ull: goto L_{t:x};' for t in entries)
-        out.append(f'static uint64_t {cname(fn.start)}_{k}(CPU *c, uint64_t pc) {{\n'
-                   f'  Flags F = c->fl;\n'
+        out.append(f'static uint64_t {cname(fn.start)}_{k}(CPU *{"restrict " if RESTRICT else ""}c, uint64_t pc) {{\n'
+                   f'  uint8_t *const M = mem;\n  Flags F = c->fl;\n'
                    f'  switch (pc) {{ {cases} default: a64_bad_jump(c, {fn.start:#x}ull, pc); return 0; }}\n'
                    + '\n'.join(lines) + '\n  return 0;\n}')
     disp = ' else '.join(f'if (pc < {chunks[k + 1][0]:#x}ull) pc = {cname(fn.start)}_{k}(c, pc);'
@@ -746,6 +751,8 @@ def main():
     ap.add_argument('--extra-roots', default=None)
     ap.add_argument('--force', action='store_true', help='regenerate every unit')
     ap.add_argument('--hle-only', action='store_true', help='only rewrite hle_table.c')
+    ap.add_argument('--no-restrict', action='store_true',
+                    help='plain CPU *c: guest registers exact in CPU at a fault (crash dumps), slower')
     args = ap.parse_args()
     t0 = time.time()
     p = Program(args.bdir)
@@ -773,7 +780,8 @@ def main():
 
     gdir = os.path.join(args.bdir, 'gen')
     os.makedirs(gdir, exist_ok=True)
-    global _P, _BUILT, _HLE, _GDIR
+    global _P, _BUILT, _HLE, _GDIR, RESTRICT
+    RESTRICT = not args.no_restrict
     if args.all:
         order = sorted(f for f in p.starts if p.is_text(f))
         funcs = None
@@ -788,7 +796,7 @@ def main():
     buckets = collections.defaultdict(list)
     for f in order:
         buckets[f >> BUCKET_SHIFT].append(f)
-    base = inputs_hash(args.bdir)
+    base = inputs_hash(args.bdir) + ('' if RESTRICT else ' no-restrict')
     keys_path = os.path.join(gdir, 'keys.json')
     old_keys = json.load(open(keys_path)) if os.path.exists(keys_path) and not args.force else {}
     new_keys, jobs = {}, []
@@ -830,7 +838,8 @@ def main():
                f'{p.by_name["_ZN2nn2ro6detail36g_pLookupGlobalManualFunctionPointerE"]:#x}ull;']
     write_if_changed(os.path.join(gdir, 'layout.c'), '\n'.join(layout) + '\n')
     # (not a make dependency of the units, so additions here don't rebuild them all)
-    write_if_changed(os.path.join(gdir, 'gen.h'), '#include "../../recomp/rt/runtime.h"\n#include <setjmp.h>\n'
+    write_if_changed(os.path.join(gdir, 'gen.h'), '#define MEMB M  /* the local copy of mem in each generated function (cpu.h) */\n'
+                     '#include "../../recomp/rt/runtime.h"\n#include <setjmp.h>\n'
                      '/* host context of the setjmp call being made (recomp/hle/setjmp.c) */\n'
                      'extern __thread jmp_buf *a64_pending_jb;\n')
     json.dump({'functions': len(order), 'instructions': stats['insns'], 'tus': tu_i,

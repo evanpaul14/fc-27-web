@@ -2,7 +2,10 @@
 # (run recomp/image.py and recomp/build.py first).
 B := ../build
 CC := cc
-CFLAGS := -O1 -w -mllvm -enable-misched=false -mllvm -global-isel -mllvm -global-isel-abort=0
+# -O2 for GVN: with `CPU *restrict c` it keeps guest registers in host registers across guest stores. Capture
+# tracking gives up on pointers with over 100 uses (c has thousands) and then ignores restrict, hence the limit.
+CFLAGS := -O2 -w -mllvm -enable-misched=false -mllvm -global-isel -mllvm -global-isel-abort=0 \
+  -mllvm -capture-tracking-max-uses-to-explore=1000000
 # Largest units first so the long ones don't finish last.
 GEN := $(shell ls -S $(B)/gen/*.c 2>/dev/null)
 OBJ := $(GEN:$(B)/gen/%.c=$(B)/obj/%.o)

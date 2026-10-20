@@ -256,7 +256,8 @@ from the roots (215k functions), which rewrites every unit and costs a full
     each job under ~0.5 GB so `make -j8` fits in 8 GB; largest units build
     first. Flags live in a function-local `Flags F` (14% smaller code,
     same compile time).
-  - A full rebuild is ~43 min (50.5M instructions, 768 units). Only C
+  - A full rebuild is ~43 min (50.5M instructions, 768 units; ~61 min since
+    the switch to -O2, see "Guest registers across guest stores"). Only C
     files whose text changed are rewritten, so a generator fix that touches
     few functions recompiles in minutes. New function starts only touch
     the buckets that contain them or call them (180 new starts: 97 units,
@@ -1036,6 +1037,21 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   46.4-47.1). What's left on the CPU is mostly guest code (the hottest single function, `F_0e58fab0`, ~700 samples
   per 10 s, is a 24 KB-stack game function), i.e. translator quality: structured loops, keeping guest registers in
   host registers across a function.
+- Guest registers across guest stores (b15 profile, b16): in b15 72-80% of busy samples are guest code over 300+
+  functions (`a64_call` 4-5%, the rest of the runtime 1-2% each). The generated code reloaded the global `mem` and
+  every guest register it had read from `c` after each guest store (~3 extra instructions per store): a store through
+  `mem` may alias both. Now each generated function copies `mem` into a local `M` (cpu.h `MEMB`; `LD64` etc. are
+  macros over `ld64(M, a)`) and takes `CPU *restrict c` (the `CPU` lives in the host `Thread`, never in guest memory).
+  Functions with a guest setjmp keep plain `CPU *c`: a longjmp would bring back host registers cached before it.
+  `build.py --no-restrict` turns it off for crash diagnosis (with restrict, guest registers in `CPU` can be stale at a
+  fault mid-block; calls and returns still write them back). Two catches: `-O1` has no GVN, so restrict changes nothing
+  there (the generated code is `-O2` now); and capture tracking gives up on pointers with over 100 uses and then
+  ignores restrict (`-mllvm -capture-tracking-max-uses-to-explore=1000000`). `F_0e58fab0`: 20,489 -> 13,062
+  instructions, 2,603 -> 1,125 loads from `c`. Full rebuild 43 -> 61 min, peak memory per unit unchanged (~1.1 GB on
+  the largest), binary 726 -> 536 MB. b16 vs b15: 0.279-0.284 -> 0.166-0.169 Gi/frame (-40%); CPU ms per frame about
+  the same (52.0 / 45.7 vs 46.3) but with the P cores at 1.29-1.46 GHz instead of 2.73, i.e. ~half the cycles per
+  frame; fence waits 0 -> 6-7 ms/frame (the CPU now waits on the GPU). No faults; open play and close-ups look as
+  before (the black arms/hands in close-ups were already there in b8).
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -1187,8 +1203,8 @@ round") and blits on by default ("Blits", "Match profile"). In order:
    on by default), ~~`a64_call` lookups, texture gathers, ring allocation,
    constant copies~~ ("CPU cost per frame, first round"), `upload_texture`'s
    per-frame change checks, `gfind`'s window scan, the ~10 MB/frame of
-   uniform snapshots, structured loops instead of `switch (pc)` for simple
-   back-edges. Measure each with `tools/bench.py` + `tools/benchsum.py`
+   uniform snapshots, ~~guest registers across guest stores~~ (`restrict`,
+   -O2), structured loops instead of `switch (pc)` for simple back-edges. Measure each with `tools/bench.py` + `tools/benchsum.py`
    (cost per frame), never while building.
    The second 30 fps lock (see "The 30 fps cap"): find it with `fps 60` and
    `FIFA_LOG_WAITS=1`, if uncapping is still wanted.

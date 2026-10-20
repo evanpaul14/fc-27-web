@@ -30,19 +30,35 @@ typedef struct CPU {
 extern uint8_t *mem;
 
 #define A64_INLINE static inline __attribute__((always_inline))
-#define G(a) ((void *)(mem + (uint64_t)(a)))
+/* Base of guest memory at the point of use. Generated functions copy `mem`
+ * into a local `M` at entry (gen.h defines MEMB as M): a guest store may alias
+ * the global, so through it every store forced a reload of the base. */
+#ifndef MEMB
+#define MEMB mem
+#endif
+#define G(a) ((void *)(MEMB + (uint64_t)(a)))
 
 /* ---- memory ---- */
-A64_INLINE uint8_t  LD8(uint64_t a)  { return *(uint8_t *)G(a); }
-A64_INLINE uint16_t LD16(uint64_t a) { uint16_t t; memcpy(&t, G(a), 2); return t; }
-A64_INLINE uint32_t LD32(uint64_t a) { uint32_t t; memcpy(&t, G(a), 4); return t; }
-A64_INLINE uint64_t LD64(uint64_t a) { uint64_t t; memcpy(&t, G(a), 8); return t; }
-A64_INLINE void ST8(uint64_t a, uint8_t v)   { *(uint8_t *)G(a) = v; }
-A64_INLINE void ST16(uint64_t a, uint16_t v) { memcpy(G(a), &v, 2); }
-A64_INLINE void ST32(uint64_t a, uint32_t v) { memcpy(G(a), &v, 4); }
-A64_INLINE void ST64(uint64_t a, uint64_t v) { memcpy(G(a), &v, 8); }
-A64_INLINE V128 LDQ(uint64_t a) { V128 t; memcpy(&t, G(a), 16); return t; }
-A64_INLINE void STQ(uint64_t a, V128 v) { memcpy(G(a), &v, 16); }
+A64_INLINE uint8_t  ld8(uint8_t *m, uint64_t a)  { return m[a]; }
+A64_INLINE uint16_t ld16(uint8_t *m, uint64_t a) { uint16_t t; memcpy(&t, m + a, 2); return t; }
+A64_INLINE uint32_t ld32(uint8_t *m, uint64_t a) { uint32_t t; memcpy(&t, m + a, 4); return t; }
+A64_INLINE uint64_t ld64(uint8_t *m, uint64_t a) { uint64_t t; memcpy(&t, m + a, 8); return t; }
+A64_INLINE void st8(uint8_t *m, uint64_t a, uint8_t v)   { m[a] = v; }
+A64_INLINE void st16(uint8_t *m, uint64_t a, uint16_t v) { memcpy(m + a, &v, 2); }
+A64_INLINE void st32(uint8_t *m, uint64_t a, uint32_t v) { memcpy(m + a, &v, 4); }
+A64_INLINE void st64(uint8_t *m, uint64_t a, uint64_t v) { memcpy(m + a, &v, 8); }
+A64_INLINE V128 ldq(uint8_t *m, uint64_t a) { V128 t; memcpy(&t, m + a, 16); return t; }
+A64_INLINE void stq(uint8_t *m, uint64_t a, V128 v) { memcpy(m + a, &v, 16); }
+#define LD8(a) ld8(MEMB, (a))
+#define LD16(a) ld16(MEMB, (a))
+#define LD32(a) ld32(MEMB, (a))
+#define LD64(a) ld64(MEMB, (a))
+#define ST8(a, v) st8(MEMB, (a), (v))
+#define ST16(a, v) st16(MEMB, (a), (v))
+#define ST32(a, v) st32(MEMB, (a), (v))
+#define ST64(a, v) st64(MEMB, (a), (v))
+#define LDQ(a) ldq(MEMB, (a))
+#define STQ(a, v) stq(MEMB, (a), (v))
 
 #define LDA(bits, a) __atomic_load_n((uint##bits##_t *)G(a), __ATOMIC_ACQUIRE)
 #define STL(bits, a, v) __atomic_store_n((uint##bits##_t *)G(a), (uint##bits##_t)(v), __ATOMIC_RELEASE)

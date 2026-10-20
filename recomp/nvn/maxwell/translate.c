@@ -100,8 +100,8 @@ typedef struct {
     int bl_slot[64], nbl;
     int img_slot[8];              // NVN image bindings (c[2][0x120 + 8 * i]) -> slot + 1
     uint8_t img_access[64];       // per slot: 1 read, 2 written (SULD / SUST)
-    const uint64_t *words;        // instruction words, and the index of the one being translated
-    size_t cur;
+    const uint64_t *words;        // instruction words, their count, and the index of the one being translated
+    size_t nwords, cur;
     bool fail;
     bool branchy;  // program uses the pc state machine
     int ipa_mode;  // interpolation mode of the IPA being translated (-1 for plain loads)
@@ -562,6 +562,12 @@ static bool emit_half(Ctx *c, uint64_t w) {
 }
 
 // ------------------------------------------------------------------ textures
+// TEXS / TLDS component mask: bits 50-52 index a table that depends on whether there is a second result pair
+static uint32_t texs_mask(uint64_t w) {
+    static const uint32_t m2[] = {1, 2, 4, 8, 3, 9, 10, 12}, m4[] = {7, 11, 13, 14, 15, 15, 15, 15};
+    return (bits(w, 28, 8) == RZ ? m2 : m4)[bits(w, 50, 3)];
+}
+
 // `ref` holds the slot + 1 for this texture (0: not allocated yet); a new slot reads its handle at `off`
 static int tex_slot_at(Ctx *c, int *ref, uint32_t off, int type, bool shadow, bool array) {
     if (*ref) {
@@ -621,9 +627,10 @@ static bool writes_reg(uint64_t w, int r) {
     // multi-register results: TEX / TEX.B one register per mask component, TEXS / TLDS two pairs
     if ((w & 0xfc38000000000000ull) == 0xc038000000000000ull || (w & 0xfff8000000000000ull) == 0xdeb8000000000000ull)
         return r > d && r < d + __builtin_popcount((unsigned)bits(w, 31, 4));
-    if ((w & 0xf400000000000000ull) == 0xd000000000000000ull) {
-        int d1 = (int)bits(w, 28, 8);
-        return r == d + 1 || (d1 != RZ && (r == d1 || r == d1 + 1));
+    if ((w & 0xf400000000000000ull) == 0xd000000000000000ull) {  // as write_tex_result: .F16 packs pairs
+        int d1 = (int)bits(w, 28, 8), n = __builtin_popcount(texs_mask(w));
+        if (!bits(w, 59, 1)) return d1 != RZ && r == d1;
+        return (r == d + 1 && n > 1) || (d1 != RZ && (r == d1 || (r == d1 + 1 && n > 3)));
     }
     // loads: LDG / LDL / LDS / LDC size in bits 48-50, LD in 53-55 (5 = .64, 6 = .128)
     if (o8 == 0xeed0 || o8 == 0xef40 || o8 == 0xef48 || o8 == 0xef90 || (op & 0xe000) == 0x8000) {
@@ -650,15 +657,45 @@ static bool pred_written_between(Ctx *c, size_t from, size_t to, int p) {
     return false;
 }
 
+// Can execution continue from w to the next instruction? False for an unpredicated BRA (condition code T), BRX,
+// JMP, EXIT, RET, BRK, CONT or SYNC.
+static bool falls_through(uint64_t w) {
+    uint16_t op12 = (uint16_t)(w >> 52);
+    bool term = op12 == 0xe24 || op12 == 0xe25 || op12 == 0xe21 || op12 == 0xe30 || op12 == 0xe32 || op12 == 0xe34 ||
+                op12 == 0xe35 || (w & 0xfff8000000000000ull) == 0xf0f8000000000000ull;
+    return !term || bits(w, 16, 4) != PT || ((op12 == 0xe24 || op12 == 0xe21) && bits(w, 0, 5) != 0xf);
+}
+
+// The only instruction that branches to `target` (a direct BRA), or SIZE_MAX when there are none, several, or the
+// target is also an SSY / PBK destination (reached by SYNC / BRK, which don't name it).
+static size_t branch_into(Ctx *c, size_t target) {
+    size_t found = SIZE_MAX;
+    for (size_t k = 1; k < c->nwords; k++) {
+        if (k % 4 == 0) continue;
+        uint64_t w = c->words[k];
+        uint16_t op12 = (uint16_t)(w >> 52);
+        if (op12 != 0xe24 && op12 != 0xe29 && op12 != 0xe2a) continue;
+        if ((size_t)((int64_t)(k + 1) + sbits(w, 20, 24) / 8) != target) continue;
+        if (op12 != 0xe24 || found != SIZE_MAX) return SIZE_MAX;
+        found = k;
+    }
+    return found;
+}
+
 // The constant-buffer word(s) a handle register holds at instruction `at`. A write under a predicate counts when the
 // using instruction has the same predicate (`@P3 MOV r10, c[2][0x120]; @P3 SUST ... r10`) and nothing in between
 // sets it; c->trace_use is that instruction.
 static int trace_handle(Ctx *c, size_t at, int r, uint32_t *offs, int n, int depth) {
     if (r == RZ || depth > 6 || n < 0) return -1;
     if (depth == 0) c->trace_use = at;
+    int hops = 0;
     for (size_t j = at; j-- > 0;) {
         if (j % 4 == 0) continue;
         uint64_t w = c->words[j];
+        if (!falls_through(w) && hops < 8) {  // the block starts at j + 1: continue from the one branch that enters it
+            size_t k = branch_into(c, j + 1);  // (with several, keep walking straight back as before)
+            if (k != SIZE_MAX) { j = k; hops++; continue; }
+        }
         if (!writes_reg(w, r)) continue;
         uint32_t wp = (uint32_t)bits(w, 16, 4), up = (uint32_t)bits(c->words[c->trace_use], 16, 4);
         if (wp != PT && (wp != up || pred_written_between(c, j, c->trace_use, (int)(wp & 7))))
@@ -698,6 +735,14 @@ static int tex_slot_bindless(Ctx *c, uint32_t a, uint32_t b, int type, bool shad
         t->bindless_offset = b;
     }
     return s;
+}
+
+// The slot for the bindless handle in register r at the current instruction (c[2] texture | sampler words), or -1
+// (and the shader fails) if it is built any other way.
+static int bindless_slot(Ctx *c, int r, int type, bool shadow, bool array) {
+    uint32_t ho[2];
+    if (trace_handle(c, c->cur, r, ho, 0, 0) != 2) { fail(c, "bindless tex at %#zx: handle r%d not from c[2]", c->cur * 8, r); return -1; }
+    return tex_slot_bindless(c, ho[0], ho[1], type, shadow, array);
 }
 
 static const char *tex_type_name(int t) {
@@ -896,15 +941,7 @@ static void emit_texs(Ctx *c, uint64_t w, bool fetch) {
     int d0 = (int)bits(w, 0, 8), d1 = (int)bits(w, 28, 8), a = (int)bits(w, 8, 8), b = (int)bits(w, 20, 8);
     uint32_t index = (uint32_t)bits(w, 36, 13);
     int info = (int)bits(w, 53, 4);
-    int msel = (int)bits(w, 50, 3);
-    uint32_t mask;
-    if (d1 == RZ) {
-        static const uint32_t m2[] = {1, 2, 4, 8, 3, 9, 10, 12};
-        mask = m2[msel];
-    } else {
-        static const uint32_t m4[] = {7, 11, 13, 14, 15, 15, 15, 15};
-        mask = m4[msel];
-    }
+    uint32_t mask = texs_mask(w);
     char ra[16], ra1[16], rb[16], rb1[16];
     const char *A = reg(c, a, ra), *A1 = reg(c, a == RZ ? RZ : a + 1, ra1), *Bv = reg(c, b, rb),
                *B1 = reg(c, b == RZ ? RZ : b + 1, rb1);
@@ -987,9 +1024,7 @@ static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
     int ncoord = target == 0 ? 1 : target == 1 ? 2 : 3;
     int slot;
     if (bindless) {
-        uint32_t ho[2];
-        if (trace_handle(c, c->cur, b, ho, 0, 0) != 2) { fail(c, "bindless tex at %#zx: handle r%d not from c[2]", c->cur * 8, b); return; }
-        slot = tex_slot_bindless(c, ho[0], ho[1], type, dc, array);
+        if ((slot = bindless_slot(c, b, type, dc, array)) < 0) return;
         b++;  // the handle is the first meta register; LOD, offset and reference follow it
     } else {
         slot = tex_slot(c, index, type, dc, array);
@@ -1098,9 +1133,8 @@ static void emit_tld4_bindless(Ctx *c, uint64_t w) {
     if (c->glsl) { fail(c, "tld4 (GLSL)"); return; }
     if (target == 0 || target == 2 || offmode > 1) { fail(c, "tld4 target %d offset %d", target, offmode); return; }
     int type = target == 1 ? (array ? TEXTYPE_2D_ARRAY : TEXTYPE_2D) : (array ? TEXTYPE_CUBE_ARRAY : TEXTYPE_CUBE);
-    uint32_t ho[2];
-    if (trace_handle(c, c->cur, b, ho, 0, 0) != 2) { fail(c, "bindless tex at %#zx: handle r%d not from c[2]", c->cur * 8, b); return; }
-    int slot = tex_slot_bindless(c, ho[0], ho[1], type, dc, array);
+    int slot = bindless_slot(c, b, type, dc, array);
+    if (slot < 0) return;
     int ar = a, pr = b + 1;
     char coords[160] = "", layer[64] = "", off[96] = "", dref[48] = "", tmp[48], call[1024];
     if (array) { sprintf(layer, ", min(uint(r%d), t%d.get_array_size() - 1u)", a, slot); c->reg_used[a] = 1; ar = a + 1; }
@@ -1125,6 +1159,26 @@ static void emit_tld4_bindless(Ctx *c, uint64_t w) {
         sprintf(call, "t%d.gather_compare(s%d, %s(%s)%s%s%s)", slot, slot, vec, coords, layer, dref, off);
     else
         sprintf(call, "t%d.gather(s%d, %s(%s)%s%s, component::%s)", slot, slot, vec, coords, layer, off, comps[comp]);
+    write_tex_result(c, slot, call, mask, d, RZ, false, false);
+}
+
+// TXD.B (bindless, explicit gradients): at gpr8 the handle, then the coordinates (array layer after them); at
+// gpr20 the derivatives interleaved per axis (dx.x, dy.x, dx.y, dy.y). Bits 28-30 target, 31-34 mask, 35 .AOFFI,
+// 50 .LC. Only 2D without offset or LOD clamp so far (the two shaders seen).
+static void emit_txd_bindless(Ctx *c, uint64_t w) {
+    int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), g = (int)bits(w, 20, 8);
+    int target = (int)bits(w, 29, 2);
+    bool array = bits(w, 28, 1), aoffi = bits(w, 35, 1), lc = bits(w, 50, 1);
+    uint32_t mask = (uint32_t)bits(w, 31, 4);
+    if (c->glsl) { fail(c, "txd (GLSL)"); return; }
+    if (target != 1 || array || aoffi || lc) { fail(c, "txd target %d%s%s%s", target, array ? " array" : "", aoffi ? " aoffi" : "", lc ? " lc" : ""); return; }
+    int slot = bindless_slot(c, a, TEXTYPE_2D, false, false);
+    if (slot < 0) return;
+    for (int i = 0; i < 2; i++) c->reg_used[a + 1 + i] = 1;
+    for (int i = 0; i < 4; i++) c->reg_used[g + i] = 1;
+    char call[512];
+    sprintf(call, "t%d.sample(s%d, float2(as_type<float>(r%d), as_type<float>(r%d)), gradient2d(float2(as_type<float>(r%d), as_type<float>(r%d)), float2(as_type<float>(r%d), as_type<float>(r%d))))",
+            slot, slot, a + 1, a + 2, g, g + 2, g + 1, g + 3);
     write_tex_result(c, slot, call, mask, d, RZ, false, false);
 }
 
@@ -1335,6 +1389,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         emit_tld(c, w);
     } else if (OPM(0xdef8000000000000ull, 0xfff8000000000000ull)) {  // TLD4.B (bindless gather)
         emit_tld4_bindless(c, w);
+    } else if (OPM(0xde78000000000000ull, 0xfff8000000000000ull)) {  // TXD.B (bindless, gradients)
+        emit_txd_bindless(c, w);
     } else if (OPM(0xdf48000000000000ull, 0xfff8000000000000ull)) {  // TXQ
         uint32_t index = (uint32_t)bits(w, 36, 13);
         int qt = (int)bits(w, 22, 6);
@@ -2503,6 +2559,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     c->branchy = any_branch;
     c->bar_rounds = c->bar_rounds && any_branch && !c->glsl;
     c->words = (const uint64_t *)code;
+    c->nwords = end;
     for (size_t i = 0; i < end && !c->fail; i++) {
         if (i % 4 == 0) continue;
         c->cur = i;

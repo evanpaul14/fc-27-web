@@ -952,6 +952,22 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     "unknown instructions" were constant data. Real failures: bindless
     handles not from c[2] (4 FS, 1 CS), 3a2c (2 CS), surface type 1
     (2 CS), TXD.B de7a (2 FS).
+  - Shader coverage, next round: 431/437. TXD.B (`de7a`: handle at gpr8,
+    then the coordinates; gpr20 the derivatives dx.x, dy.x, dx.y, dy.y ->
+    `gradient2d`; 2D only, .AOFFI/.LC fail) for `171855700` `1718fdb00`.
+    `writes_reg` took a one-component TLDS/TEXS as writing d+1 too, so
+    handle traces stopped on it (`16fcd1300`, `16fd3ac00`); it counts from
+    the component mask now (`texs_mask`, shared with `emit_texs`). The
+    trace walked straight back across an unconditional BRK into
+    `171838a00`'s loop; across a terminator it now continues from the one
+    BRA that enters the block (several: straight back as before). Every
+    shader that translated before gives byte-identical MSL.
+    `FIFA_SKIP_PROGS=<fs>,...` fails chosen fragment programs for A/B runs.
+    In open play the 5 programs took skipped draws from ~65 to 0 per 2 s.
+    Seen in both A/B runs, so not from these: noisy pink/multicolour
+    arms, legs and hands (skin) in the walkout/handshake and close-ups,
+    a black sky, and 12-17 fps in open play with the window shown
+    (28-30 above was with blits; not re-measured hidden).
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -1106,14 +1122,16 @@ round") and blits on by default ("Blits", "Match profile"). In order:
 3. ~~The black 3D scene for part of the first half~~ fixed by the lane
    masks. ~~The 32^3 3D texture sampled as 2D~~ is the game's own stale
    binding, harmless (see "Blits").
-4. Visual pass over the match: shadows, reflections, the remaining ~10
-   skipped draws per frame (`16fd3ac00`, `171855700` TXD.B).
-5. Shader coverage (`build/shtool` over the dumps, now bounded by the
-   compiler constants): 426/437 translate; the rest are bindless handles
-   not from c[2] (4 FS `16e40c500` `16fcd1300` `16fd3ac00` `171838a00`,
-   1 CS: indexed `LDC c[2][r + ...]`), TXD.B `de7a` (2 FS), surface type 1
-   (2 CS), 3a2c (2 CS), SUATOM.
-6. Try the keyboard and a gamepad in the visible window; audio output for
+4. Visual pass over the match: the noisy skin on arms/legs/hands
+   (walkout, handshake, close-ups), the black sky, shadows, reflections.
+   ~~Skipped draws~~ 0 per 2 s in open play now.
+5. Shader coverage (`build/shtool`): 431/437 translate. Left: FS
+   `16e40c500` (texture handle from an indexed `LDC c[2][r + 0x168]` in a
+   loop), surface type 1 = buffer images (3 CS, incl. `16eca9800`; needs
+   texture buffers bound as images), `3a2c` VMNMX (2 CS), SUATOM.
+6. Why open play is at 12-17 fps in the visible window (was 28-30):
+   re-measure with `FIFA_HIDDEN=1` and `prof 1` / `prof 2`.
+7. Try the keyboard and a gamepad in the visible window; audio output for
    `audout.c`'s sink thread; the dark Continue button on the accessibility
    screen (seen before the threading fix; check if it still happens).
 

@@ -1074,6 +1074,15 @@ static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
     maxwell_consts_size = p->stages[1].const_size;
     pr->fi = maxwell_translate(gptr(p->stages[1].code_addr), fmax, STAGE_FRAGMENT, fkey);
     if (!pr->fi->msl) { LOG("[shader] FS translate failed: %s\n", pr->fi->error); pr->failed = true; return nil; }
+    {
+        // FIFA_SKIP_PROGS=<fs code addr hex>,...: treat these as failed translations (A/B a shader's effect)
+        const char *e = getenv("FIFA_SKIP_PROGS");
+        for (char *end; e && *e; e = *end ? end + 1 : end) {
+            unsigned long long a = strtoull(e, &end, 16);
+            if (end == e) break;
+            if (a == p->stages[1].code_addr) { LOG("[shader] FS %llx skipped (FIFA_SKIP_PROGS)\n", a); pr->failed = true; return nil; }
+        }
+    }
     if (getenv("FIFA_SAVE_MSL")) {
         mkdir("build/msl", 0755);
         char path[256];

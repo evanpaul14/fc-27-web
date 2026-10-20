@@ -899,6 +899,19 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     (`meta.txt`; `u<i>` is c[i + 3]); the control command `csdump [n]`
     dumps the next n dispatches of that program. `FIFA_DBG_CSW` lines also
     print the bound uniform buffers.
+- Match check after the barrier fix (2026-10-19, run `build/r4`, update
+  RomFS, screenshots every 45 s through the first half): **the 3D scene no
+  longer goes black**; normal brightness at 39:34 and in stoppage time
+  (46:04 +2'), where it was black from ~37:00 before. So it was the exposure
+  chain's lane masks, not the e_prev readback. The `want 2 have 7`
+  (32x32x32 as 2D) mismatch still shows (2x).
+  - Without profiling: 15-28 fps in open play and cutscenes; the fps line
+    shows ~0.8-1.0 s of every 2 s blocked in `renderer_flush` over ~100
+    waits (`waits flush`), fences 0. With `prof 1` open play drops to 7-9
+    fps (a command buffer per pass), so compare fps with profiling off.
+  - `prof 1` top entries: depth-only passes (`pass 0x0 fs 0`, ~5.5 ms each,
+    ~3 per frame), 1280x720 FS `16ff87600` (~17 ms each), `170a27300`,
+    `16ffd7600`; `16dff9100` is gone from the list.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -1049,10 +1062,9 @@ round"). In order:
    on `CMD_COPY_BUFFER_TO_BUFFER` / `CMD_COPY_TEXTURE_TO_BUFFER`, `gfind`'s
    window scan, structured loops instead of `switch (pc)` for simple
    back-edges. Profile with `prof 1` / `prof 2` after each.
-3. The black 3D scene for part of the first half (likely the e_prev = 0
-   exposure readback, see "The match renders"; recheck first: the exposure
-   chain used the broken lane masks), and the program that
-   samples a 32^3 3D texture as 2D (`[tex] type mismatch: want 2 have 7`).
+3. ~~The black 3D scene for part of the first half~~ fixed by the lane
+   masks. Left: the program that samples a 32^3 3D texture as 2D
+   (`[tex] type mismatch: want 2 have 7`).
 4. Visual pass over the match: shadows, reflections, the remaining ~10
    skipped draws per frame (`16fd3ac00`, `171855700` TXD.B).
 5. Shader coverage (`build/shtool` over the dumps): 407/437 translate; the

@@ -1052,6 +1052,26 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   the same (52.0 / 45.7 vs 46.3) but with the P cores at 1.29-1.46 GHz instead of 2.73, i.e. ~half the cycles per
   frame; fence waits 0 -> 6-7 ms/frame (the CPU now waits on the GPU). No faults; open play and close-ups look as
   before (the black arms/hands in close-ups were already there in b8).
+- GPU profile with stage timestamps (2026-10-20, runs `build/g1`: prof 0/1/2, `build/g2`: prof 0/3/0). New level
+  `FIFA_GPU_PROFILE=3` / `prof 3`: an `MTLCounterSampleBuffer` (4,096-sample ring) with stage-boundary timestamps on
+  every render pass (vertex start/end, fragment start/end) and compute dispatch, resolved in the command buffer's
+  completion handler. Submission is unchanged, so unlike levels 1/2 the numbers are real: GPU 19.2 ms/frame with it vs
+  18.7-18.8 without. Logged per tag as total (first stage start to last stage end), `vtx`, `frag`. (g2's log has the
+  totals 41.67x too big: `sampleTimestamps`' CPU value is already ns; fixed after the run.)
+  - Without thermal pressure (g1, g2: thm 0-1, P 2.5 GHz) open play is CPU 27-28 ms, GPU ~19 ms per frame, fence
+    waits 0: both fit the 30 fps cap with room. b16's 6-7 ms of fence waits were at a 1.3-1.5 GHz P clock.
+  - Per frame (g2, 3,390 frames): stage time (vtx + frag; compute: start to end) sums to 12.5 ms of the 19 ms in
+    command buffers. Main pass (first FS `16f973400`, ~287 draws, 896x504 drawn) **6.5 ms: vertex 2.6, fragment 3.9**,
+    half of all stage time. Then FS `17119b900` 1.0, the two 0x0 depth passes 0.96, `16de63d00` 0.78, the three
+    1280x720 depth passes 0.64, `16e7d0e00` 0.59, the 512x512 shadow pass `16f9f9000` 0.52 (vertex), `16f124700`
+    0.31; every compute dispatch together ~0.4 (`16dff9100` 0.07 for 2).
+  - Gaps: several passes span far more than their stages (0x0 depth 4.8 ms span for 0.96 of work, 1280x720 depth
+    5.3 for 0.64, `16e6d5200` 2.4 for 0.08, `16fc74000` 0.73 for 0.02): they wait for earlier work before starting
+    (Metal's hazard tracking on resources written just before, or the blits between passes). With the ~6.5 ms of
+    command-buffer time that isn't stage time, that's the other place to look.
+  - `prof 1` misranked: the depth-only passes (~10 ms/frame there) are ~1.6 ms of real work; their own command buffer
+    each added the wait to them. `prof 2`'s per-draw passes reload the attachments per draw (glyph quads `16ea35100`:
+    11.3 ms/frame there, 0.15 in reality); use it only to rank draws within one pass.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -1218,6 +1238,8 @@ round") and blits on by default ("Blits", "Match profile"). In order:
    `16e40c500` (texture handle from an indexed `LDC c[2][r + 0x168]` in a
    loop), surface type 1 = buffer images (3 CS, incl. `16eca9800`; needs
    texture buffers bound as images), `3a2c` VMNMX (2 CS), SUATOM.
+   GPU side (see "GPU profile with stage timestamps"): the main pass's vertex stage (2.6 ms; the 287 draws' VS,
+   incl. `gfind`'s window scan for global memory) and fragment stage (3.9 ms), and the waits between passes.
 6. Why open play is at 12-17 fps in the visible window (was 28-30):
    probably the P-core throttling found in "fps vs blits, benchmarked"; re-measure at thermal pressure 0
    with `tools/bench.py` (visible and hidden).

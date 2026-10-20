@@ -158,16 +158,25 @@ static uint32_t tex_wh[2][64][2];       // per bound texture slot: guest size
 // FIFA_GPU_PROFILE=1: every render pass and compute dispatch gets its own command buffer; GPU time is summed per
 // tag (the pass's size and first fragment program, or the compute program) and the top ones are logged with the
 // fps line (renderer_profile_report). FIFA_GPU_PROFILE=2: every draw ends its pass, tagged with its programs
-// (inflated more by reloading the attachments per draw; compare programs within a run).
+// (inflated more by reloading the attachments per draw; compare programs within a run). FIFA_GPU_PROFILE=3:
+// stage-boundary timestamps on every render pass and compute dispatch, submitted as without profiling, so the
+// times are real; passes also get their vertex and fragment time (tiles: a pass's vertex stage can overlap the
+// previous pass's fragments, so the per-pass totals add up to more than the frame).
 // FIFA_CONTROL "prof <n>" changes the level while running.
 static int gpu_profile(void) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("FIFA_GPU_PROFILE"); on = e ? (atoi(e) == 2 ? 2 : 1) : 0; }
+    if (on < 0) {
+        const char *e = getenv("FIFA_GPU_PROFILE");
+        int v = e ? atoi(e) : 0;
+        on = !e ? 0 : v >= 1 && v <= 3 ? v : 1;
+    }
     int c = input_profile_mode();
     return c >= 0 ? c : on;
 }
+static bool prof_split(void) { int p = gpu_profile(); return p == 1 || p == 2; }  // own command buffer per pass
 static uint64_t prof_pass_fs, prof_pass_vs;  // first programs drawn in the open pass
 static void commit_cb(const char *tag);
+static void ts_end(const char *tag);
 
 static int debug_pass_no;
 static void end_pass(void) {
@@ -183,7 +192,8 @@ static void end_pass(void) {
                          (unsigned long long)prof_pass_fs);
             else
                 snprintf(tag, sizeof tag, "pass %ux%u fs %llx", w, h, (unsigned long long)prof_pass_fs);
-            commit_cb(tag);
+            if (gpu_profile() == 3) ts_end(tag);
+            else commit_cb(tag);
         }
         prof_pass_fs = prof_pass_vs = 0;
         if (g_debug_frame && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {
@@ -251,20 +261,117 @@ static void drain_gone(void) {
 }
 
 #define PROF_N 512
-static struct { char tag[64]; double s; int n; } prof[PROF_N];
+// s: seconds (levels 1, 2) or GPU timestamp ticks (level 3, with v/f the vertex and fragment stages' ticks)
+static struct { char tag[64]; double s, v, f; int n; } prof[PROF_N];
 static int nprof;
 static pthread_mutex_t prof_lock = PTHREAD_MUTEX_INITIALIZER;
-static void prof_add(const char *tag, double s) {
+static void prof_add3(const char *tag, double s, double v, double f) {
     pthread_mutex_lock(&prof_lock);
     int i = 0;
     while (i < nprof && strcmp(prof[i].tag, tag)) i++;
     if (i == nprof && nprof < PROF_N) {
         snprintf(prof[nprof].tag, sizeof prof[0].tag, "%s", tag);
-        prof[nprof].s = 0;
+        prof[nprof].s = prof[nprof].v = prof[nprof].f = 0;
         prof[nprof++].n = 0;
     }
-    if (i < nprof) { prof[i].s += s; prof[i].n++; }
+    if (i < nprof) { prof[i].s += s; prof[i].v += v; prof[i].f += f; prof[i].n++; }
     pthread_mutex_unlock(&prof_lock);
+}
+static void prof_add(const char *tag, double s) { prof_add3(tag, s, 0, 0); }
+
+// Level 3: a ring of timestamp samples. A render pass takes 4 (vertex start/end, fragment start/end), a dispatch 2;
+// ts_pend lists the ones encoded into the open command buffer, and its completion handler resolves them.
+static id<MTLCounterSampleBuffer> ts_buf;
+static uint32_t ts_n, ts_next;
+static int ts_open = -1, ts_open_n;  // samples of the encoder being recorded
+#define TS_PEND 1024
+static struct ts_ent { uint32_t idx, n; char tag[56]; } ts_pend[TS_PEND];
+static int nts_pend;
+static MTLTimestamp ts_cpu0, ts_gpu0;  // calibration (sampleTimestamps)
+
+static bool ts_init(void) {
+    static bool tried;
+    if (ts_buf || tried) return ts_buf != nil;
+    tried = true;
+    id<MTLCounterSet> set = nil;
+    for (id<MTLCounterSet> c in dev.counterSets)
+        if ([c.name isEqualToString:MTLCommonCounterSetTimestamp]) set = c;
+    if (!set || ![dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+        LOG("[prof] no stage-boundary timestamps on this device\n");
+        return false;
+    }
+    MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
+    d.counterSet = set;
+    d.storageMode = MTLStorageModeShared;
+    for (uint32_t n = 32768; n >= 1024 && !ts_buf; n /= 2) {
+        d.sampleCount = n;
+        ts_buf = [dev newCounterSampleBufferWithDescriptor:d error:nil];
+        ts_n = n;
+    }
+    [dev sampleTimestamps:&ts_cpu0 gpuTimestamp:&ts_gpu0];
+    LOG("[prof] timestamp ring %u samples\n", ts_buf ? ts_n : 0);
+    return ts_buf != nil;
+}
+
+static int ts_take(int n) {
+    if (gpu_profile() != 3 || !ts_init() || nts_pend >= TS_PEND) return -1;
+    if (ts_next + n > ts_n) ts_next = 0;
+    ts_open = (int)ts_next;
+    ts_open_n = n;
+    ts_next += n;
+    return ts_open;
+}
+
+static void ts_render_attach(MTLRenderPassDescriptor *rp) {
+    int i = ts_take(4);
+    if (i < 0) return;
+    MTLRenderPassSampleBufferAttachmentDescriptor *a = rp.sampleBufferAttachments[0];
+    a.sampleBuffer = ts_buf;
+    a.startOfVertexSampleIndex = i;
+    a.endOfVertexSampleIndex = i + 1;
+    a.startOfFragmentSampleIndex = i + 2;
+    a.endOfFragmentSampleIndex = i + 3;
+}
+
+static id<MTLComputeCommandEncoder> ts_compute_encoder(id<MTLCommandBuffer> c) {
+    int i = ts_take(2);
+    if (i < 0) return [c computeCommandEncoder];
+    MTLComputePassDescriptor *d = [MTLComputePassDescriptor computePassDescriptor];
+    d.sampleBufferAttachments[0].sampleBuffer = ts_buf;
+    d.sampleBufferAttachments[0].startOfEncoderSampleIndex = i;
+    d.sampleBufferAttachments[0].endOfEncoderSampleIndex = i + 1;
+    return [c computeCommandEncoderWithDescriptor:d];
+}
+
+// The encoder that took samples has ended: account them to tag when its command buffer completes.
+static void ts_end(const char *tag) {
+    if (ts_open < 0) return;
+    struct ts_ent *e = &ts_pend[nts_pend++];
+    e->idx = (uint32_t)ts_open;
+    e->n = (uint32_t)ts_open_n;
+    snprintf(e->tag, sizeof e->tag, "%s", tag);
+    ts_open = -1;
+}
+
+static bool ts_ok(uint64_t t) { return t && t != MTLCounterErrorValue; }
+static void ts_resolve(struct ts_ent *e, int n) {
+    for (int k = 0; k < n; k++) {
+        NSData *d = [ts_buf resolveCounterRange:NSMakeRange(e[k].idx, e[k].n)];
+        if (!d || d.length < e[k].n * sizeof(MTLCounterResultTimestamp)) continue;
+        const MTLCounterResultTimestamp *t = d.bytes;
+        double v = 0, f = 0, lo = 0, hi = 0;
+        if (e[k].n == 4) {
+            if (ts_ok(t[0].timestamp) && ts_ok(t[1].timestamp)) { v = (double)(t[1].timestamp - t[0].timestamp); lo = t[0].timestamp; hi = t[1].timestamp; }
+            if (ts_ok(t[2].timestamp) && ts_ok(t[3].timestamp)) {
+                f = (double)(t[3].timestamp - t[2].timestamp);
+                if (!lo || t[2].timestamp < lo) lo = t[2].timestamp;
+                if (t[3].timestamp > hi) hi = t[3].timestamp;
+            }
+        } else if (ts_ok(t[0].timestamp) && ts_ok(t[1].timestamp)) {
+            lo = t[0].timestamp; hi = t[1].timestamp;
+        }
+        if (hi > lo) prof_add3(e[k].tag, hi - lo, v, f);
+    }
 }
 
 static int prof_cmp(const void *a, const void *b) {
@@ -276,6 +383,18 @@ void renderer_profile_report(void) {
     if (!gpu_profile()) return;
     pthread_mutex_lock(&prof_lock);
     qsort(prof, nprof, sizeof prof[0], prof_cmp);
+    if (gpu_profile() == 3 && ts_buf) {
+        // GPU ticks -> seconds: against the CPU clock (ns) since ts_init; 1 ns per tick on Apple silicon
+        MTLTimestamp c1, g1;
+        [dev sampleTimestamps:&c1 gpuTimestamp:&g1];
+        double sc = g1 > ts_gpu0 ? (double)(c1 - ts_cpu0) * 1e-9 / (double)(g1 - ts_gpu0) : 1e-9;
+        double tot = 0;
+        for (int i = 0; i < nprof; i++) tot += prof[i].s;
+        LOG("[prof] stage timestamps: %.1f ms summed over %d tags (%.3g ns/tick)\n", tot * sc * 1e3, nprof, sc * 1e9);
+        for (int i = 0; i < nprof && i < 40; i++)
+            LOG("[prof] %6.1f ms %5d x  %-44s vtx %5.1f frag %5.1f\n", prof[i].s * sc * 1e3, prof[i].n, prof[i].tag,
+                prof[i].v * sc * 1e3, prof[i].f * sc * 1e3);
+    } else
     for (int i = 0; i < nprof && i < (gpu_profile() == 2 ? 40 : 12); i++) LOG("[prof] %6.1f ms %5d x  %s\n", prof[i].s * 1e3, prof[i].n, prof[i].tag);
     nprof = 0;
     pthread_mutex_unlock(&prof_lock);
@@ -294,6 +413,13 @@ static void commit_cb(const char *tag) {
         id<MTLCommandBuffer> c = cmdbuf;
         cmdbuf = nil;
         char *ptag = tag ? strdup(tag) : NULL;
+        struct ts_ent *pts = NULL;
+        int npts = nts_pend;
+        if (npts) {
+            pts = malloc(sizeof *pts * npts);
+            memcpy(pts, ts_pend, sizeof *pts * npts);
+            nts_pend = 0;
+        }
         pthread_mutex_lock(&cb_lock);
         uint64_t seq = submit_seq + 1;
         pthread_mutex_unlock(&cb_lock);
@@ -303,6 +429,7 @@ static void commit_cb(const char *tag) {
             stat_gpu_s += done.GPUEndTime - done.GPUStartTime;
             __atomic_add_fetch(&g_gpu_total_ns, (uint64_t)((done.GPUEndTime - done.GPUStartTime) * 1e9), __ATOMIC_RELAXED);
             if (ptag) { prof_add(ptag, done.GPUEndTime - done.GPUStartTime); free(ptag); }
+            if (pts) { ts_resolve(pts, npts); free(pts); }
             if (done.error) LOG("[metal] command buffer error: %s\n", done.error.localizedDescription.UTF8String);
         }];
         [c commit];
@@ -555,6 +682,7 @@ static void begin_pass(void) {
     static int chunk = -1;
     if (chunk < 0) { const char *e = ENV("FIFA_CHUNK_PASSES"); chunk = e ? atoi(e) : 8; }
     if (chunk > 0 && cmdbuf && ++g_passes_in_cb >= chunk) renderer_submit();
+    ts_render_attach(rp);
     enc = [cb() renderCommandEncoderWithDescriptor:rp];
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     stat_passes++;
@@ -1703,9 +1831,9 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
 #define CST(x) do { if (trace) { fprintf(stderr, "[cs] %s\n", x); fflush(stderr); } } while (0)
     CST("end_pass");
     end_pass();
-    if (gpu_profile()) commit_cb("other");
+    if (prof_split()) commit_cb("other");
     CST("encoder");
-    id<MTLComputeCommandEncoder> ce = [cb() computeCommandEncoder];
+    id<MTLComputeCommandEncoder> ce = ts_compute_encoder(cb());
     CST("pipeline");
     [ce setComputePipelineState:cp->pipe];
     ShaderInfo *si = cp->si;
@@ -1882,7 +2010,8 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     if (gpu_profile()) {
         char tag[64];
         snprintf(tag, sizeof tag, "cs %llx", (unsigned long long)st.program->stages[5].code_addr);
-        commit_cb(tag);
+        if (gpu_profile() == 3) ts_end(tag);
+        else commit_cb(tag);
     }
     CST("done");
     stat_dispatches++;

@@ -33,6 +33,13 @@ const uint8_t *maxwell_dbg_vs;
 #define LMEM_WORDS 256  // local memory per invocation (1 KB)
 uint32_t maxwell_shared_size;
 
+// Iteration cap of the `switch (pc)` loop (a program that never exits stops there); FIFA_SHADER_GUARD overrides it.
+static unsigned guard_limit(void) {
+    static unsigned n;
+    if (!n) { const char *e = getenv("FIFA_SHADER_GUARD"); n = e && atoi(e) > 0 ? (unsigned)atoi(e) : 100000u; }
+    return n;
+}
+
 // compute shared memory words: the program's size rounded up to a power of two (addresses are masked), else
 // Metal's 32 KB limit
 static int smem_words(void) {
@@ -1659,7 +1666,16 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             else { strcat(e, " | "); strcat(e, term); }
         }
         sprintf(t, "(%s)", e);
-        set_reg(c, d, t);
+        int pd = (w >> 56) == 0x5b ? (int)bits(w, 48, 3) : PT;  // .P (register form only): predicate from the result
+        if (pd != PT) {
+            c->pred_used[pd] = 1;
+            int pop = (int)bits(w, 36, 2);
+            sp(&c->body, "    { uint res = %s;\n", t);
+            if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = res;\n", d); }
+            sp(&c->body, "      p%d = %s; }\n", pd, pop == 2 ? "(res == 0u)" : pop == 3 ? "(res != 0u)" : pop == 1 ? "true" : "false");
+        } else {
+            set_reg(c, d, t);
+        }
     } else if (OPM(0x5c00000000000000ull, 0xfff8000000000000ull) || OPM(0x4c00000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x3800000000000000ull, 0xfef8000000000000ull)) {  // BFE
         const char *bv = B(false);
@@ -2308,7 +2324,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (any_branch) {
         sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0u; uint pbk[16]; uint pbk_n = 0u; uint pcnt[16]; uint pcnt_n = 0u;\n");
         sp(&s, "  bool exit_now = false;\n");
-        sp(&s, "  for (uint guard = 0u; guard < 100000u; guard++) {\n  switch (pc) {\n");
+        sp(&s, "  for (uint guard = 0u; guard < %uu; guard++) {\n  switch (pc) {\n", guard_limit());
         sp(&s, "%s", body.buf ? body.buf : "");
         sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n  if (exit_now) break;\n  }\n");
     } else {
@@ -2465,6 +2481,14 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     // (old & 0xFFFF0000u) | lo in Link's body shader - the merged low half read back as a constant 512.0 and Link
     // rendered white. Same bits either way.
     sp(&s, "static inline uint hpack(float2 r, uint merge, uint old) { if (merge == 1u) return as_type<uint>(r.x); half2 o = as_type<half2>(old), n = half2(r); if (merge == 2u) o.x = n.x; else if (merge == 3u) o.y = n.y; else o = n; return as_type<uint>(o); }\n");
+    // 1D and buffer textures are stored as 2D textures with rows of 16384 texels (Apple GPUs' 1D limit; buffer
+    // textures are often longer). rows1d<T> keeps the 1D call syntax (t.read(x), t.sample(s, u), ...).
+    sp(&s, "template<typename T> struct rows1d { T t;\n"
+           "  float4 read(uint x, uint l = 0) const { return t.read(uint2(x & 16383u, x >> 14), l); }\n"
+           "  void write(float4 v, uint x) const { t.write(v, uint2(x & 16383u, x >> 14)); }\n"
+           "  template<typename... A> float4 sample(sampler s, float u, A... a) const { return t.sample(s, float2(u, 0.5f), a...); }\n"
+           "  uint get_width(uint l = 0) const { return t.get_width(l) * t.get_height(l); }\n"
+           "  uint get_num_mip_levels() const { return t.get_num_mip_levels(); } };\n");
     sp(&s, "static inline uint prmt(uint a, uint b, uint sel) { uint r = 0; for (uint i = 0; i < 4; i++) { uint s = (sel >> (i * 4)) & 7u; uint byte = s < 4 ? (a >> (s * 8)) & 0xFFu : (b >> ((s - 4) * 8)) & 0xFFu; r |= byte << (i * 8); } return r; }\n");
 
     // inputs/outputs
@@ -2525,20 +2549,30 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         sp(&args, ", constant float4 *ltint [[buffer(19)]]");
         info->uses_tint = true;
     }
-    Str salias = {0};  // samplers shared with an earlier texture
+    Str salias = {0};  // samplers shared with an earlier texture; 1D textures' rows1d wrappers
     int nsamplers = 0;
     for (int i = 0; i < info->ntex; i++) {
         ShaderTexture *t = &info->tex[i];
         const char *tn = tex_type_name(t->type);
         if (t->is_image) {  // no sampler
             static const char *const acc[] = {"read", "read", "write", "read_write"};
-            sp(&args, ", texture%s<float, access::%s> t%d [[texture(%d)]]", tn, acc[c->img_access[i] & 3], i, i);
+            if (t->type == TEXTYPE_1D) {
+                sp(&args, ", texture2d<float, access::%s> t%d_rows [[texture(%d)]]", acc[c->img_access[i] & 3], i, i);
+                sp(&salias, "  rows1d<texture2d<float, access::%s>> t%d = {t%d_rows};\n", acc[c->img_access[i] & 3], i, i);
+            } else {
+                sp(&args, ", texture%s<float, access::%s> t%d [[texture(%d)]]", tn, acc[c->img_access[i] & 3], i, i);
+            }
             continue;
         }
         int same = -1;
         for (int j = 0; j < i && t->bindless && same < 0; j++)
             if (info->tex[j].bindless && info->tex[j].bindless_offset == t->bindless_offset) same = j;
-        sp(&args, t->shadow ? ", depth%s<float> t%d [[texture(%d)]]" : ", texture%s<float> t%d [[texture(%d)]]", tn, i, i);
+        if (t->type == TEXTYPE_1D && !t->shadow) {
+            sp(&args, ", texture2d<float> t%d_rows [[texture(%d)]]", i, i);
+            sp(&salias, "  rows1d<texture2d<float>> t%d = {t%d_rows};\n", i, i);
+        } else {
+            sp(&args, t->shadow ? ", depth%s<float> t%d [[texture(%d)]]" : ", texture%s<float> t%d [[texture(%d)]]", tn, i, i);
+        }
         if (same >= 0) {
             t->sampler = info->tex[same].sampler;
             sp(&salias, "  sampler s%d = s%d;\n", i, same);
@@ -2579,7 +2613,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     if (any_branch) {
         sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0; uint pbk[16]; uint pbk_n = 0; uint pcnt[16]; uint pcnt_n = 0;\n");
         sp(&s, "  bool exit_now = false;\n");
-        sp(&s, "  for (uint guard = 0; guard < 100000u; guard++) {\n  switch (pc) {\n");
+        sp(&s, "  for (uint guard = 0; guard < %uu; guard++) {\n  switch (pc) {\n", guard_limit());
         sp(&s, "%s", c->body.buf ? c->body.buf : "");
         sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n  if (exit_now) break;\n  }\n");
     } else {

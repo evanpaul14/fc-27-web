@@ -233,7 +233,7 @@ bool renderer_texture_presented(NvnTexture *t) {
 
 static MTLTextureType mtl_tex_type(uint32_t target, uint32_t samples) {
     switch (target) {
-    case 0: return MTLTextureType1D;
+    case 0: return MTLTextureType2D;  // 1D and buffer textures: rows of 16384 texels (translate.c rows1d)
     case 2: return MTLTextureType3D;
     case 3: return MTLTextureType1DArray;
     case 4: return MTLTextureType2DArray;
@@ -241,7 +241,7 @@ static MTLTextureType mtl_tex_type(uint32_t target, uint32_t samples) {
     case 6: return MTLTextureType2DMultisampleArray;
     case 8: return MTLTextureTypeCube;
     case 9: return MTLTextureTypeCubeArray;
-    case 10: return MTLTextureType1D;  // buffer texture (shaders fetch it as texture1d; see upload_buffer_texture)
+    case 10: return MTLTextureType2D;
     default: return samples > 1 ? MTLTextureType2DMultisample : MTLTextureType2D;
     }
 }
@@ -252,11 +252,11 @@ static void create_backend_texture(NvnTexture *t, TexBackend *b) {
     d.textureType = mtl_tex_type(t->target, t->samples);
     d.pixelFormat = mf.pf;
     d.width = t->width ? t->width : 1;
-    if (t->target == 10 && d.width > 16384) {  // Apple GPUs: 1D textures up to 16384 texels
-        LOG("[metal] buffer texture of %u texels clamped to 16384\n", t->width);
-        d.width = 16384;
+    d.height = t->target == 3 ? 1 : (t->height ? t->height : 1);
+    if (t->target == 0 || t->target == 10) {  // Apple GPUs: 1D textures up to 16384 texels; longer ones wrap to rows
+        d.width = MIN(d.width, 16384);
+        d.height = ((t->width ? t->width : 1) + 16383) / 16384;
     }
-    d.height = (t->target == 0 || t->target == 3) ? 1 : (t->height ? t->height : 1);
     d.depth = t->target == 2 ? (t->depth ? t->depth : 1) : 1;
     if (t->target == 3) d.arrayLength = t->height ? t->height : 1;
     else if (t->target == 4 || t->target == 6) d.arrayLength = t->depth ? t->depth : 1;
@@ -344,7 +344,8 @@ static uint64_t fnv_sample(const uint8_t *p, uint64_t n) {
 static void upload_buffer_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncoder> blit) {
     if (b->uploaded && b->checked_frame == g_frame_counter) return;
     b->checked_frame = g_frame_counter;
-    uint64_t n = MIN((uint64_t)t->width, (uint64_t)b->tex.width) * nvn_format_info(t->format)->bpb;
+    uint32_t bpb = nvn_format_info(t->format)->bpb;
+    uint64_t n = (uint64_t)t->width * bpb;
     uint8_t *tmp;
     const uint8_t *mem = nvn_texture_data(t, n, &tmp);
     if (!mem || !n) return;
@@ -354,9 +355,12 @@ static void upload_buffer_texture(NvnTexture *t, TexBackend *b, id<MTLBlitComman
     b->uploaded = true;
     id<MTLCommandBuffer> own_cb = nil;
     if (!blit) { own_cb = [queue commandBuffer]; blit = [own_cb blitCommandEncoder]; }
-    id<MTLBuffer> staging = [dev newBufferWithBytes:mem length:n options:MTLResourceStorageModeShared];
-    [blit copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:n sourceBytesPerImage:n
-              sourceSize:MTLSizeMake(n / nvn_format_info(t->format)->bpb, 1, 1) toTexture:b->tex
+    // rows of b->tex.width texels (create_backend_texture); the staging copy pads the last row
+    uint64_t row = (uint64_t)b->tex.width * bpb, rows = b->tex.height;
+    id<MTLBuffer> staging = [dev newBufferWithLength:row * rows options:MTLResourceStorageModeShared];
+    memcpy(staging.contents, mem, n);
+    [blit copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:row sourceBytesPerImage:row * rows
+              sourceSize:MTLSizeMake(b->tex.width, rows, 1) toTexture:b->tex
         destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
     if (own_cb) { [blit endEncoding]; [own_cb commit]; }
     free(tmp);

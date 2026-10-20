@@ -736,9 +736,13 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     in each run and swallows presses, so fixed-timing menu macros break:
     `python3 -I tools/tomatch.py <fifo>` (game started with
     `FIFA_CONTROL=<fifo>`) goes from boot to the match, classifying a
-    screenshot after each step (menu = teal side panel, notice = flat grey;
-    `--classify PNG...` to check) and navigating `up 12; down 4` to Kick Off
-    (the menu doesn't wrap). ~8 minutes boot to match.
+    screenshot after each step (menu = teal side panel, notice = Ok button on
+    neutral grey; `--classify PNG...` to check) and stepping to Kick Off one
+    press at a time. ~8 minutes boot to match. The main menu list scrolls, so
+    the highlighted entry is told by its label's size (`MENU_LABELS`: width
+    and white pixels at 720p), not its row; the highlight lags presses, so
+    each step waits for two agreeing screenshots. Each step's screenshot is
+    kept as `<shot>-NN.png`; `--from-menu` skips the boot wait.
 - **The match renders** (2026-10-19): broadcast camera, lit pitch, players,
   stands, replays with the goal graphics, at the same ~3-4 fps. After the
   NaN fixes the image was still nearly black with only highlights:
@@ -761,6 +765,32 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     watch by size), `[rt3d]` (3D render targets), `[copy3d]` (buffer copies
     into 3D textures), RGB10A2 colour counts in the texture probe;
     `FIFA_DBG_CSW` also fires in the debug frame.
+- Match performance, first round (2026-10-19): ~3-4 fps, ~1.7 s GPU per 2 s.
+  - `FIFA_GPU_PROFILE=2` (each draw its own pass, tagged `draw WxH vs fs`)
+    and the `prof <n>` control command (profile level while running) show
+    one program: compute `16dff9100` is ~88% of all GPU time, ~98 ms per
+    dispatch, ~2 per frame. It links mesh edges into contours (64 threads
+    read triangle indices from a buffer texture, classify edges, write
+    links to shared memory), then thread 0 alone walks each contour
+    (`next = smem[i] & 0x3ff` until back at the start) and emits it.
+  - That walk runs to the `switch (pc)` loop's 100000-iteration guard
+    (~1 us per serial iteration): the index buffer texture has 65000
+    texels and was clamped to 16384 (Apple 1D limit), so the links read
+    past it are junk and a contour never closes. Fix (not yet verified in
+    a run): 1D and buffer textures are 2D textures with rows of 16384
+    texels; MSL declares them `texture2d` and wraps them in `rows1d<T>`
+    (same `.read(x)` / `.sample(s, u)` / `.get_width()` syntax). The
+    guard is `FIFA_SHADER_GUARD` (to confirm: the cost should scale with it).
+  - LOP3 `.P` (register form: predicate op bits 36-37, predicate 48-50)
+    wrote no predicate; in `16dff9100` the contour emit was dead code
+    behind a stale P0. 5 programs use it.
+  - Changing the translator changes every program's MSL, so Metal's disk
+    cache misses, and a few pipelines then take 10+ minutes to build
+    (`MTLCompilerService` at 100%) while the render thread waits for a
+    one-shot target: Player Career's screen, and the match's VS `1e3ec9400`
+    / FS `16fb79200` (FS is 2784 lines, 44 cases; the library compiles in
+    0.3 s, the pipeline back-end is the slow part). The game looks frozen.
+    `[metal] waiting > 2 s for ...` now names the program.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -907,9 +937,12 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   black screen with the PL logo, and then the match itself runs: HUD
   (BOU 0-0 BHA, clock running, radar with moving players, player names,
   "Difficulty changed to Beginner") and the 3D scene renders (see "The
-  match renders" in Status). Next: performance (~3-4 fps in the match,
-  GPU-bound; the `switch (pc)` form of branchy shaders is the likely cost),
-  the occasional e_prev = 0 exposure readback, and a visual pass over the
+  match renders" in Status). Next: performance (see "Match performance" in
+  Status): run with the 1D-rows fix and confirm `16dff9100` drops from ~98
+  ms (needs getting past the 10+ minute pipeline builds after translator
+  changes: find what makes `16fb79200`'s pipeline so slow, likely the
+  `switch (pc)` form; structured control flow would help both), then
+  profile again with `FIFA_GPU_PROFILE=2`; the occasional e_prev = 0 exposure readback, and a visual pass over the
   match (shadows, reflections, the remaining ~10 skipped draws per frame:
   `16fd3ac00`, `171855700` TXD.B). Shader coverage (`build/shtool` over
   the dumps): 407/437 translate; the rest are unknown 3b03 (7 FS), bindless

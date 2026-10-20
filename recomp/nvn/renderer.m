@@ -16,6 +16,7 @@
 #include "maxwell/shader.h"
 #include "nvn.h"
 #include "renderer.h"
+#include "../rt/input.h"
 
 static id<MTLDevice> dev;
 static id<MTLCommandBuffer> cmdbuf;
@@ -151,13 +152,16 @@ static uint32_t tex_wh[2][64][2];       // per bound texture slot: guest size
 
 // FIFA_GPU_PROFILE=1: every render pass and compute dispatch gets its own command buffer; GPU time is summed per
 // tag (the pass's size and first fragment program, or the compute program) and the top ones are logged with the
-// fps line (renderer_profile_report).
+// fps line (renderer_profile_report). FIFA_GPU_PROFILE=2: every draw ends its pass, tagged with its programs
+// (inflated more by reloading the attachments per draw; compare programs within a run).
+// FIFA_CONTROL "prof <n>" changes the level while running.
 static int gpu_profile(void) {
     static int on = -1;
-    if (on < 0) on = getenv("FIFA_GPU_PROFILE") != NULL;
-    return on;
+    if (on < 0) { const char *e = getenv("FIFA_GPU_PROFILE"); on = e ? (atoi(e) == 2 ? 2 : 1) : 0; }
+    int c = input_profile_mode();
+    return c >= 0 ? c : on;
 }
-static uint64_t prof_pass_fs;  // first fragment program drawn in the open pass
+static uint64_t prof_pass_fs, prof_pass_vs;  // first programs drawn in the open pass
 static void commit_cb(const char *tag);
 
 static int debug_pass_no;
@@ -167,11 +171,16 @@ static void end_pass(void) {
         enc = nil;
         if (gpu_profile()) {
             char tag[64];
-            snprintf(tag, sizeof tag, "pass %ux%u fs %llx", st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->width : 0,
-                     st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->height : 0, (unsigned long long)prof_pass_fs);
+            unsigned w = st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->width : 0;
+            unsigned h = st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->height : 0;
+            if (gpu_profile() == 2 && prof_pass_fs)
+                snprintf(tag, sizeof tag, "draw %ux%u vs %llx fs %llx", w, h, (unsigned long long)prof_pass_vs,
+                         (unsigned long long)prof_pass_fs);
+            else
+                snprintf(tag, sizeof tag, "pass %ux%u fs %llx", w, h, (unsigned long long)prof_pass_fs);
             commit_cb(tag);
         }
-        prof_pass_fs = 0;
+        prof_pass_fs = prof_pass_vs = 0;
         if (g_debug_frame && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {
             id<MTLTexture> t = renderer_texture(st.rt.color[0], nil, true);
             id<MTLCommandBuffer> c = cmdbuf;
@@ -262,7 +271,7 @@ void renderer_profile_report(void) {
     if (!gpu_profile()) return;
     pthread_mutex_lock(&prof_lock);
     qsort(prof, nprof, sizeof prof[0], prof_cmp);
-    for (int i = 0; i < nprof && i < 12; i++) LOG("[prof] %6.1f ms %5d x  %s\n", prof[i].s * 1e3, prof[i].n, prof[i].tag);
+    for (int i = 0; i < nprof && i < (gpu_profile() == 2 ? 40 : 12); i++) LOG("[prof] %6.1f ms %5d x  %s\n", prof[i].s * 1e3, prof[i].n, prof[i].tag);
     nprof = 0;
     pthread_mutex_unlock(&prof_lock);
 }
@@ -1100,8 +1109,7 @@ static id<MTLTexture> dummy_texture(int type) {
         d.pixelFormat = MTLPixelFormatRGBA8Unorm;
         d.width = d.height = 1;
         d.textureType = type == TEXTYPE_CUBE ? MTLTextureTypeCube : type == TEXTYPE_3D ? MTLTextureType3D
-                      : type == TEXTYPE_2D_ARRAY ? MTLTextureType2DArray : type == TEXTYPE_1D ? MTLTextureType1D
-                      : MTLTextureType2D;
+                      : type == TEXTYPE_2D_ARRAY ? MTLTextureType2DArray : MTLTextureType2D;  // (1D: 2D rows)
         t[type] = [dev newTextureWithDescriptor:d];
     }
     return t[type];
@@ -1109,7 +1117,6 @@ static id<MTLTexture> dummy_texture(int type) {
 
 static MTLTextureType mtl_type_for(int t) {
     switch (t) {
-    case TEXTYPE_1D: return MTLTextureType1D;
     case TEXTYPE_3D: return MTLTextureType3D;
     case TEXTYPE_CUBE: return MTLTextureTypeCube;
     case TEXTYPE_2D_ARRAY: return MTLTextureType2DArray;
@@ -1952,11 +1959,19 @@ static void draw(CmdRec *r, bool indexed) {
     bool must_draw = one_shot_target();
     if (pr && !pr->ready && must_draw) {
         double t0 = now_ms();
-        while (!pr->ready && !__atomic_load_n(&pr->failed, __ATOMIC_ACQUIRE)) usleep(100);
+        bool slow = false;
+        while (!pr->ready && !__atomic_load_n(&pr->failed, __ATOMIC_ACQUIRE)) {
+            usleep(100);
+            if (!slow && now_ms() - t0 > 2000) {  // (a pathological Metal compile shows here, not as a hang)
+                slow = true;
+                LOG("[metal] waiting > 2 s for program vs %llx fs %llx to compile\n",
+                    (unsigned long long)st.program->stages[0].code_addr, (unsigned long long)st.program->stages[1].code_addr);
+            }
+        }
         stat_compile_wait_ms += now_ms() - t0;
     }
     if (!pr || !pr->ready) { SKIP(1); return; }
-    if (!prof_pass_fs) prof_pass_fs = st.program->stages[1].code_addr;
+    if (!prof_pass_fs) { prof_pass_fs = st.program->stages[1].code_addr; prof_pass_vs = st.program->stages[0].code_addr; }
     static int log_rt_w = -1, log_rt_h;
     if (log_rt_w < 0) { const char *e = getenv("FIFA_LOG_RT"); log_rt_w = 0; if (e) sscanf(e, "%dx%d", &log_rt_w, &log_rt_h); }
     static uint64_t log_rt_addr = 1;
@@ -2072,8 +2087,14 @@ static void draw(CmdRec *r, bool indexed) {
         }
         if (pobj == pending && must_draw) {
             double t0 = now_ms();
+            bool slow = false;
             while (pobj == pending) {
                 usleep(100);
+                if (!slow && now_ms() - t0 > 2000) {
+                    slow = true;
+                    LOG("[metal] waiting > 2 s for the pipeline of vs %llx fs %llx\n",
+                        (unsigned long long)st.program->stages[0].code_addr, (unsigned long long)st.program->stages[1].code_addr);
+                }
                 @synchronized(ready_pipes) {
                     id done = ready_pipes[pk];
                     if (done) { [ready_pipes removeObjectForKey:pk]; cache[pk] = done; pobj = done; }
@@ -2266,6 +2287,7 @@ static void draw(CmdRec *r, bool indexed) {
     static int perdraw = -1;
     if (perdraw < 0) perdraw = getenv("FIFA_DBG_PERDRAW") != NULL;
     if (g_debug_frame && perdraw) { perdraw_prog = pr; perdraw_check(); }
+    else if (gpu_profile() == 2 && enc) { end_pass(); st.rt_dirty = true; }
     if (dbg_this) {
         static int nlog;
         if (nlog++ < 4) {

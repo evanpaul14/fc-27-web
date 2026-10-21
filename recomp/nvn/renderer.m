@@ -905,6 +905,7 @@ static int cbuf_base = 3, tex_base = 8;
     ShaderInfo *vi, *fi;
     uint64_t fs_addr;  // fragment code address (debug switches)
     bool failed;
+    bool depth_only;   // no fragment program (fi is a stub)
     _Atomic bool ready;  // functions compiled (async compile: draws are skipped until then)
 }
 @end
@@ -1241,7 +1242,7 @@ static void compile_program(Prog *pr) {
 
 static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
     shader_cache_warm();
-    if (!(p->stage_mask & 1) || !(p->stage_mask & 2)) {
+    if (!(p->stage_mask & 1)) {
         static NvnProgram *seen[64];
         static int nseen;
         bool fresh = true;
@@ -1313,7 +1314,14 @@ static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
     fkey->vs_out_mask = pr->vi->out_mask;
     maxwell_consts = p->stages[1].const_offset ? (const uint8_t *)gptr(p->stages[1].code_addr + p->stages[1].const_offset) : NULL;
     maxwell_consts_size = p->stages[1].const_size;
-    pr->fi = maxwell_translate(gptr(p->stages[1].code_addr), fmax, STAGE_FRAGMENT, fkey);
+    if (!(p->stage_mask & 2)) {
+        // vertex-only (depth pre-passes, shadow maps): a fragment stage that writes nothing, colour writes off
+        pr->fi = calloc(1, sizeof *pr->fi);
+        pr->fi->stage = STAGE_FRAGMENT;
+        pr->fi->msl = strdup("#include <metal_stdlib>\nusing namespace metal;\nfragment void main0() {}\n");
+        pr->depth_only = true;
+    } else
+        pr->fi = maxwell_translate(gptr(p->stages[1].code_addr), fmax, STAGE_FRAGMENT, fkey);
     if (!pr->fi->msl) { LOG("[shader] FS translate failed: %s\n", pr->fi->error); pr->failed = true; return nil; }
     {
         // FIFA_SKIP_PROGS=<fs code addr hex>,...: treat these as failed translations (A/B a shader's effect)
@@ -2152,6 +2160,29 @@ static void perdraw_check(void) {
             static int nprobe;
             if (perdraw_prog && nprobe++ < 2) { LOG("[perdraw] fs textures:"); log_bound_textures(1, perdraw_prog->fi); LOG("\n"); }
         }
+        // FIFA_DBG_PIXELS=x,y;x,y...: which draws change these pixels of a full-size colour target 0
+        static int npix = -1, px[16][2];
+        static float last[16][4];
+        if (npix < 0) {
+            npix = 0;
+            for (const char *e = getenv("FIFA_DBG_PIXELS"); e && *e && npix < 16; e = strchr(e, ';') ? strchr(e, ';') + 1 : "")
+                if (sscanf(e, "%d,%d", &px[npix][0], &px[npix][1]) == 2) npix++;
+        }
+        if (npix && i == 0 && tex.width >= 1280) {
+            float *fp = renderer_read_float_rgba(tex);
+            for (int k = 0; k < npix; k++) {
+                const float *v = fp + ((size_t)px[k][1] * tex.width + (size_t)px[k][0]) * 4;
+                if (memcmp(v, last[k], 16)) {
+                    LOG("[pixel] %d,%d draw %d pass %d: %g %g %g %g (was %g %g %g) vs %llx fs %llx\n", px[k][0], px[k][1], ndraw,
+                        debug_pass_no, v[0], v[1], v[2], v[3], last[k][0], last[k][1], last[k][2],
+                        st.program ? (unsigned long long)st.program->stages[0].code_addr : 0ull,
+                        st.program ? (unsigned long long)st.program->stages[1].code_addr : 0ull);
+                    memcpy(last[k], v, 16);
+                }
+            }
+            free(fp);
+            continue;
+        }
         long first;
         size_t bad = renderer_count_nonfinite(tex, &first);
         LOG("[perdraw] draw %d pass %d rt%d %llx %lux%lu fmt %lu: %zu non-finite (first %ld,%ld) vs %llx fs %llx\n", ndraw,
@@ -2460,6 +2491,7 @@ static void draw(CmdRec *r, bool indexed) {
         uint32_t m = (st.channel_mask >> (i * 4)) & 0xF;
         ca.writeMask = (m & 1 ? MTLColorWriteMaskRed : 0) | (m & 2 ? MTLColorWriteMaskGreen : 0) |
                        (m & 4 ? MTLColorWriteMaskBlue : 0) | (m & 8 ? MTLColorWriteMaskAlpha : 0);
+        if (pr->depth_only) ca.writeMask = MTLColorWriteMaskNone;
         bool blend_on = (st.color_state[0] >> i) & 1;
         if (blend_on && !rt_kind(st.rt.color[i]->format)) {
             uint8_t *b = st.blend[i];

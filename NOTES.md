@@ -1108,10 +1108,25 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   - FS `16e40c500` fetched through a table of separate textures indexed in a loop (`LDC c[2][r + 0x168]` OR the
     sampler word at 0x570). `trace_handle` flags the indexed LDC; `bindless_slot` gives TEX.B 8 candidate slots
     (0x168 + 8k) and `emit_tex` picks at run time the one whose `c[2]` words equal the handle register.
-  - Still open after these: ~10% of draws skipped (reason b, `!pr`) in cutscenes (walkout, bench, crowd shots;
-    0 in open play) with no translate failure logged: missing Bournemouth/Brighton jackets and spectators.
-    `get_program` now logs programs without both VS and FS (`[shader] program ... stage mask`). Grey/white
-    sharp-edged patches on faces and necks (at some angles); grass shimmer/grain.
+  - The ~10% of draws skipped in cutscenes (reason b, `!pr`, 0 in open play) were vertex-only programs
+    (stage mask 0x1: depth pre-passes / shadow casters, position only, no stores), dropped by `get_program`.
+    They now draw with a stub fragment stage and colour writes off (`Prog.depth_only`); skips ~0. That did
+    not change the black jackets or the flat black/white crowd (they were drawn, just wrong).
+  - Black jackets (run `build/d4`, debug frame triggered on the dark walkout shot; `FIFA_DBG_PERDRAW=1
+    FIFA_DBG_PIXELS=x,y;...` logs every draw that changes those pixels of colour target 0): the jacket pixels
+    are written by FS `16fa89700` with ~3e-4 (black). Its textures look right; its slot 9 is the 256x1
+    RGBA16F LUT at 1f91d4000 from FS `16e3a1a00`, which is NaN in all 256 texels: `t0[x] / t0[255]` per
+    channel, and channel G of its inputs (256x1 RG16F at 1f91d2000 / 1f91d0000, from the max-reduction FS
+    `16dda7600` / `16e3c8b00` over the 256x256 R16F target that FS `16fa54a00` draws the players into, and
+    compute `16ed0fd00`) is all zero: G = 0 * (1/0). (The 256x256 target is drawn in the match now, unlike
+    the 2026-10-19 note above.) `FIFA_NANZERO=16e3a1a00` (LUT NaN -> 0) leaves the jackets black and the
+    face patches, so 0 isn't the value either: next, why G is zero (the reduction's diagonal `t0[(i, i)]`
+    TLDS reads, per yuzu's 2D-array TLDS layout x = a+1, y = b) or what the jacket FS does with the LUT.
+  - Still open: grey/white sharp-edged patches on faces and necks; crowd drawn flat black/white; grass
+    shimmer/grain (no LOD bias is applied: Metal samplers have none; or TAA).
+  - Cutscene fps in the visible window (v3, v4) dropped to 2-16 with the CPU at ~1 core and the GPU mostly
+    idle while the window was not frontmost (screenshots, chat): presentation throttling, not rendering
+    cost; v1/v2 (window left alone) held 30.
   - Visible window, open play, thermal 0 (v1, v2): 30.0 fps, P cores ~2.6 GHz; the old 12-17 fps was throttling.
   - (`pgrep -f tools/bench.py` in a wait loop matches the loop's own shell: wait on the bench's PID instead.)
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
@@ -1281,9 +1296,11 @@ so the visual pass (4) comes next. In order:
    masks. ~~The 32^3 3D texture sampled as 2D~~ is the game's own stale
    binding, harmless (see "Blits").
 4. Visual pass over the match ("Visual pass, first round"): ~~black/noisy skin on
-   arms/legs/hands~~ (compute fixes). Left: draws skipped in cutscenes
-   (jackets, spectators), grey patches on faces, grass shimmer/grain,
-   shadows, reflections. (The black sky is not an issue.)
+   arms/legs/hands~~ (compute fixes), ~~draws skipped in cutscenes~~
+   (vertex-only programs). Left: black jackets (the NaN LUT from
+   `16e3a1a00`, see "Visual pass, first round"), flat black/white crowd,
+   grey patches on faces, grass shimmer/grain, shadows, reflections. (The
+   black sky is not an issue.)
 5. Shader coverage (`build/shtool`): 437/437 of the dumps translate. Seen
    at boot only: SUATOM (`ea70`, CS `16e61ea00`, `16f0ce900`).
    GPU side: not a bottleneck (busy ~11.5 ms per frame, ~1 ms idle between stages: "GPU busy vs idle"); the main

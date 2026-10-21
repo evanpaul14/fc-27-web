@@ -21,6 +21,7 @@ id<MTLBuffer> renderer_pool_window(uint64_t addr, uint64_t *guest_base);
 void renderer_save_texture(id<MTLTexture> tex, const char *path);
 void renderer_save_texture_alpha(id<MTLTexture> tex, const char *path);
 size_t renderer_count_nonfinite(id<MTLTexture> tex, long *first);
+float *renderer_read_float_rgba(id<MTLTexture> tex);  // RGBA float per texel (malloc'd)
 void renderer_nantrace_report(id<MTLTexture> tex);
 #endif
 

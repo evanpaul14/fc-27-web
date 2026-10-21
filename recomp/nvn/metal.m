@@ -678,6 +678,8 @@ static float *read_float_rgba(id<MTLTexture> tex) {
 }
 
 // Debug: how many pixels of the texture have a non-finite colour channel; *first gets the first one (y * w + x).
+float *renderer_read_float_rgba(id<MTLTexture> tex) { return read_float_rgba(tex); }
+
 size_t renderer_count_nonfinite(id<MTLTexture> tex, long *first) {
     NSUInteger n = tex.width * tex.height;
     float *fp = read_float_rgba(tex);

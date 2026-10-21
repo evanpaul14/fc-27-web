@@ -27,6 +27,7 @@ static atomic_bool ui_ready;
 static id<MTLRenderPipelineState> present_pipe;
 static id<MTLSamplerState> present_sampler;
 bool g_debug_frame;
+int g_probe_fs_draws = -1;  // draws of the FIFA_DBG_FS probed program this frame (-1: no probe)
 
 // ================================================================== memory pools
 #define HOST_PAGE 0x4000ull
@@ -851,7 +852,14 @@ void backend_present(NvnTexture *t) {
     }
     static long debug_at = -1;  // FIFA_DEBUG_FRAME=<n>: log (and dump passes of) frame n
     if (debug_at < 0) debug_at = ENV("FIFA_DEBUG_FRAME") ? atol(ENV("FIFA_DEBUG_FRAME")) : 0;
-    g_debug_frame = (debug_at && total_frames == (uint64_t)debug_at) || input_take_debug();  // or FIFA_CONTROL "debug"
+    // or FIFA_CONTROL "debug"; with a FIFA_DBG_FS register probe, the first frame after it whose previous frame drew
+    // the probed program at least 4 times (so the probe has pixels to report)
+    static bool debug_armed;
+    debug_armed |= input_take_debug();
+    bool probe_ready = g_probe_fs_draws < 0 || g_probe_fs_draws >= 4;
+    g_debug_frame = (debug_at && total_frames == (uint64_t)debug_at) || (debug_armed && probe_ready);
+    if (g_debug_frame) debug_armed = false;
+    if (g_probe_fs_draws > 0) g_probe_fs_draws = 0;
     if (g_debug_frame) LOG("===== debug frame %llu =====\n", (unsigned long long)total_frames);
     double now = now_s();
     if (now - last_fps_time >= 2.0) {

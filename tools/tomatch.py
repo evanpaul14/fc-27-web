@@ -81,7 +81,10 @@ def classify_img(img):
     # the notice: a light Ok button below the text, neutral dark grey either side (other dialogs are tinted)
     button = pixel(img, 0.52, 0.66)
     sides = [pixel(img, fx, 0.66) for fx in (0.40, 0.60)]
-    if min(button) > 150 and all(max(c) < 45 and max(c) - min(c) < 10 for c in sides):
+    # and dark along the bottom: the match intro's stand shot has white crowd cards where the button would be
+    bottom = [pixel(img, fx, 0.95) for fx in (0.05, 0.5, 0.95)]
+    if (min(button) > 150 and all(max(c) < 45 and max(c) - min(c) < 10 for c in sides)
+            and all(max(c) < 70 for c in bottom)):
         return 'notice'
     return 'other'
 

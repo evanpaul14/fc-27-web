@@ -1129,6 +1129,32 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     cost; v1/v2 (window left alone) held 30.
   - Visible window, open play, thermal 0 (v1, v2): 30.0 fps, P cores ~2.6 GHz; the old 12-17 fps was throttling.
   - (`pgrep -f tools/bench.py` in a wait loop matches the loop's own shell: wait on the bench's PID instead.)
+- Visual pass, second round (2026-10-20, runs `build/w2`..`w4`, `d5`..`d19`):
+  - **TLDS ARRAY_2D.LZ (texture_info 8) is layer Ra, x Rb, y Rb+1**, not TEXS's x Ra+1, y Rb. The dumps show it:
+    every such TLDS has its layer in Ra and (x, y) as a pair at Rb, often contiguous after Ra (r3 / r4,r5). The old
+    decode made the exposure chain's max reduction (`16dda7600`) read `t0[(i, i)]` for its G channel, so G was 0, the
+    prefix sum (`16ed0fd00`) was all zero and the 256x1 LUT (`16e3a1a00`, `cdf[x] / cdf[255]`) NaN. Now G is set
+    and the LUT is finite (0 of 256 non-finite). It did **not** change the black jackets.
+  - Black jackets, narrowed with register probes on FS `16fa89700` (output = `lit * cb6[300].w * (1 - fog.a) +
+    fog * cb6[300].w`; `cb6[300].w` ~0.009 is the exposure every lit FS shares, white shorts reach ~140 before it):
+    the light term is fine (~200), fog 0, but the diffuse colour `r9 = base * (1 - r36)` is 0 on most jacket
+    pixels, so only specular (~0.05) is left. The base colour is a palette blend, `sum(mask_i * cb4[i]^2)` with the
+    masks from texture slot 1 (512x512 fmt 0x46, mostly R) and the team colours in cb4 (ubuf 1): Brighton's jacket
+    colour `cb4[2]` is 0.1176 (sRGB-ish, ~0.014 linear), so the jacket is meant to be near-black but should
+    still read as dark grey with shading (~0.014 * 200 * 0.009). Next: probe the mask sample (t1 at pc ~0x188,
+    r12-r14) and the palette sum (r21/r22, r3 at 0x468) on the same pixels: either the mask's channels are
+    wrong (fmt 0x46 decode / swizzle) or a branch picks the black path. Slot 3 is bound to an EA SPORTS logo
+    (256x256 fmt 0x9a, GPU-written): a decal rectangle (cb5[1]), worth a look after.
+  - Some walkouts skip the jackets (kits only), so a run can have no jacket draws at all.
+  - Face/neck patches: the same with the old TLDS decode (`w4`), so not from this change.
+  - Register probe, extended: `FIFA_DBG_FS=<fs>:<pc>:<reg>[,<pc>:<reg>[,<pc>:<reg>]]` writes up to three
+    registers to R, G, B. With `FIFA_DBG_PERDRAW=1` the debug frame logs `[probe] draw N: <pixels>, mean/min/max`
+    over the pixels each draw of that FS changed in a >= 1280-wide colour target 0 (GPU copy of the target after
+    every draw, read back only around probed draws; R11G11B10F targets clamp negatives to 0). A `debug` request
+    with a probe waits for a frame after one that drew the FS at least 4 times. Pc's: `LARECOMP_SAVE_MSL=1
+    build/shtool -o <dir> <dump>` annotates the MSL with `// pc`.
+  - `tools/tomatch.py`: the match intro's stand shot (white crowd cards mid-screen) passed as the notice; the
+    notice check also wants the bottom edge dark now.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -1297,8 +1323,8 @@ so the visual pass (4) comes next. In order:
    binding, harmless (see "Blits").
 4. Visual pass over the match ("Visual pass, first round"): ~~black/noisy skin on
    arms/legs/hands~~ (compute fixes), ~~draws skipped in cutscenes~~
-   (vertex-only programs). Left: black jackets (the NaN LUT from
-   `16e3a1a00`, see "Visual pass, first round"), flat black/white crowd,
+   (vertex-only programs), ~~the NaN LUT~~ (TLDS array layout). Left: black
+   jackets (diffuse colour 0, see "Visual pass, second round"), flat black/white crowd,
    grey patches on faces, grass shimmer/grain, shadows, reflections. (The
    black sky is not an issue.)
 5. Shader coverage (`build/shtool`): 437/437 of the dumps translate. Seen

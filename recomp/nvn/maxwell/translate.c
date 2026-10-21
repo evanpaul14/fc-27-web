@@ -27,7 +27,16 @@ uint64_t maxwell_gmem_base, maxwell_gmem_size;
 const uint8_t *maxwell_dbg_code;
 uint32_t maxwell_dbg_pc;
 int maxwell_dbg_reg;
+uint32_t maxwell_dbg_pcx[2];
+int maxwell_dbg_regx[2] = {-1, -1};
 const uint8_t *maxwell_dbg_vs;
+
+// register probe output for colour component comp: probe 1/2 when given, else probe 0 (greyscale)
+static const char *dbg_name(int comp) {
+    if (comp == 1 && maxwell_dbg_regx[0] >= 0) return "dbgv1";
+    if (comp == 2 && maxwell_dbg_regx[1] >= 0) return "dbgv2";
+    return "dbgv";
+}
 
 #define RZ 255
 #define LMEM_WORDS 256  // local memory per invocation (1 KB)
@@ -952,7 +961,7 @@ static bool glsl_texs(Ctx *c, uint64_t w, bool fetch, int *slot_out, char *call,
         case 7: slot = tex_slot(c, index, TEXTYPE_3D, false, false);
             sprintf(call, "texelFetch(t%d, ivec3(%s, %s, %s), 0)", slot, A, A1, Bv); break;
         case 8: slot = tex_slot(c, index, TEXTYPE_2D_ARRAY, false, true);
-            sprintf(call, "texelFetch(t%d, ivec3(ivec2(%s), int(%s)), 0)", slot, RSC2(c, slot, "uint2(%s, %s)", A1, Bv), A); break;
+            sprintf(call, "texelFetch(t%d, ivec3(ivec2(%s), int(%s)), 0)", slot, RSC2(c, slot, "uint2(%s, %s)", Bv, B1), A); break;
         case 12: slot = tex_slot(c, index, TEXTYPE_2D, false, false);
             sprintf(call, "texelFetch(t%d, ivec2(%s), int(%s))", slot, RSC2(c, slot, "uint2(int2(%s, %s) + int2(int(%s << 28) >> 28, int(%s << 24) >> 28))", A, A1, B1, B1), Bv); break;
         default: fail(c, "tlds info %d", info); return false;
@@ -1024,8 +1033,8 @@ static void emit_texs(Ctx *c, uint64_t w, bool fetch) {
             sprintf(call, "t%d.read(%s, uint(%s))", slot, RSC2(c, slot, "uint2(%s, %s)", A, A1), Bv); break;
         case 7: slot = tex_slot(c, index, TEXTYPE_3D, false, false);
             sprintf(call, "t%d.read(uint3(%s, %s, %s))", slot, A, A1, Bv); break;
-        case 8: slot = tex_slot(c, index, TEXTYPE_2D_ARRAY, false, true);
-            sprintf(call, "t%d.read(%s, uint(%s))", slot, RSC2(c, slot, "uint2(%s, %s)", A1, Bv), A); break;
+        case 8: slot = tex_slot(c, index, TEXTYPE_2D_ARRAY, false, true);  // ARRAY_2D.LZ: layer Ra, x Rb, y Rb+1 (not TEXS's Ra+1, Rb)
+            sprintf(call, "t%d.read(%s, uint(%s))", slot, RSC2(c, slot, "uint2(%s, %s)", Bv, B1), A); break;
         case 12: slot = tex_slot(c, index, TEXTYPE_2D, false, false);
             sprintf(call, "t%d.read(%s, uint(%s))", slot, RSC2(c, slot, "uint2(int2(%s, %s) + int2(int(%s << 28) >> 28, int(%s << 24) >> 28))", A, A1, B1, B1), Bv); break;
         default: fail(c, "tlds info %d", info); return;
@@ -2503,7 +2512,8 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         if (c->pred_used[i]) sp(&s, "  bool p%d = false;\n", i);
     if (c->uses_cc) sp(&s, "  uint cc = 0u; bool ccz = false, ccs = false;\n");
     if (c->uses_local) sp(&s, "  uint lmem[%d]; for (int li_ = 0; li_ < %d; li_++) lmem[li_] = 0u;\n", LMEM_WORDS, LMEM_WORDS);
-    if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f;\n" : "  float dbgv = -1.0f;\n");
+    if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f, dbgv1 = 1.0f, dbgv2 = 1.0f;\n"
+                                                  : "  float dbgv = -1.0f, dbgv1 = -1.0f, dbgv2 = -1.0f;\n");
     if (any_branch) {
         sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0u; uint pbk[16]; uint pbk_n = 0u; uint pcnt[16]; uint pcnt_n = 0u;\n");
         sp(&s, "  bool exit_now = false;\n");
@@ -2529,7 +2539,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
                 if (!(m & (1u << comp))) continue;
                 if (dbg) {
                     if (comp == 3) sp(&s, "  c%d[%d] = %s(1.0f);\n", rt, comp, cv);
-                    else sp(&s, "  c%d[%d] = %s(dbgv);\n", rt, comp, cv);
+                    else sp(&s, "  c%d[%d] = %s(%s);\n", rt, comp, cv, dbg_name(comp));
                 } else if (r < 256 && c->reg_used[r]) {
                     if (kind == 0) sp(&s, "  c%d[%d] = as_f(r%d);\n", rt, comp, r);
                     else sp(&s, "  c%d[%d] = %s(r%d);\n", rt, comp, cv, r);
@@ -2646,11 +2656,15 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         if (dbg && maxwell_dbg_pc == 0xfffffffeu) nan_trace(c, start, (uint32_t)i);
         int wbar = (int)((sch >> 5) & 7);
         if (wbar < 6 && !flow && !late_off()) defer_late(c, start, wbar);
-        if (dbg && pc == maxwell_dbg_pc) {
-            int rr = maxwell_dbg_reg % 1000, half = maxwell_dbg_reg / 1000;  // +1000: low f16, +2000: high f16
+        for (int k = 0; dbg && k < 3; k++) {  // probe 0 -> dbgv (R, and G/B without probes 1/2), probes 1/2 -> G/B
+            uint32_t ppc = k ? maxwell_dbg_pcx[k - 1] : maxwell_dbg_pc;
+            int preg = k ? maxwell_dbg_regx[k - 1] : maxwell_dbg_reg;
+            if (preg < 0 || pc != ppc) continue;
+            int rr = preg % 1000, half = preg / 1000;  // +1000: low f16, +2000: high f16
+            const char *v = k == 0 ? "dbgv" : k == 1 ? "dbgv1" : "dbgv2";
             c->reg_used[rr] = 1;
-            if (half) sp(&c->body, c->glsl ? "    dbgv = unpackHalf2x16(r%d)[%d];\n" : "    dbgv = float(as_type<half2>(r%d)[%d]);\n", rr, half - 1);
-            else sp(&c->body, "    dbgv = as_type<float>(r%d);\n", rr);
+            if (half) sp(&c->body, c->glsl ? "    %s = unpackHalf2x16(r%d)[%d];\n" : "    %s = float(as_type<half2>(r%d)[%d]);\n", v, rr, half - 1);
+            else sp(&c->body, "    %s = as_type<float>(r%d);\n", v, rr);
         }
         info->num_insts++;
     }
@@ -2806,7 +2820,8 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     if (c->uses_cc) sp(&s, "  uint cc = 0; bool ccz = false, ccs = false;\n");
     if (c->uses_local) sp(&s, "  uint lmem[%d] = {};\n", LMEM_WORDS);
     if (c->uses_shared) sp(&s, "  threadgroup uint smem[%d];\n", smem_words());
-    if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f;\n" : "  float dbgv = -1.0f;\n");
+    if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f, dbgv1 = 1.0f, dbgv2 = 1.0f;\n"
+                                                  : "  float dbgv = -1.0f, dbgv1 = -1.0f, dbgv2 = -1.0f;\n");
     if (dbg && maxwell_dbg_pc == 0xfffffffeu) sp(&s, "  uint nanpc = 0u;\n");
     if (any_branch) {
         sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0; uint pbk[16]; uint pbk_n = 0; uint pcnt[16]; uint pcnt_n = 0;\n");
@@ -2852,7 +2867,8 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
                     static const char *const v[] = {"float(nanpc & 63u)", "float((nanpc >> 6) & 63u)", "(nanpc ? 1.0f : 0.0f)", "1.0f"};
                     sp(&s, "  o.c%d[%d] = %s;\n", rt, comp, v[comp]);
                 } else if (dbg) {
-                    sp(&s, comp == 3 ? "  o.c%d[%d] = 1.0f;\n" : "  o.c%d[%d] = dbgv;\n", rt, comp);
+                    if (comp == 3) sp(&s, "  o.c%d[%d] = 1.0f;\n", rt, comp);
+                    else sp(&s, "  o.c%d[%d] = %s;\n", rt, comp, dbg_name(comp));
                 } else if (r < 256 && c->reg_used[r]) {
                     if (kind == 0) sp(&s, "  o.c%d[%d] = as_type<float>(r%d);\n", rt, comp, r);
                     else sp(&s, "  o.c%d[%d] = r%d;\n", rt, comp, r);

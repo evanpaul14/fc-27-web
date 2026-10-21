@@ -43,6 +43,7 @@ static NvnTexture *snap_tex[8];
 static bool snap_ok[8];
 static uint64_t op_counts[CMD_COUNT];
 extern bool g_debug_frame;
+extern int g_probe_fs_draws;
 static char stats_text[2048];
 
 // ------------------------------------------------------------------ state
@@ -1287,7 +1288,14 @@ static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
         static unsigned long long dbg_addr;
         static unsigned dbg_pc;
         static int dbg_reg;
-        if (!parsed) { parsed = 1; const char *e = getenv("FIFA_DBG_FS"); if (e) sscanf(e, "%llx:%x:%d", &dbg_addr, &dbg_pc, &dbg_reg); }
+        // (",<pc>:<reg>" up to twice more: those go to green and blue)
+        if (!parsed) {
+            parsed = 1;
+            const char *e = getenv("FIFA_DBG_FS");
+            if (e) sscanf(e, "%llx:%x:%d", &dbg_addr, &dbg_pc, &dbg_reg);
+            for (int k = 0; e && k < 2 && (e = strchr(e, ',')); k++, e++)
+                if (sscanf(e + 1, "%x:%d", &maxwell_dbg_pcx[k], &maxwell_dbg_regx[k]) != 2) maxwell_dbg_regx[k] = -1;
+        }
         maxwell_dbg_code = dbg_addr ? (const uint8_t *)gptr(dbg_addr) : NULL;
         static unsigned long long dbg_vs;
         static int vparsed;
@@ -2160,6 +2168,56 @@ static void perdraw_check(void) {
             static int nprobe;
             if (perdraw_prog && nprobe++ < 2) { LOG("[perdraw] fs textures:"); log_bound_textures(1, perdraw_prog->fi); LOG("\n"); }
         }
+        // FIFA_DBG_FS register probe: the pixels each draw of that program changed in a full-size colour target 0
+        // (mean, min, max per component; probes 1/2 are G/B). The target is copied after every draw on the GPU and
+        // read back only around the probed draws, and the non-finite counts below are skipped, so this stays fast.
+        static unsigned long long probe_fs = 1;
+        static id<MTLTexture> prev;
+        if (probe_fs == 1) {
+            const char *e = getenv("FIFA_DBG_FS");
+            unsigned long long a = 0;
+            unsigned pc = 0;
+            probe_fs = e && sscanf(e, "%llx:%x", &a, &pc) == 2 && pc < 0xfffffffeu ? a : 0;
+        }
+        if (probe_fs && i == 0 && tex.width >= 1280) {
+            bool same = prev && prev.width == tex.width && prev.height == tex.height && prev.pixelFormat == tex.pixelFormat;
+            if (same && st.program && st.program->stages[1].code_addr == probe_fs) {
+                float *fp = renderer_read_float_rgba(tex), *pp = renderer_read_float_rgba(prev);
+                size_t n = tex.width * tex.height, changed = 0;
+                double sum[3] = {0, 0, 0};
+                float lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
+                for (size_t k = 0; k < n; k++) {
+                    if (!memcmp(fp + k * 4, pp + k * 4, 12)) continue;
+                    changed++;
+                    for (int ch = 0; ch < 3; ch++) {
+                        float v = fp[k * 4 + ch];
+                        sum[ch] += v;
+                        lo[ch] = fminf(lo[ch], v);
+                        hi[ch] = fmaxf(hi[ch], v);
+                    }
+                }
+                if (changed)
+                    LOG("[probe] draw %d: %zu pixels, mean %g %g %g, min %g %g %g, max %g %g %g\n", ndraw, changed, sum[0] / changed,
+                        sum[1] / changed, sum[2] / changed, lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]);
+                else
+                    LOG("[probe] draw %d: no pixels changed\n", ndraw);
+                free(fp);
+                free(pp);
+            }
+            if (!same) {
+                MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:tex.pixelFormat
+                                                                                             width:tex.width height:tex.height mipmapped:NO];
+                d.usage = MTLTextureUsageShaderRead;
+                d.storageMode = MTLStorageModePrivate;
+                prev = [dev newTextureWithDescriptor:d];
+            }
+            id<MTLBlitCommandEncoder> bl = [cb() blitCommandEncoder];
+            [bl copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                     sourceSize:MTLSizeMake(tex.width, tex.height, 1) toTexture:prev destinationSlice:0
+               destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+            [bl endEncoding];
+        }
+        if (probe_fs) continue;
         // FIFA_DBG_PIXELS=x,y;x,y...: which draws change these pixels of a full-size colour target 0
         static int npix = -1, px[16][2];
         static float last[16][4];
@@ -2730,6 +2788,15 @@ static void draw(CmdRec *r, bool indexed) {
         }
     }
     stat_draws++;
+    static unsigned long long probe_fs = 1;  // FIFA_DBG_FS register probe: count its program's draws (debug frame trigger)
+    if (probe_fs == 1) {
+        const char *e = getenv("FIFA_DBG_FS");
+        unsigned long long a = 0;
+        unsigned pc = 0;
+        probe_fs = e && sscanf(e, "%llx:%x", &a, &pc) == 2 && pc < 0xfffffffeu ? a : 0;
+        if (probe_fs) g_probe_fs_draws = 0;
+    }
+    if (probe_fs && st.program && st.program->stages[1].code_addr == probe_fs) g_probe_fs_draws++;
     static int perdraw = -1;
     if (perdraw < 0) perdraw = getenv("FIFA_DBG_PERDRAW") != NULL;
     if (g_debug_frame && perdraw) { perdraw_prog = pr; perdraw_check(); }

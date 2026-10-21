@@ -101,10 +101,14 @@ extern uint32_t maxwell_shared_size;
 extern const uint8_t *maxwell_consts;
 extern uint32_t maxwell_consts_size;
 // Debug: when translating the shader whose code starts at maxwell_dbg_code, output register
-// maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets).
+// maxwell_dbg_reg as captured after the instruction at maxwell_dbg_pc (greyscale, all targets; with
+// FIFA_DBG_PERDRAW the debug frame logs the pixels each of its draws changed as [probe]).
 extern const uint8_t *maxwell_dbg_code;
 extern uint32_t maxwell_dbg_pc;
 extern int maxwell_dbg_reg;
+// up to two more probes (pc, reg; reg -1 = none) for the green and blue components
+extern uint32_t maxwell_dbg_pcx[2];
+extern int maxwell_dbg_regx[2];
 // Debug: the vertex shader at maxwell_dbg_vs writes each vertex's position to buffer 18 (slot iid*8+vid).
 extern const uint8_t *maxwell_dbg_vs;
 #define DBG_VS_BUFFER_INDEX 29

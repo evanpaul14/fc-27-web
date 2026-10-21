@@ -284,7 +284,7 @@ from the roots (215k functions), which rewrites every unit and costs a full
   functions that return the next guest address to a driver loop; compile
   time is superlinear in function size otherwise.
 
-## Status (2026-10-20)
+## Status (2026-10-21)
 
 Current state: with the update (`FIFA_ROMFS=extracted/update/romfs_program.json`)
 the game plays the EA SPORTS intro, the title ("Let's Play!"), the offline
@@ -296,7 +296,8 @@ half-time) at 28-30 fps in open play (the game's 30 fps cap) with buffer
 copies and readbacks as GPU blits (see "Blits" and "Match profile"). Per frame
 in open play (hidden, no thermal pressure) the CPU takes ~28-30 ms and the GPU
 is busy ~11.5 ms of the 33 ms ("GPU busy vs idle", "Host thunks in
-`a64_call`"). The
+`a64_call`"). The visual pass over the match is under way (skin, faces, jackets
+and crowd fixed; grass grain, shadows and reflections left: "Next steps" item 4). The
 worker-thread crashes were an exclusive-store ordering bug (see "Worker
 thread crashes" below); 8 runs of 2-3 minutes since, none crashed. The rest of
 this section is the history that led here, oldest first.
@@ -365,7 +366,10 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   colour target to `build/pass_*.png` and sampled 2D textures to
   `build/dtex_*.png`), `FIFA_DUMP_SHADERS=1` (code and control sections to
   `build/shaders/<addr>_s<stage>_*.bin`), `FIFA_DBG_FS=addr:pc:reg[,pc:reg[,pc:reg]]`
-  (register probe, up to three registers to R/G/B; pc `ffffffff` = solid white; see "Visual pass, second round"), `FIFA_DUMP_VB=1` (first
+  (register probe, up to three registers to R/G/B; pc `ffffffff` = solid white; see "Visual pass, second round"),
+  `FIFA_DBG_VS=<vs>` with `FIFA_DBG_VSREG`/`FIFA_DBG_VSTEX` (vertex dumps and probes), `FIFA_WATCH=<addr>:<len>` /
+  `FIFA_WATCH_TEX=<w>x<h>x<d>:<fmt>` (CPU write watchpoint), `FIFA_WATCH_GPU`/`FIFA_WATCH_FMT` (copies into a range or
+  format; all in "Visual pass, fourth round"), `FIFA_DUMP_VB=1` (first
   6 raw vertices of stream 0 per debug-frame draw; also calls
   `dbg_vb_hook(host, guest)` for lldb), `FIFA_DUMP_VSUBO=1`,
   `FIFA_LOG_POOLS=1`; the debug frame's `[dtex]` lines give each sampled
@@ -1165,7 +1169,7 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     1848 BRAs in 366 of the 437 dumps carry CC.NEU (all others CC.T); 1815 follow an FSET.CC, 13 an ISET.CC, 20 no
     producer in reach (flags stay clear: taken, as before). 437/437 still translate and compile.
   - Found with the new debug aids: `FIFA_DBG_WRITERS=1` (with `FIFA_DBG_PERDRAW=1`, debug frame: per pixel of each
-    full-size colour target 0 the last draw that changed it, `build/writers_<addr>.bin` (uint32 draw numbers,
+    full-size colour target 0 the last draw that changed it, `build/writers_<addr>_<present>.bin` (uint32 draw numbers,
     matching `[writer] draw N ... fs` lines) and `.f32` (RGBA floats)); the register probe also writes
     `build/probe_<frame>.f32` (RGBA floats the probed draws wrote, 0 elsewhere: raw values, unlike the tonemapped
     screen); `FIFA_DBG_NODTEX=1` skips the debug frame's texture dumps, so several `debug` requests fit in one

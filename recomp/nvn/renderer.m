@@ -1241,7 +1241,19 @@ static void compile_program(Prog *pr) {
 
 static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
     shader_cache_warm();
-    if (!(p->stage_mask & 1) || !(p->stage_mask & 2)) return nil;
+    if (!(p->stage_mask & 1) || !(p->stage_mask & 2)) {
+        static NvnProgram *seen[64];
+        static int nseen;
+        bool fresh = true;
+        for (int i = 0; i < nseen; i++) fresh &= seen[i] != p;
+        if (fresh && nseen < 64) {
+            seen[nseen++] = p;
+            LOG("[shader] program %p stage mask %#x skipped:", (void *)p, p->stage_mask);
+            for (int i = 0; i < 6; i++) if (p->stage_mask & (1u << i)) LOG(" s%d %llx", i, (unsigned long long)p->stages[i].code_addr);
+            LOG("\n");
+        }
+        return nil;
+    }
     // fast path: hash of the code addresses and keys
     uint64_t h = 0xcbf29ce484222325ull;
     for (int i = 0; i < 2; i++) { uint64_t a = p->stages[i].code_addr; for (int k = 0; k < 8; k++) { h ^= (a >> (k * 8)) & 0xFF; h *= 0x100000001B3ull; } }

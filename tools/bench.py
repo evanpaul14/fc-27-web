@@ -10,7 +10,7 @@ separated by ';' (a bare number n means `blits n`), e.g. 'blits 1;prof 0:120'; e
 cores.log: every 2 s the game's CPU seconds on P and E cores, retired instructions and clocks (proc_pid_rusage v6, no
 root). Compare fps only at the same P clock: the P cores throttle to ~0.83 GHz under thermal pressure; compare runs by
 cost per frame instead (tools/benchsum.py: instructions, CPU and GPU time per frame, which don't depend on the clock). SAMPLE=1 also runs
-/usr/bin/sample for 10 s near the end of each segment (<outdir>/seg<i>.sample).
+/usr/bin/sample for 10 s near the end of each segment (<outdir>/seg<i>.sample). VISIBLE=1 shows the window.
 """
 import ctypes
 import os
@@ -28,6 +28,8 @@ if os.path.exists(fifo):
     os.remove(fifo)
 os.mkfifo(fifo)
 env = dict(os.environ, FIFA_CONTROL=fifo, FIFA_ROMFS='extracted/update/romfs_program.json', FIFA_HIDDEN='1')
+if os.environ.get('VISIBLE'):  # VISIBLE=1: show the window
+    del env['FIFA_HIDDEN']
 t0 = time.time()
 game = subprocess.Popen(['./build/fifa'], cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 log = open(os.path.join(out, 'game.log'), 'w')

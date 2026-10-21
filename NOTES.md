@@ -1099,6 +1099,21 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   instructions (1,207 chunks) dispatch with `switch (pc)`. The hottest guest function `F_0fc1e9c0` is the job system's
   LDXR/STXR work-queue poll (spinning, not work). Busy samples (b17): ~50% guest code over hundreds of functions,
   `a64_call` 6-8%, every runtime piece (texture checks, ring snapshots, pool lookups, objc) ~1% each.
+- Visual pass, first round (2026-10-20, runs `build/w1` hidden, `build/v1`..`v3` visible: `VISIBLE=1 LOAD=4
+  tools/bench.py ... 'fps -1:3' x12` takes walkout shots every ~3 s). Shader coverage 437/437 (shtool):
+  - The 5 compute programs that failed are dispatched at match load: VMNMX (`3a2c`, `16ea01d00` `16ebcb400`, and an
+    FS: `d = min(min(a, b), c)`, now general per yuzu's decoding: selectors, widths, MRG/ACC/MIN/MAX; .SAT/.CC fail)
+    and SUST to buffer images (surface type 1, `16ea3ec00` `16eca9800` `16f469b00`; bound as 1D images: both are
+    rows of 16384 texels). With them the **black arms/legs/hands are fixed** (the skin was composited by these).
+  - FS `16e40c500` fetched through a table of separate textures indexed in a loop (`LDC c[2][r + 0x168]` OR the
+    sampler word at 0x570). `trace_handle` flags the indexed LDC; `bindless_slot` gives TEX.B 8 candidate slots
+    (0x168 + 8k) and `emit_tex` picks at run time the one whose `c[2]` words equal the handle register.
+  - Still open after these: ~10% of draws skipped (reason b, `!pr`) in cutscenes (walkout, bench, crowd shots;
+    0 in open play) with no translate failure logged: missing Bournemouth/Brighton jackets and spectators.
+    `get_program` now logs programs without both VS and FS (`[shader] program ... stage mask`). Grey/white
+    sharp-edged patches on faces and necks (at some angles); grass shimmer/grain.
+  - Visible window, open play, thermal 0 (v1, v2): 30.0 fps, P cores ~2.6 GHz; the old 12-17 fps was throttling.
+  - (`pgrep -f tools/bench.py` in a wait loop matches the loop's own shell: wait on the bench's PID instead.)
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -1265,18 +1280,16 @@ so the visual pass (4) comes next. In order:
 3. ~~The black 3D scene for part of the first half~~ fixed by the lane
    masks. ~~The 32^3 3D texture sampled as 2D~~ is the game's own stale
    binding, harmless (see "Blits").
-4. Visual pass over the match: the noisy skin on arms/legs/hands
-   (walkout, handshake, close-ups), the black sky, shadows, reflections.
-   ~~Skipped draws~~ 0 per 2 s in open play now.
-5. Shader coverage (`build/shtool`): 431/437 translate. Left: FS
-   `16e40c500` (texture handle from an indexed `LDC c[2][r + 0x168]` in a
-   loop), surface type 1 = buffer images (3 CS, incl. `16eca9800`; needs
-   texture buffers bound as images), `3a2c` VMNMX (2 CS), SUATOM.
+4. Visual pass over the match ("Visual pass, first round"): ~~black/noisy skin on
+   arms/legs/hands~~ (compute fixes). Left: draws skipped in cutscenes
+   (jackets, spectators), grey patches on faces, grass shimmer/grain,
+   shadows, reflections. (The black sky is not an issue.)
+5. Shader coverage (`build/shtool`): 437/437 of the dumps translate. Seen
+   at boot only: SUATOM (`ea70`, CS `16e61ea00`, `16f0ce900`).
    GPU side: not a bottleneck (busy ~11.5 ms per frame, ~1 ms idle between stages: "GPU busy vs idle"); the main
    pass's vertex (2.6 ms, incl. `gfind`) and fragment (3.9 ms) stages only matter for 60 fps.
-6. Open play at 12-17 fps in the visible window: hidden runs at thermal
-   pressure 0-2 (g2-g4, b17, b18) all hold 29.8-30 fps, so it was the P-core
-   throttling ("fps vs blits, benchmarked"). Not re-measured visible.
+6. ~~Open play at 12-17 fps in the visible window~~: 30.0 fps visible at
+   thermal 0 (v1, v2); it was P-core throttling.
 7. Try the keyboard and a gamepad in the visible window; audio output for
    `audout.c`'s sink thread; the dark Continue button on the accessibility
    screen (seen before the threading fix; check if it still happens).

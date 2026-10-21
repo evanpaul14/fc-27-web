@@ -111,6 +111,10 @@ typedef struct {
     bool uses_gmem_store;    // STG present: the gmem buffer is not readonly
     uint32_t cbuf_need[18];  // highest constant vec4 index + 1 per cbuf (array size of the GLSL block)
     size_t trace_use;        // trace_handle: the instruction that uses the handle
+    // bindless_slot on an indexed handle (LDC c[2][r + off]): the candidate bindings off + 8 * k, picked at run time
+    // by comparing the handle register with each one's words (emit_tex)
+    int multi_n, multi_reg, multi_slot[8];
+    uint32_t multi_off[8], multi_smp;
 } Ctx;
 
 static uint64_t bits(uint64_t w, int lo, int n) { return (w >> lo) & ((n == 64) ? ~0ull : ((1ull << n) - 1)); }
@@ -685,6 +689,7 @@ static size_t branch_into(Ctx *c, size_t target) {
 // The constant-buffer word(s) a handle register holds at instruction `at`. A write under a predicate counts when the
 // using instruction has the same predicate (`@P3 MOV r10, c[2][0x120]; @P3 SUST ... r10`) and nothing in between
 // sets it; c->trace_use is that instruction.
+#define HANDLE_INDEXED 0x80000000u  // trace_handle: an offset into an indexed table of handles
 static int trace_handle(Ctx *c, size_t at, int r, uint32_t *offs, int n, int depth) {
     if (r == RZ || depth > 6 || n < 0) return -1;
     if (depth == 0) c->trace_use = at;
@@ -712,6 +717,10 @@ static int trace_handle(Ctx *c, size_t at, int r, uint32_t *offs, int n, int dep
             n = trace_handle(c, j, (int)bits(w, 8, 8), offs, n, depth + 1);
             return trace_handle(c, j, (int)bits(w, 20, 8), offs, n, depth + 1);
         }
+        // LDC.32 c[2][r + off]: one of a table of separate textures, indexed in a loop (flagged; bindless_slot)
+        if (op == 0xef90000000000000ull && bits(w, 36, 5) == 2 && bits(w, 48, 3) == 4 && !bits(w, 44, 2) &&
+            bits(w, 8, 8) != RZ && n < 2)
+            return offs[n++] = (uint32_t)bits(w, 20, 16) | HANDLE_INDEXED, n;
         return -1;
     }
     return -1;  // read before any write
@@ -741,7 +750,23 @@ static int tex_slot_bindless(Ctx *c, uint32_t a, uint32_t b, int type, bool shad
 // (and the shader fails) if it is built any other way.
 static int bindless_slot(Ctx *c, int r, int type, bool shadow, bool array) {
     uint32_t ho[2];
+    c->multi_n = 0;
     if (trace_handle(c, c->cur, r, ho, 0, 0) != 2) { fail(c, "bindless tex at %#zx: handle r%d not from c[2]", c->cur * 8, r); return -1; }
+    if ((ho[0] | ho[1]) & HANDLE_INDEXED) {  // an indexed table OR a sampler word: the first 8 entries
+        uint32_t tab = (ho[0] & HANDLE_INDEXED ? ho[0] : ho[1]) & ~HANDLE_INDEXED, smp = ho[0] & HANDLE_INDEXED ? ho[1] : ho[0];
+        if ((ho[0] & ho[1]) & HANDLE_INDEXED || tab < 0x168 || tab + 8 * 8 > 0x168 + 8 * 128) {
+            fail(c, "bindless tex at %#zx: indexed handle table at c[2][%#x]", c->cur * 8, tab);
+            return -1;
+        }
+        c->multi_n = 8;
+        c->multi_reg = r;
+        c->multi_smp = smp;
+        for (int k = 0; k < c->multi_n && !c->fail; k++) {
+            c->multi_off[k] = tab + 8 * k;
+            c->multi_slot[k] = tex_slot_bindless(c, tab + 8 * k, smp, type, shadow, array);
+        }
+        return c->fail ? -1 : c->multi_slot[0];
+    }
     return tex_slot_bindless(c, ho[0], ho[1], type, shadow, array);
 }
 
@@ -1076,12 +1101,21 @@ static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
     }
     if (dc) { c->reg_used[pr] = 1; sprintf(dref, "as_type<float>(r%d)", pr); pr++; }
     const char *vec = ncoord == 1 ? "" : ncoord == 2 ? "float2" : "float3";
-    char call[1024];
-    if (dc)
-        sprintf(call, "float4(t%d.sample_compare(s%d, %s(%s)%s%s, %s%s%s))", slot, slot, vec, coords, array ? ", " : "",
-                layer, dref, lod, off);
-    else
-        sprintf(call, "t%d.sample(s%d, %s(%s)%s%s%s%s)", slot, slot, vec, coords, array ? ", " : "", layer, lod, off);
+    char call[8192] = "", one[1024], ha[64], hb[64];
+    int nmulti = bindless ? c->multi_n : 0;
+    for (int k = 0; k < (nmulti ? nmulti : 1); k++) {
+        int sl = nmulti ? c->multi_slot[k] : slot;
+        if (dc)
+            sprintf(one, "float4(t%d.sample_compare(s%d, %s(%s)%s%s, %s%s%s))", sl, sl, vec, coords, array ? ", " : "",
+                    layer, dref, lod, off);
+        else
+            sprintf(one, "t%d.sample(s%d, %s(%s)%s%s%s%s)", sl, sl, vec, coords, array ? ", " : "", layer, lod, off);
+        if (!nmulti) { strcpy(call, one); break; }
+        // the binding whose texture | sampler words are the handle (none: zero)
+        sprintf(call + strlen(call), "r%d == (%s | %s) ? %s : ", c->multi_reg, cbuf_ref(c, 2, c->multi_off[k], NULL, ha),
+                cbuf_ref(c, 2, c->multi_smp, NULL, hb), one);
+    }
+    if (nmulti) strcat(call, "float4(0.0f)");
     write_tex_result(c, slot, call, mask, d, RZ, false, false);
 }
 
@@ -1134,6 +1168,7 @@ static void emit_tld4_bindless(Ctx *c, uint64_t w) {
     if (target == 0 || target == 2 || offmode > 1) { fail(c, "tld4 target %d offset %d", target, offmode); return; }
     int type = target == 1 ? (array ? TEXTYPE_2D_ARRAY : TEXTYPE_2D) : (array ? TEXTYPE_CUBE_ARRAY : TEXTYPE_CUBE);
     int slot = bindless_slot(c, b, type, dc, array);
+    if (c->multi_n) { fail(c, "tld4.b with an indexed handle"); return; }
     if (slot < 0) return;
     int ar = a, pr = b + 1;
     char coords[160] = "", layer[64] = "", off[96] = "", dref[48] = "", tmp[48], call[1024];
@@ -1174,6 +1209,7 @@ static void emit_txd_bindless(Ctx *c, uint64_t w) {
     if (target != 1 || array || aoffi || lc) { fail(c, "txd target %d%s%s%s", target, array ? " array" : "", aoffi ? " aoffi" : "", lc ? " lc" : ""); return; }
     int slot = bindless_slot(c, a, TEXTYPE_2D, false, false);
     if (slot < 0) return;
+    if (c->multi_n) { fail(c, "txd.b with an indexed handle"); return; }
     for (int i = 0; i < 2; i++) c->reg_used[a + 1 + i] = 1;
     for (int i = 0; i < 4; i++) c->reg_used[g + i] = 1;
     char call[512];
@@ -1191,20 +1227,21 @@ static void emit_surface(Ctx *c, uint64_t w, bool store) {
     bool sized = bits(w, 52, 1);
     if (c->glsl) { fail(c, "surface ops (GLSL)"); return; }
     if (bits(w, 51, 1)) { fail(c, "bound surface"); return; }
-    if (stype == 1 || stype > 5) { fail(c, "surface type %d", stype); return; }
+    if (stype > 5) { fail(c, "surface type %d", stype); return; }
     uint32_t ho[2];
     if (trace_handle(c, c->cur, hreg, ho, 0, 0) != 1 || ho[0] < 0x120 || ho[0] >= 0x160) {
         fail(c, "surface handle r%d at %#zx not an image binding", hreg, c->cur * 8);
         return;
     }
-    static const int types[] = {TEXTYPE_1D, TEXTYPE_BUFFER, TEXTYPE_1D_ARRAY, TEXTYPE_2D, TEXTYPE_2D_ARRAY, TEXTYPE_3D};
+    // (buffer images bind as 1D ones: both are rows of 16384 texels, metal.m mtl_tex_type)
+    static const int types[] = {TEXTYPE_1D, TEXTYPE_1D, TEXTYPE_1D_ARRAY, TEXTYPE_2D, TEXTYPE_2D_ARRAY, TEXTYPE_3D};
     int type = types[stype];
     bool array = stype == 2 || stype == 4;
     int slot = tex_slot_at(c, &c->img_slot[(ho[0] - 0x120) / 8], ho[0], type, false, array);
     if (c->fail) return;
     c->info->tex[slot].is_image = true;
     c->img_access[slot] |= store ? 2 : 1;
-    int nco = stype == 0 || stype == 2 ? 1 : stype == 5 ? 3 : 2;
+    int nco = stype <= 2 ? 1 : stype == 5 ? 3 : 2;
     int size = (int)bits(w, 20, 3), bytes = size == 5 ? 8 : size == 6 ? 16 : 4;
     if (sized && size < 4) { fail(c, "surface .D size %d", size); return; }
     char co[160], tmp[48];
@@ -2141,6 +2178,37 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         if (p != PT) { c->pred_used[p] = 1; sp(&c->body, "      p%d = cmp %s pp;\n", p, bool_op(bo)); }
         if (q != PT) { c->pred_used[q] = 1; sp(&c->body, "      p%d = !cmp %s pp;\n", q, bool_op(bo)); }
         sp(&c->body, "    }\n");
+    } else if (OPM(0x3a00000000000000ull, 0xfe00000000000000ull)) {  // VMNMX
+        // (yuzu's decoding) 20-35 immediate b or 20-27 register b, 28-29 b selector, 29-30 b width, 36-37 a selector,
+        // 37-38 a width (0 byte, 2 short, 3 word; the fields overlap), 39-46 c, 47 .CC, 48 a signed, 49 b signed,
+        // 50 b is a register, 51-53 op (0 MRG_16H, 1 MRG_16L, 2 MRG_8B0, 3 MRG_8B2, 4 ACC, 5 MIN, 6 MAX), 54 .SAT,
+        // 55 .MX. d = op(.MX ? max(a, b) : min(a, b), c): the first comparison takes b's sign, the second a's.
+        int op = (int)bits(w, 51, 3);
+        bool asg = bits(w, 48, 1), bsg = bits(w, 49, 1);
+        if (bits(w, 47, 1) || bits(w, 54, 1) || op > 6) { fail(c, "vmnmx%s%s op %d", bits(w, 47, 1) ? ".cc" : "", bits(w, 54, 1) ? ".sat" : "", op); return; }
+        char va[96], vb[96], m[256];
+        const char *ra = R(a);
+        int aw = (int)bits(w, 37, 2), asel = (int)bits(w, 36, 2);
+        if (aw == 3) strcpy(va, ra);
+        else sprintf(va, asg ? "uint(extract_bits(int(%s), %du, %du))" : "extract_bits(%s, %du, %du)", ra, asel * (aw ? 16 : 8), aw ? 16 : 8);
+        if (!bits(w, 50, 1)) sprintf(vb, "%uu", (unsigned)bits(w, 20, 16));
+        else {
+            const char *rb = R((int)bits(w, 20, 8));
+            int bw = (int)bits(w, 29, 2), bsel = (int)bits(w, 28, 2);
+            if (bw == 3) strcpy(vb, rb);
+            else sprintf(vb, bsg ? "uint(extract_bits(int(%s), %du, %du))" : "extract_bits(%s, %du, %du)", rb, bsel * (bw ? 16 : 8), bw ? 16 : 8);
+        }
+        const char *f1 = bits(w, 55, 1) ? "max" : "min";
+        if (bsg) sprintf(m, "uint(%s(int(%s), int(%s)))", f1, va, vb);
+        else sprintf(m, "%s(%s, %s)", f1, va, vb);
+        const char *rc = R((int)bits(w, 39, 8));
+        static const char *const merge[] = {"insert_bits(%s, %s, 16u, 16u)", "insert_bits(%s, %s, 0u, 16u)",
+                                            "insert_bits(%s, %s, 0u, 8u)", "insert_bits(%s, %s, 16u, 8u)"};
+        if (op < 4) sprintf(t, merge[op], rc, m);
+        else if (op == 4) sprintf(t, "(%s + %s)", m, rc);
+        else if (asg) sprintf(t, "uint(%s(int(%s), int(%s)))", op == 5 ? "min" : "max", m, rc);
+        else sprintf(t, "%s(%s, %s)", op == 5 ? "min" : "max", m, rc);
+        set_reg(c, d, t);
     } else if (OPM(0x5098000000000000ull, 0xfff8000000000000ull)) {  // CSET
         fail(c, "cset");
     } else if (OPM(0xf0a8000000000000ull, 0xfff8000000000000ull)) {  // BAR

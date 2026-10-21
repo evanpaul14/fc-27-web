@@ -67,6 +67,7 @@ static struct {
     uint32_t channel_mask;
     uint8_t color_state[4], ds[8], ms[0x18], poly[4];
     float poly_offset[3];  // factor, units, clamp (nvnCommandBufferSetPolygonOffsetClamp)
+    bool depth_clamp;      // nvnCommandBufferSetDepthClamp: clamp depth instead of clipping at the near/far planes
     uint32_t attrib[16];
     int nattrib;
     uint32_t stream[16][2];
@@ -1601,6 +1602,11 @@ static void resolve_feedback(Prog *pr) {
 
 static bool rtw(const NvnTexture *t);
 static void bind_textures(int stage, ShaderInfo *si) {
+    static unsigned long long dump_fs = 1;  // FIFA_DUMP_TEX_FS=<fs>: dump that program's textures like the debug frame does
+    if (dump_fs == 1) dump_fs = getenv("FIFA_DUMP_TEX_FS") ? strtoull(getenv("FIFA_DUMP_TEX_FS"), NULL, 16) : 0;
+    static int nodtex = -1;  // FIFA_DBG_NODTEX: no texture dumps in the debug frame (a faster debug frame)
+    if (nodtex < 0) nodtex = getenv("FIFA_DBG_NODTEX") != NULL;
+    bool dump = (g_debug_frame && !nodtex) || (dump_fs && st.program && st.program->stages[1].code_addr == dump_fs);
     for (int i = 0; i < si->ntex; i++) {
         ShaderTexture *st_ = &si->tex[i];
         uint64_t h = shader_tex_handle(stage, st_);
@@ -1633,7 +1639,7 @@ static void bind_textures(int stage, ShaderInfo *si) {
         if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = sampler_for(&((NvnSamplerDesc *)st.spool->entries)[tsc]);
         if (!tex) tex = dummy_texture(st_->type);
         if (!smp) smp = default_sampler();
-        if (g_debug_frame && tex.textureType == MTLTextureType2D && stage == 1) {
+        if (dump && tex.textureType == MTLTextureType2D && stage == 1) {
             static int dn;
             char path[128];
             snprintf(path, sizeof path, "build/dtex_%03d_%d.png", dn++, i);
@@ -1649,7 +1655,7 @@ static void bind_textures(int stage, ShaderInfo *si) {
             snprintf(path, sizeof path, "build/dtex_%03d_%d_a.png", dn - 1, i);
             renderer_save_texture_alpha(tex, path);
         }
-        if (g_debug_frame && tex.textureType != MTLTextureType2D && stage == 1) {  // arrays, 3D, cubes: no dump, just what is bound
+        if (dump && tex.textureType != MTLTextureType2D && stage == 1) {  // arrays, 3D, cubes: no dump, just what is bound
             NvnTexture *dt = h && st.tpool && tic < (uint32_t)st.tpool->count ? ((NvnTexEntry *)st.tpool->entries)[tic].tex : NULL;
             LOG("[dtexa] slot %d tic %u mtl type %lu %lux%lux%lu fmt %lu%s", i, tic, (unsigned long)tex.textureType, (unsigned long)tex.width,
                 (unsigned long)tex.height, (unsigned long)tex.arrayLength, (unsigned long)tex.pixelFormat, tex == dummy_texture(st_->type) ? " DUMMY" : "");
@@ -2186,15 +2192,25 @@ static void perdraw_check(void) {
                 size_t n = tex.width * tex.height, changed = 0;
                 double sum[3] = {0, 0, 0};
                 float lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
+                static float *probe_img;  // build/probe_<frame>.f32: the RGBA floats the probed draws wrote (0 elsewhere), w x h
+                static size_t probe_n;
+                if (probe_n != n) { free(probe_img); probe_img = calloc(n * 4, sizeof(float)); probe_n = n; }
                 for (size_t k = 0; k < n; k++) {
                     if (!memcmp(fp + k * 4, pp + k * 4, 12)) continue;
                     changed++;
+                    memcpy(probe_img + k * 4, fp + k * 4, 16);
                     for (int ch = 0; ch < 3; ch++) {
                         float v = fp[k * 4 + ch];
                         sum[ch] += v;
                         lo[ch] = fminf(lo[ch], v);
                         hi[ch] = fmaxf(hi[ch], v);
                     }
+                }
+                if (changed) {
+                    char ppath[64];
+                    snprintf(ppath, sizeof ppath, "build/probe_%llu.f32", (unsigned long long)renderer_present_count());
+                    FILE *pf = fopen(ppath, "wb");
+                    if (pf) { fwrite(probe_img, 16, n, pf); fclose(pf); }
                 }
                 if (changed)
                     LOG("[probe] draw %d: %zu pixels, mean %g %g %g, min %g %g %g, max %g %g %g\n", ndraw, changed, sum[0] / changed,
@@ -2217,7 +2233,38 @@ static void perdraw_check(void) {
                destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
             [bl endEncoding];
         }
-        if (probe_fs) continue;
+        // FIFA_DBG_WRITERS=1: per pixel of each full-size colour target 0, the last draw that changed it
+        // (build/writers_<addr>.bin: width x height uint32 draw numbers, .f32: the RGBA floats; rewritten after each draw that
+        // changes it; also with a register probe, whose values are then in the floats)
+        static int writers = -1;
+        if (writers < 0) writers = getenv("FIFA_DBG_WRITERS") != NULL;
+        if (probe_fs && !writers) continue;
+        if (writers && i == 0 && tex.width >= 1280) {
+            static struct { uint64_t addr; float *last; uint32_t *map; } wt[8];
+            int s = 0;
+            while (s < 8 && wt[s].addr && wt[s].addr != t->addr) s++;
+            if (s == 8) continue;
+            size_t n = tex.width * tex.height;
+            if (!wt[s].addr) { wt[s].addr = t->addr; wt[s].last = calloc(n * 4, sizeof(float)); wt[s].map = calloc(n, 4); }
+            float *fp = renderer_read_float_rgba(tex);
+            size_t changed = 0;
+            for (size_t k = 0; k < n; k++)
+                if (memcmp(fp + k * 4, wt[s].last + k * 4, 16)) { wt[s].map[k] = ndraw; changed++; }
+            memcpy(wt[s].last, fp, n * 16);
+            free(fp);
+            if (changed) {
+                LOG("[writer] draw %d rt %llx: %zu pixels vs %llx fs %llx\n", ndraw, (unsigned long long)t->addr, changed,
+                    st.program ? (unsigned long long)st.program->stages[0].code_addr : 0ull,
+                    st.program ? (unsigned long long)st.program->stages[1].code_addr : 0ull);
+                char path[128];
+                snprintf(path, sizeof path, "build/writers_%llx.bin", (unsigned long long)t->addr);
+                FILE *f = fopen(path, "wb");
+                if (f) { fwrite(wt[s].map, 4, n, f); fclose(f); }
+                snprintf(path, sizeof path, "build/writers_%llx.f32", (unsigned long long)t->addr);  // the target's RGBA floats
+                if ((f = fopen(path, "wb"))) { fwrite(wt[s].last, 16, n, f); fclose(f); }
+            }
+            continue;
+        }
         // FIFA_DBG_PIXELS=x,y;x,y...: which draws change these pixels of a full-size colour target 0
         static int npix = -1, px[16][2];
         static float last[16][4];
@@ -2345,7 +2392,7 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
     }
     LOG(" | rt %d", st.rt.ncolor);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) LOG(" %ux%u/f%#x@%llx obj %p", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format, (unsigned long long)st.rt.color[i]->addr, (void *)st.rt.color[i]);
-    if (st.rt.depth) LOG(" d%#x", st.rt.depth->format);
+    if (st.rt.depth) LOG(" d%#x@%llx", st.rt.depth->format, (unsigned long long)st.rt.depth->addr);
     LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x streams:", st.viewport[0][0], st.viewport[0][1], st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask);
     for (int i = 0; i < st.nattrib; i++) LOG(" a%d(f%#x s%u o%u)", i, st.attrib[i] & 0xFF, (st.attrib[i] >> 8) & 0x1F, st.attrib[i] >> 13);
     for (int i = 0; i < 12; i++) if (st.vbuf[i].addr) LOG(" vb%d(%llx,%llu,stride %u div %u)", i, st.vbuf[i].addr, st.vbuf[i].size, st.stream[i][0], st.stream[i][1]);
@@ -2482,7 +2529,8 @@ static void draw(CmdRec *r, bool indexed) {
         if (st.rt.color[i] && st.rt.color[i]->addr <= log_rt_addr + 0x40000 && st.rt.color[i]->addr + 0x40000 >= log_rt_addr) addr_hit = true;
     if (addr_hit) LOG("[rtaddr] rt0 addr %llx\n", st.rt.color[0] ? st.rt.color[0]->addr : 0);
     if (g_debug_frame || addr_hit || (log_rt_w && st.rt.ncolor && st.rt.color[0] && (int)st.rt.color[0]->width == log_rt_w &&
-                          (int)st.rt.color[0]->height == log_rt_h))
+                          (int)st.rt.color[0]->height == log_rt_h) ||
+        (log_rt_w && st.rt.depth && (int)st.rt.depth->width == log_rt_w && (int)st.rt.depth->height == log_rt_h))
         debug_draw(pr, r, indexed);
     resolve_feedback(pr);
     // this draw's writes make snapshots of its attachments stale
@@ -2698,6 +2746,8 @@ static void draw(CmdRec *r, bool indexed) {
             last_bias_enc = enc;
         }
     }
+    // depth clamp (nvnCommandBufferSetDepthClamp): geometry beyond the near/far planes is clamped, not clipped
+    [enc setDepthClipMode:st.depth_clamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
     float *vp = st.viewport[0];
     float zn = st.depth_range[0][0], zf = st.depth_range[0][1];
 
@@ -3308,6 +3358,13 @@ static void exec_list(uint64_t handle, int depth) {
             break;
         }
         case CMD_SET_POLYGON_OFFSET: memcpy(st.poly_offset, r->f, sizeof st.poly_offset); break;
+        case CMD_SET_DEPTH_CLAMP: {
+            static int nlog;
+            bool on = (r->x[0] & 1) != 0;
+            if (on != st.depth_clamp && nlog++ < 8) LOG("[clamp] depth clamp %d\n", on);
+            st.depth_clamp = on;
+            break;
+        }
         case CMD_SET_PRIMITIVE_RESTART: st.prim_restart = r->x[0] != 0; st.restart_index = (uint32_t)r->x[1]; break;
         case CMD_SET_COPY_STRIDES: st.copy_row_stride = r->x[0]; st.copy_image_stride = r->x[1]; break;
         case CMD_CLEAR_COLOR: {
@@ -3316,9 +3373,11 @@ static void exec_list(uint64_t handle, int depth) {
             static int log_clears = -1;  // FIFA_LOG_CLEARS: every colour clear (frame, target size, mask, scissor)
             if (log_clears < 0) log_clears = getenv("FIFA_LOG_CLEARS") != NULL;
             if (log_clears && index < st.rt.ncolor && st.rt.color[index])
-                LOG("[cclear] frame %llu idx %d %ux%u f%#x mask %#x scissor %d,%d %dx%d\n", (unsigned long long)renderer_present_count(),
-                    index, st.rt.color[index]->width, st.rt.color[index]->height, st.rt.color[index]->format, (uint32_t)r->x[2],
-                    st.scissor[0][0], st.scissor[0][1], st.scissor[0][2], st.scissor[0][3]);
+                LOG("[cclear] frame %llu idx %d %ux%u f%#x addr %llx mask %#x scissor %d,%d %dx%d color %g %g %g %g (kind %d)\n",
+                    (unsigned long long)renderer_present_count(), index, st.rt.color[index]->width, st.rt.color[index]->height,
+                    st.rt.color[index]->format, (unsigned long long)st.rt.color[index]->addr, (uint32_t)r->x[2], st.scissor[0][0],
+                    st.scissor[0][1], st.scissor[0][2], st.scissor[0][3], ((const float *)x)[0], ((const float *)x)[1],
+                    ((const float *)x)[2], ((const float *)x)[3], (int)r->x[5]);
             else if (log_clears) LOG("[cclear] frame %llu idx %d: no target bound (ncolor %d)\n", (unsigned long long)renderer_present_count(), index, st.rt.ncolor);
             if (index < st.rt.ncolor && st.rt.color[index]) clear(index, (int)r->x[5], x, (uint32_t)r->x[2], false, 0, false, 0, 0);
             break;
@@ -3362,6 +3421,10 @@ static void exec_list(uint64_t handle, int depth) {
             if (st.rt.depth) {
                 // (depth s0, depthMask x1, stencil x2, stencilMask x3)
                 bool has_stencil = renderer_format_has_stencil(st.rt.depth->format);
+                if (getenv("FIFA_LOG_CLEARS"))
+                    LOG("[dclear] frame %llu %ux%u f%#x addr %llx depth %g mask %llu stencil %llu/%#llx\n",
+                        (unsigned long long)renderer_present_count(), st.rt.depth->width, st.rt.depth->height, st.rt.depth->format,
+                        (unsigned long long)st.rt.depth->addr, r->f[0], r->x[0], r->x[1], r->x[2]);
                 clear(-1, 0, NULL, 0, r->x[0] != 0, r->f[0], has_stencil && r->x[2] != 0, (uint32_t)r->x[1],
                       (uint32_t)r->x[2]);
             }

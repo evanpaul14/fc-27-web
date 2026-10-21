@@ -1152,10 +1152,33 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     registers to R, G, B. With `FIFA_DBG_PERDRAW=1` the debug frame logs `[probe] draw N: <pixels>, mean/min/max`
     over the pixels each draw of that FS changed in a >= 1280-wide colour target 0 (GPU copy of the target after
     every draw, read back only around probed draws; R11G11B10F targets clamp negatives to 0). A `debug` request
-    with a probe waits for a frame after one that drew the FS at least 4 times. Pc's: `LARECOMP_SAVE_MSL=1
-    build/shtool -o <dir> <dump>` annotates the MSL with `// pc`.
+    with a probe waits for a frame after one that drew the FS at least once (was 4: that skipped close-ups). Pc's:
+    `LARECOMP_SAVE_MSL=1 build/shtool -o <dir> <dump>` annotates the MSL with `// pc`.
   - `tools/tomatch.py`: the match intro's stand shot (white crowd cards mid-screen) passed as the notice; the
     notice check also wants the bottom edge dark now.
+- Visual pass, third round (2026-10-20, runs `build/f1`..`f25`): **face/neck patches fixed**.
+  - The patches were in the head FS `16fabce00` (not `16fafed00`, which only draws a few pixels): its light loop
+    ends with `FSETP p0 = r54 <= 0; FSET.CC RZ = r48 <= 0; @P0 BRA CC.NEU <exit>`. The translator emitted nothing
+    for an FSET into RZ and ignored the BRA's condition-code test, so the loop left after the first light on every
+    pixel where `r54 <= 0`; the per-light specular sum (`r39`) was then ~0.05 or ~10 in sharp-edged regions.
+    FSET/ISET `.CC` now set the zero/sign flags (also into RZ) and BRA tests CC (`cc_test`, shared with CSETP).
+    1848 BRAs in 366 of the 437 dumps carry CC.NEU (all others CC.T); 1815 follow an FSET.CC, 13 an ISET.CC, 20 no
+    producer in reach (flags stay clear: taken, as before). 437/437 still translate and compile.
+  - Found with the new debug aids: `FIFA_DBG_WRITERS=1` (with `FIFA_DBG_PERDRAW=1`, debug frame: per pixel of each
+    full-size colour target 0 the last draw that changed it, `build/writers_<addr>.bin` (uint32 draw numbers,
+    matching `[writer] draw N ... fs` lines) and `.f32` (RGBA floats)); the register probe also writes
+    `build/probe_<frame>.f32` (RGBA floats the probed draws wrote, 0 elsewhere: raw values, unlike the tonemapped
+    screen); `FIFA_DBG_NODTEX=1` skips the debug frame's texture dumps, so several `debug` requests fit in one
+    walkout (`'fps -1:12,debug:1,fps -1:4,debug:1,...'`); `FIFA_DUMP_TEX_FS=<fs>` dumps that program's textures
+    on every draw (like the debug frame); `FIFA_LOG_RT=WxH` also matches the depth target, and draw lines print
+    the depth target's address (`d0x32@<addr>`); `FIFA_LOG_CLEARS` logs depth clears (`[dclear]`) and colour
+    clear values/addresses. The walkout's shot order varies from run to run (line-ups first or handshakes first).
+  - `nvnCommandBufferSetDepthClamp` was a no-op; it now sets Metal's depth clip mode per draw. The game toggles it
+    (shadow casters, the load-time top-down captures). It did not change the faces.
+  - Ruled out on the way: the head's world-space height-field lookup (t0, a 1024x1024 R11G11B10F packed at match
+    load by FS `16ede1800` from two 2048x2048 D16 top-down captures and an R8 mask; its G input is cleared in the
+    same frame before its own pass, so G is 0 as recorded); the step test is uniform over the heads. The sun's PCF
+    shadow (pc 0xbf8-0xf28) is ~0 (unshadowed) on faces.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -1324,9 +1347,10 @@ so the visual pass (4) comes next. In order:
    binding, harmless (see "Blits").
 4. Visual pass over the match ("Visual pass, first round"): ~~black/noisy skin on
    arms/legs/hands~~ (compute fixes), ~~draws skipped in cutscenes~~
-   (vertex-only programs), ~~the NaN LUT~~ (TLDS array layout). Left: black
+   (vertex-only programs), ~~the NaN LUT~~ (TLDS array layout), ~~grey patches on
+   faces~~ (BRA CC tests, "Visual pass, third round"). Left: black
    jackets (diffuse colour 0, see "Visual pass, second round"), flat black/white crowd,
-   grey patches on faces, grass shimmer/grain, shadows, reflections. (The
+   grass shimmer/grain, shadows, reflections. (The
    black sky is not an issue.)
 5. Shader coverage (`build/shtool`): 437/437 of the dumps translate. Seen
    at boot only: SUATOM (`ea70`, CS `16e61ea00`, `16f0ce900`).

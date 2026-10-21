@@ -853,10 +853,10 @@ void backend_present(NvnTexture *t) {
     static long debug_at = -1;  // FIFA_DEBUG_FRAME=<n>: log (and dump passes of) frame n
     if (debug_at < 0) debug_at = ENV("FIFA_DEBUG_FRAME") ? atol(ENV("FIFA_DEBUG_FRAME")) : 0;
     // or FIFA_CONTROL "debug"; with a FIFA_DBG_FS register probe, the first frame after it whose previous frame drew
-    // the probed program at least 4 times (so the probe has pixels to report)
+    // the probed program at least once (so the probe has pixels to report)
     static bool debug_armed;
     debug_armed |= input_take_debug();
-    bool probe_ready = g_probe_fs_draws < 0 || g_probe_fs_draws >= 4;
+    bool probe_ready = g_probe_fs_draws < 0 || g_probe_fs_draws >= 1;
     g_debug_frame = (debug_at && total_frames == (uint64_t)debug_at) || (debug_armed && probe_ready);
     if (g_debug_frame) debug_armed = false;
     if (g_probe_fs_draws > 0) g_probe_fs_draws = 0;

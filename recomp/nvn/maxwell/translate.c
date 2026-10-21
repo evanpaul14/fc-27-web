@@ -1315,6 +1315,22 @@ static void emit_atomic(Ctx *c, uint64_t w, int kind) {  // kind: 0 ATOMS, 1 ATO
 }
 
 // ------------------------------------------------------------------ instruction translation
+// Condition-code test (BRA, CSETP: bits 0-4 / 8-12) on the zero/sign flags. NULL for tests that need the
+// overflow/carry flags (not tracked).
+static const char *cc_test(int test) {
+    switch (test) {
+    case 0: return "false";
+    case 15: return "true";
+    case 2: case 10: return "ccz";
+    case 5: case 13: return "!ccz";
+    case 1: case 9: return "ccs";
+    case 6: case 14: return "!ccs";
+    case 4: case 12: return "(!ccz && !ccs)";
+    case 3: case 11: return "(ccz || ccs)";
+    default: return NULL;
+    }
+}
+
 static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     char t[2048], u[2048];
     int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8);
@@ -1345,7 +1361,14 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     } else if (OPM(0xe240000000000000ull, 0xfff0000000000020ull)) {  // BRA
         uint32_t target = norm_target((int64_t)pc + 8 + sbits(w, 20, 24));
         c->uses_branches = true;
-        sp(&c->body, "    pc = %uu; continue;\n", target);
+        int test = (int)bits(w, 0, 5);
+        if (test == 0xf) sp(&c->body, "    pc = %uu; continue;\n", target);
+        else {  // BRA CC.<test>: taken only when the condition code passes too (FSET.CC + BRA CC.NEU ends light loops)
+            const char *cond = cc_test(test);
+            if (!cond) { fail(c, "bra cc test %d", test); return; }
+            c->uses_cc = true;
+            sp(&c->body, "    if (%s) { pc = %uu; continue; }\n", cond, target);
+        }
     } else if (OPM(0xe290000000000000ull, 0xfff0000000000020ull)) {  // SSY
         c->uses_branches = true;
         sp(&c->body, "    ssy[ssy_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
@@ -1542,6 +1565,10 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         sprintf(t, "((%s) %s %s)", cmp, bool_op((int)bits(w, 45, 2)), P((int)bits(w, 39, 3), bits(w, 42, 1)));
         sprintf(u, bits(w, 52, 1) ? "(%s ? 0x3f800000u : 0u)" : "(%s ? 0xFFFFFFFFu : 0u)", t);
         set_reg(c, d, u);
+        if (bits(w, 47, 1)) {  // .CC: zero/sign flags of the result (also with d = RZ, for a following BRA CC.<test>)
+            c->uses_cc = true;
+            sp(&c->body, "    { uint ccv = %s; ccz = ccv == 0u; ccs = int(ccv) < 0; }\n", u);
+        }
     } else if (OPM(0x5ba0000000000000ull, 0xfff0000000000000ull) || OPM(0x4ba0000000000000ull, 0xfff0000000000000ull) ||
                OPM(0x36a0000000000000ull, 0xfef0000000000000ull) || OPM(0x53a0000000000000ull, 0xfff0000000000000ull)) {  // FCMP
         char cmp[512], cb[256], bb[256];
@@ -1691,6 +1718,10 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         sprintf(t, "((%s) %s %s)", cmp, bool_op((int)bits(w, 45, 2)), P((int)bits(w, 39, 3), bits(w, 42, 1)));
         sprintf(u, bits(w, 44, 1) ? "(%s ? 0x3f800000u : 0u)" : "(%s ? 0xFFFFFFFFu : 0u)", t);
         set_reg(c, d, u);
+        if (bits(w, 47, 1)) {  // .CC (as FSET)
+            c->uses_cc = true;
+            sp(&c->body, "    { uint ccv = %s; ccz = ccv == 0u; ccs = int(ccv) < 0; }\n", u);
+        }
     } else if (OPM(0x5c20000000000000ull, 0xfff8000000000000ull) || OPM(0x4c20000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x3820000000000000ull, 0xfef8000000000000ull)) {  // IMNMX
         bool sgn = bits(w, 48, 1);
@@ -2168,18 +2199,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
            (uint32_t)sbits(w, 20, 24));
     } else if (OPM(0x50a0000000000000ull, 0xfff8000000000000ull)) {  // CSETP (zero/sign flags only)
         int test = (int)bits(w, 8, 5);
-        const char *cond;
-        switch (test) {
-        case 0: cond = "false"; break;
-        case 15: cond = "true"; break;
-        case 2: case 10: cond = "ccz"; break;
-        case 5: case 13: cond = "!ccz"; break;
-        case 1: case 9: cond = "ccs"; break;
-        case 6: case 14: cond = "!ccs"; break;
-        case 4: case 12: cond = "(!ccz && !ccs)"; break;
-        case 3: case 11: cond = "(ccz || ccs)"; break;
-        default: cond = "false"; fail(c, "csetp test %d", test);
-        }
+        const char *cond = cc_test(test);
+        if (!cond) { cond = "false"; fail(c, "csetp test %d", test); }
         c->uses_cc = true;
         int p = (int)bits(w, 3, 3), q = (int)bits(w, 0, 3), bo = (int)bits(w, 45, 2);
         const char *pc_ = P((int)bits(w, 39, 3), bits(w, 42, 1));

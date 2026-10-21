@@ -297,7 +297,7 @@ copies and readbacks as GPU blits (see "Blits" and "Match profile"). Per frame
 in open play (hidden, no thermal pressure) the CPU takes ~28-30 ms and the GPU
 is busy ~11.5 ms of the 33 ms ("GPU busy vs idle", "Host thunks in
 `a64_call`"). The visual pass over the match is under way (skin, faces, jackets
-crowd and grass grain fixed; shadows and reflections left: "Next steps" item 4). The
+crowd and grass grain fixed, night shadows checked; reflections and a day match left: "Next steps" item 4). The
 worker-thread crashes were an exclusive-store ordering bug (see "Worker
 thread crashes" below); 8 runs of 2-3 minutes since, none crashed. The rest of
 this section is the history that led here, oldest first.
@@ -1240,6 +1240,19 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     reverse angles); that was the second bug.
   - Debug aids: `FIFA_DBG_PROBE_3D=1` writes level 0 of 3D textures the probe touches (`[probefs]`, `FIFA_DBG_CSW`)
     to `build/probe3d_<w>x<h>x<d>_<mtl fmt>.bin`.
+- Visual pass, sixth round (2026-10-21, runs `build/s1`, `s2`): **night-match shadows work; nothing to fix**.
+  - Player shadows at night are a screen-space buffer, not a shadow map: a 512x512 RG target (fmt 0xd) cleared to
+    white, the players drawn into it 5 instances per draw (FS `16f9f9000` and three others: per-floodlight cone
+    falloff from the light table at `cb0[81]`, 0xa0 per light) with MIN blending (bf ONE,ONE, eq 4,4), then blurred
+    twice by FS `16e2df900` (1f3590000 -> 1f3bd0000 -> 17872cc00). The pitch FS `170958600` samples it as t3 at
+    pc 0x268 with coordinates from the fragment position. The buffer holds the X-shaped shadows (one arm per
+    floodlight), the scene pass shows them under every player, and the final frame keeps them, softer after the
+    tonemap: they only look absent in wide open-play shots.
+  - The sun's PCF (`gather_compare` on a depth array, ~90 lit FS, e.g. the head FS's t6) is bound to a 1x1
+    Depth32Float at night: no sun shadow map in these matches. Untested until a day match is played (the
+    cascades, TLD4.DC with offsets, compare samplers: `sampler_for` maps the compare mode/function).
+  - (A `debug` frame with `FIFA_DBG_PERDRAW=1` takes ~0.1 s per draw: give the segment after it a minute or more,
+    or the frame is cut off before the main pass.)
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -1412,7 +1425,8 @@ so the visual pass (4) comes next. In order:
    faces~~ (BRA CC tests, "Visual pass, third round"), ~~black jackets~~ (border colour
    through the alpha-one swizzle, same section), ~~flat black/white crowd~~
    (`nvnTextureGetViewOffset`, "Visual pass, fourth round"), ~~grass grain~~ (the grading LUT: IADD3.RS and
-   predicated late writes, "Visual pass, fifth round"). Left: shadows, reflections. (The
+   predicated late writes, "Visual pass, fifth round"). ~~Shadows~~: the night floodlight
+   shadows work ("Visual pass, sixth round"); sun shadows need a day match. Left: reflections. (The
    black sky is not an issue.)
 5. Shader coverage (`build/shtool`): 437/437 of the dumps translate. Seen
    at boot only: SUATOM (`ea70`, CS `16e61ea00`, `16f0ce900`).

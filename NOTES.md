@@ -364,8 +364,8 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   `FIFA_DEBUG_FRAME=n` (logs every draw of frame n and dumps each pass's
   colour target to `build/pass_*.png` and sampled 2D textures to
   `build/dtex_*.png`), `FIFA_DUMP_SHADERS=1` (code and control sections to
-  `build/shaders/<addr>_s<stage>_*.bin`), `FIFA_DBG_FS=addr:pc:reg`
-  (register probe; pc `ffffffff` = solid white), `FIFA_DUMP_VB=1` (first
+  `build/shaders/<addr>_s<stage>_*.bin`), `FIFA_DBG_FS=addr:pc:reg[,pc:reg[,pc:reg]]`
+  (register probe, up to three registers to R/G/B; pc `ffffffff` = solid white; see "Visual pass, second round"), `FIFA_DUMP_VB=1` (first
   6 raw vertices of stream 0 per debug-frame draw; also calls
   `dbg_vb_hook(host, guest)` for lldb), `FIFA_DUMP_VSUBO=1`,
   `FIFA_LOG_POOLS=1`; the debug frame's `[dtex]` lines give each sampled
@@ -1122,6 +1122,7 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     the 2026-10-19 note above.) `FIFA_NANZERO=16e3a1a00` (LUT NaN -> 0) leaves the jackets black and the
     face patches, so 0 isn't the value either: next, why G is zero (the reduction's diagonal `t0[(i, i)]`
     TLDS reads, per yuzu's 2D-array TLDS layout x = a+1, y = b) or what the jacket FS does with the LUT.
+    (Both answered in "Visual pass, second round": the layout was wrong, and the jackets aren't the LUT.)
   - Still open: grey/white sharp-edged patches on faces and necks; crowd drawn flat black/white; grass
     shimmer/grain (no LOD bias is applied: Metal samplers have none; or TAA).
   - Cutscene fps in the visible window (v3, v4) dropped to 2-16 with the CPU at ~1 core and the GPU mostly

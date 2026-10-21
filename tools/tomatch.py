@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Drive a running game (FIFA_CONTROL=<fifo>) from boot to Kick Off's match (Bournemouth v Brighton).
 
-  python3 -I tools/tomatch.py <fifo> [--shot build/live.png] [--from-menu] [--classify PNG...]
+  python3 -I tools/tomatch.py <fifo> [--shot build/live.png] [--from-menu] [--to-kickoff] [--classify PNG...]
 
 The game is started with FIFA_CONTROL=<fifo> FIFA_ROMFS=extracted/update/romfs_program.json ./build/fifa (mkfifo first).
 
 --from-menu: the game is already past boot (skips the initial 1200-frame wait).
+--to-kickoff: stop once Kick Off is entered (before the welcome pages), to pick match settings by hand.
 
 Fixed timings alone don't work: the "sign in to the EA Servers" notice turns up at a different point in each run
 and swallows presses, and the menu falls back to the "Press Any Button" attract screen when left alone. So each step
@@ -203,6 +204,9 @@ def main():
             what = g.look('a; wait 300')
             if what in ('menu', 'notice'):
                 continue
+        if '--to-kickoff' in args:  # stop on Kick Off's first page (settings are changed by hand from there)
+            print('[tomatch] in Kick Off; screenshot at %s' % shot)
+            return
         # welcome pages, gameplay type, Match Preview -> Start Match, difficulty notice
         what = g.look('a; wait 250; a; wait 350; a; wait 250; a; wait 900')
         if what != 'notice':

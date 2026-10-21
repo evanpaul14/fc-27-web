@@ -297,7 +297,7 @@ copies and readbacks as GPU blits (see "Blits" and "Match profile"). Per frame
 in open play (hidden, no thermal pressure) the CPU takes ~28-30 ms and the GPU
 is busy ~11.5 ms of the 33 ms ("GPU busy vs idle", "Host thunks in
 `a64_call`"). The visual pass over the match is under way (skin, faces, jackets
-crowd, grass grain and reflection cubes fixed, night shadows checked; a day match left: "Next steps" item 4). The
+crowd, grass grain and reflection cubes fixed, night and day shadows checked). The
 worker-thread crashes were an exclusive-store ordering bug (see "Worker
 thread crashes" below); 8 runs of 2-3 minutes since, none crashed. The rest of
 this section is the history that led here, oldest first.
@@ -1279,6 +1279,14 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     of every probed cube/array (each face or layer, up to 12) to `build/probeslice_<addr>_<slice>.png` (+ `_n.png`
     for float formats), once per texture. The `[copy3d]` lines (also printed for `FIFA_DBG_RTW` textures) are what
     showed the six per-face copies; `[rtw]` doesn't log buffer-to-texture copies.
+- Visual pass, eighth round (2026-10-21, run `build/d1`, hidden): **a day match; sun shadows work, nothing to fix**.
+  - To get one: Kick Off -> Match Preview -> X (Game Settings, Match tab) -> Conditions -> Dynamic Time of Day, left
+    in 30-minute steps from 8:00 PM to 3:00 PM (Time of Day then reads DAY); Match Preview shows "Sunny | 3:00 PM".
+    `tools/tomatch.py --to-kickoff` stops on Kick Off's first page (Classic Match) for this.
+  - Open play (`k10`..`k13`): the main stand's roof casts a sharp-edged shadow over the far third of the pitch with
+    the roof's lit strips in it, every player casts a sun shadow the same way, close-ups (`k09`) are sun-lit (hair
+    highlights, skin). 30.0 fps, 0 skipped draws, no faults. The sky isn't in frame from the broadcast camera, so
+    the day sky cube was only seen through the lighting.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -1452,10 +1460,9 @@ so the visual pass (4) comes next. In order:
    through the alpha-one swizzle, same section), ~~flat black/white crowd~~
    (`nvnTextureGetViewOffset`, "Visual pass, fourth round"), ~~grass grain~~ (the grading LUT: IADD3.RS and
    predicated late writes, "Visual pass, fifth round"). ~~Shadows~~: the night floodlight
-   shadows work ("Visual pass, sixth round"); sun shadows need a day match. ~~Reflections~~: cube maps; the
-   per-probe factor cube had 5 black faces (copies through one-face views, "Visual pass, seventh round"). Left:
-   a day match (sun shadows, day sky cube). (The
-   black sky is not an issue.)
+   shadows work ("Visual pass, sixth round"), ~~sun shadows~~ in a day match ("eighth round"). ~~Reflections~~: cube maps; the
+   per-probe factor cube had 5 black faces (copies through one-face views, "Visual pass, seventh round"). Nothing
+   known left; the day sky cube hasn't been seen directly (not in the broadcast camera's frame).
 5. Shader coverage (`build/shtool`): 437/437 of the dumps translate. Seen
    at boot only: SUATOM (`ea70`, CS `16e61ea00`, `16f0ce900`).
    GPU side: not a bottleneck (busy ~11.5 ms per frame, ~1 ms idle between stages: "GPU busy vs idle"); the main

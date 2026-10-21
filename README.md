@@ -27,6 +27,8 @@ Static-recompilation project aimed at running **EA Sports FC 27 (Nintendo Switch
 ## Current status
 
 - Core static analysis and translation pipeline is in place.
+- Current runnable target is macOS native only.
+- Graphics are not fully correct yet and there are known rendering issues.
 - Runtime/HLE and renderer work are ongoing.
 - See `NOTES.md` for up-to-date details and deep technical context.
 

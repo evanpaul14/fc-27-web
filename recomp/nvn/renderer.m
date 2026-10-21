@@ -1436,13 +1436,16 @@ static MTLTextureType mtl_type_for(int t) {
     }
 }
 
-// NVN texture/view component swizzle (same enum values as MTLTextureSwizzle), applied as a view.
-static id<MTLTexture> apply_swizzle(id<MTLTexture> tex, NvnTexture *t, const NvnTextureView *v, bool has_view) {
+// NVN texture/view component swizzle (same enum values as MTLTextureSwizzle), applied as a view. Formats without
+// alpha (RGBX/BGRX) read alpha as 1 through a swizzle, except under a clamp-to-border sampler (`border`): Metal
+// swizzles the border colour too, so a transparent border would turn opaque (the club crest decal on the jackets
+// covered the whole jacket with its black corners). Their uploads and copies store alpha 0xFF instead.
+static id<MTLTexture> apply_swizzle(id<MTLTexture> tex, NvnTexture *t, const NvnTextureView *v, bool has_view, bool border) {
     const uint8_t *sw = (has_view && (v->setmask & 8)) ? v->swizzle : t->swizzle;
     uint8_t c[4];
     for (int i = 0; i < 4; i++) c[i] = sw[i] <= 5 ? sw[i] : (uint8_t)(2 + i);
     if (!c[0] && !c[1] && !c[2] && !c[3]) c[0] = 2, c[1] = 3, c[2] = 4, c[3] = 5;  // never set: identity
-    if (renderer_format_alpha_one(t->format))
+    if (renderer_format_alpha_one(t->format) && !border)
         for (int i = 0; i < 4; i++) if (c[i] == MTLTextureSwizzleAlpha) c[i] = MTLTextureSwizzleOne;
     if (c[0] == 2 && c[1] == 3 && c[2] == 4 && c[3] == 5) return tex;
     if (tex.sampleCount > 1 || renderer_format_is_depth(t->format)) return tex;
@@ -1457,15 +1460,24 @@ static id<MTLTexture> apply_swizzle(id<MTLTexture> tex, NvnTexture *t, const Nvn
     return view;
 }
 
+// Does sampler pool entry tsc clamp to its border colour on any axis (NVN wrap 4/5, see sampler_for)?
+static bool sampler_border(uint32_t tsc) {
+    if (!st.spool || tsc >= (uint32_t)st.spool->count) return false;
+    const NvnSamplerDesc *d = &((NvnSamplerDesc *)st.spool->entries)[tsc];
+    for (int i = 0; i < 3; i++) if (d->wrap[i] == 4 || d->wrap[i] == 5) return true;
+    return false;
+}
+
 // Upload helper: a separate command buffer, committed now so it runs before the current pass.
 // image: bound for SULD / SUST, so no swizzled view (those can't be written)
 static uint64_t g_bind_prog;  // (for the mismatch log) program and slot being bound
 static int g_bind_slot;
-static id<MTLTexture> sampled_texture(NvnTexture *t, const NvnTextureView *v, bool has_view, int want_type, bool image) {
+static id<MTLTexture> sampled_texture(NvnTexture *t, const NvnTextureView *v, bool has_view, int want_type, bool image,
+                                      bool border) {
     // uploads (if the CPU-side contents changed) go into their own command buffer, committed before
     // the current one so they land first
     id<MTLTexture> tex = view_texture(t, v, has_view, false, nil);
-    if (!image) tex = apply_swizzle(tex, t, v, has_view);
+    if (!image) tex = apply_swizzle(tex, t, v, has_view, border);
     MTLTextureType want = mtl_type_for(want_type);
     if (tex.textureType != want && tex.textureType != MTLTextureType2DMultisample) {
         id<MTLTexture> src = tex;
@@ -1622,7 +1634,7 @@ static void bind_textures(int stage, ShaderInfo *si) {
                 if (n++ < 40) LOG("[rtw] %s %llx binds it at t%d (image %d)\n", stage ? "fs" : "vs", st.program->stages[stage].code_addr, i, st_->is_image);
             }
             g_bind_prog = st.program->stages[stage].code_addr, g_bind_slot = i;
-            if (e->tex) tex = sampled_texture(e->tex, &e->view, e->has_view, st_->type, st_->is_image);
+            if (e->tex) tex = sampled_texture(e->tex, &e->view, e->has_view, st_->type, st_->is_image, sampler_border(tsc));
             if (e->tex && i < 64) {
                 renderer_texture_scale(e->tex, &tex_sc[stage][i][0], &tex_sc[stage][i][1]);
                 tex_wh[stage][i][0] = e->tex->width; tex_wh[stage][i][1] = e->tex->height;
@@ -1648,8 +1660,14 @@ static void bind_textures(int stage, ShaderInfo *si) {
                 size_t nz = 0, n = dt->addr ? (size_t)dt->width * dt->height : 0;  // >= 1 byte per texel
                 const uint8_t *g = n ? gptr(dt->addr) : NULL;
                 for (size_t k = 0; k < n; k++) nz += g[k] != 0;
-                LOG("[dtex] %03d tic %u obj %p %ux%u fmt %#x fl %#x addr %llx pool %p+%llx nonzero %zu/%zu '%s'\n", dn - 1, tic, (void *)dt, dt->width,
+                LOG("[dtex] %03d tic %u obj %p %ux%u fmt %#x fl %#x addr %llx pool %p+%llx nonzero %zu/%zu '%s'", dn - 1, tic, (void *)dt, dt->width,
                     dt->height, dt->format, dt->flags, dt->addr, (void *)dt->pool, dt->pool_offset, nz, n, dt->label);
+                if (h && st.spool && tsc < (uint32_t)st.spool->count) {
+                    const NvnSamplerDesc *sd = &((NvnSamplerDesc *)st.spool->entries)[tsc];
+                    LOG(" | tsc %u wrap %u %u %u border %g %g %g %g", tsc, sd->wrap[0], sd->wrap[1], sd->wrap[2], sd->border[0],
+                        sd->border[1], sd->border[2], sd->border[3]);
+                }
+                LOG("\n");
             }
             renderer_save_texture(tex, path);
             snprintf(path, sizeof path, "build/dtex_%03d_%d_a.png", dn - 1, i);
@@ -1982,7 +2000,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
                 if (n++ < 40) LOG("[rtw] cs %llx binds it at t%d (image %d)\n", st.program->stages[5].code_addr, i, st_->is_image);
             }
             g_bind_prog = st.program->stages[5].code_addr, g_bind_slot = i;
-            if (e->tex) tex = sampled_texture(e->tex, &e->view, e->has_view, st_->type, st_->is_image);
+            if (e->tex) tex = sampled_texture(e->tex, &e->view, e->has_view, st_->type, st_->is_image, sampler_border(tsc));
             if (e->tex && i < 64) renderer_texture_scale(e->tex, &tex_sc[0][i][0], &tex_sc[0][i][1]);
             for (int k = 0; k < nfeedback; k++)
                 if (e->tex == feedback_tex[k]) {
@@ -2941,6 +2959,7 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
                     for (uint32_t x = 0; x < wb; x++) { memcpy(dr + x * 4, sr + x * 3, 3); dr[x * 4 + 3] = 255; }
                 else memset(dr, 0, out_row);
             }
+        renderer_fill_alpha_one(t->format, data, out_row * hb * (array ? 1 : rg[5]));
         id<MTLBuffer> staging = [dev newBufferWithBytes:data length:out_row * hb * (array ? 1 : rg[5])
                                                 options:MTLResourceStorageModeShared];
         free(data);
@@ -3059,7 +3078,7 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
             st_ ? st_->format : 0, dt ? dt->addr : 0, dt ? dt->width : 0, dt ? dt->height : 0, dt ? dt->format : 0, flags);
     if (!st_ || !dt) return;
     end_pass();
-    id<MTLTexture> s = sampled_texture(st_, &src->view, src->has_view, TEXTYPE_2D, false);
+    id<MTLTexture> s = sampled_texture(st_, &src->view, src->has_view, TEXTYPE_2D, false, false);
     renderer_mark_gpu_owned(dt);
     id<MTLTexture> d = view_texture(dt, &dst->view, dst->has_view, true, nil);
     const int32_t *sr = src->region, *dr = dst->region;

@@ -215,6 +215,15 @@ bool renderer_format_is_depth(uint32_t f) { return f >= 0x31 && f <= 0x36; }
 bool renderer_format_has_stencil(uint32_t f) { return f == 0x31 || f == 0x35 || f == 0x36; }
 MTLPixelFormat renderer_pixel_format(uint32_t f) { return mtl_format(f).pf; }
 bool renderer_format_alpha_one(uint32_t f) { return mtl_format(f).force_alpha_one; }
+// Formats without alpha (RGBX/BGRX): store alpha 1 in uploaded/copied texels, so that views without the alpha-one
+// swizzle (under clamp-to-border samplers, see apply_swizzle) still read 1 inside the texture.
+void renderer_fill_alpha_one(uint32_t f, uint8_t *data, size_t bytes) {
+    MtlFormat mf = mtl_format(f);
+    if (!mf.force_alpha_one) return;
+    if (mf.pf == MTLPixelFormatRGBA16Float) for (size_t i = 6; i + 2 <= bytes; i += 8) data[i] = 0x00, data[i + 1] = 0x3c;
+    else if (mf.pf == MTLPixelFormatRGBA32Float) for (size_t i = 12; i + 4 <= bytes; i += 16) { float one = 1; memcpy(data + i, &one, 4); }
+    else for (size_t i = 3; i < bytes; i += 4) data[i] = 0xff;
+}
 
 // ================================================================== textures
 typedef struct {
@@ -534,6 +543,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b, id<MTLBlitCommandEncode
                 lin = data;
             }
             uint64_t out_sz = (uint64_t)out_row * l.hb * l.d;
+            renderer_fill_alpha_one(t->format, data, out_sz);
             id<MTLBuffer> staging = [dev newBufferWithBytes:data length:out_sz options:MTLResourceStorageModeShared];
             free(lin);
             NSUInteger lw = MAX(b->tex.width >> lv, 1), lh = MAX(b->tex.height >> lv, 1), ld = MAX(b->tex.depth >> lv, 1);

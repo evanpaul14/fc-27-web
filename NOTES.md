@@ -1156,7 +1156,7 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     `LARECOMP_SAVE_MSL=1 build/shtool -o <dir> <dump>` annotates the MSL with `// pc`.
   - `tools/tomatch.py`: the match intro's stand shot (white crowd cards mid-screen) passed as the notice; the
     notice check also wants the bottom edge dark now.
-- Visual pass, third round (2026-10-20, runs `build/f1`..`f25`): **face/neck patches fixed**.
+- Visual pass, third round (2026-10-20, runs `build/f1`..`f25`, `j1`..`j5`): **face/neck patches and black jackets fixed**.
   - The patches were in the head FS `16fabce00` (not `16fafed00`, which only draws a few pixels): its light loop
     ends with `FSETP p0 = r54 <= 0; FSET.CC RZ = r48 <= 0; @P0 BRA CC.NEU <exit>`. The translator emitted nothing
     for an FSET into RZ and ignored the BRA's condition-code test, so the loop left after the first light on every
@@ -1175,6 +1175,15 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     clear values/addresses. The walkout's shot order varies from run to run (line-ups first or handshakes first).
   - `nvnCommandBufferSetDepthClamp` was a no-op; it now sets Metal's depth clip mode per draw. The game toggles it
     (shadow casters, the load-time top-down captures). It did not change the faces.
+  - **Black jackets fixed** (runs `build/j1`..`j5`): probing FS `16fa89700` after pc 0x468 gave decal alpha
+    `r7` = 1 on every jacket pixel, so the base colour was the decal's (black) instead of the palette (`r14`, fine).
+    The decal (slot 3) is the club crest, 256x256 fmt 0x9a (BGRX8 sRGB, no alpha) written by CopyBufferToTexture,
+    under a CLAMP_TO_BORDER sampler with border 0 (tsc 260): outside the crest rectangle it should read alpha 0.
+    Alpha-less formats read alpha 1 through an alpha -> ONE view swizzle, and Metal swizzles the border colour
+    too, so the whole jacket got the crest's opaque black corners. Now those formats keep the swizzle except
+    under a border-clamped sampler (`sampler_border`), and CPU uploads / buffer-to-texture copies store alpha 1
+    (`renderer_fill_alpha_one`). The `[dtex]` lines print the sampler's wrap modes and border colour. (A BGRX
+    texture rendered to on the GPU and sampled with a border sampler would read whatever alpha was rendered.)
   - Ruled out on the way: the head's world-space height-field lookup (t0, a 1024x1024 R11G11B10F packed at match
     load by FS `16ede1800` from two 2048x2048 D16 top-down captures and an R8 mask; its G input is cleared in the
     same frame before its own pass, so G is 0 as recorded); the step test is uniform over the heads. The sun's PCF
@@ -1348,8 +1357,8 @@ so the visual pass (4) comes next. In order:
 4. Visual pass over the match ("Visual pass, first round"): ~~black/noisy skin on
    arms/legs/hands~~ (compute fixes), ~~draws skipped in cutscenes~~
    (vertex-only programs), ~~the NaN LUT~~ (TLDS array layout), ~~grey patches on
-   faces~~ (BRA CC tests, "Visual pass, third round"). Left: black
-   jackets (diffuse colour 0, see "Visual pass, second round"), flat black/white crowd,
+   faces~~ (BRA CC tests, "Visual pass, third round"), ~~black jackets~~ (border colour
+   through the alpha-one swizzle, same section). Left: flat black/white crowd,
    grass shimmer/grain, shadows, reflections. (The
    black sky is not an issue.)
 5. Shader coverage (`build/shtool`): 437/437 of the dumps translate. Seen

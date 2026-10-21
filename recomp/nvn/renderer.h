@@ -14,6 +14,7 @@ id<MTLCommandQueue> renderer_queue(void);
 id<MTLTexture> renderer_texture(NvnTexture *t, id<MTLBlitCommandEncoder> blit, bool for_render);
 MTLPixelFormat renderer_pixel_format(uint32_t nvn_format);
 bool renderer_format_alpha_one(uint32_t nvn_format);
+void renderer_fill_alpha_one(uint32_t nvn_format, uint8_t *data, size_t bytes);
 // The memory pool buffer holding guest [addr, addr + size), with addr's offset in it; nil when no pool holds it all.
 id<MTLBuffer> renderer_pool_buffer(uint64_t addr, uint64_t size, uint64_t *offset);
 // The buffer of the pool holding addr and the guest address of its first byte (pool buffers start on a host page).

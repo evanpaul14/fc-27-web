@@ -297,7 +297,7 @@ copies and readbacks as GPU blits (see "Blits" and "Match profile"). Per frame
 in open play (hidden, no thermal pressure) the CPU takes ~28-30 ms and the GPU
 is busy ~11.5 ms of the 33 ms ("GPU busy vs idle", "Host thunks in
 `a64_call`"). The visual pass over the match is under way (skin, faces, jackets
-and crowd fixed; grass grain, shadows and reflections left: "Next steps" item 4). The
+crowd and grass grain fixed; shadows and reflections left: "Next steps" item 4). The
 worker-thread crashes were an exclusive-store ordering bug (see "Worker
 thread crashes" below); 8 runs of 2-3 minutes since, none crashed. The rest of
 this section is the history that led here, oldest first.
@@ -1213,6 +1213,33 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     three texels of that buffer texture at probe 0's value). `FIFA_NO_INPLACE=1` copies vertex/index buffers and
     buffer textures instead of reading guest memory in place. `[probefs]` lines print levels, views and sampler state;
     writer maps are named `build/writers_<addr>_<present>.bin`.
+- Visual pass, fifth round (2026-10-21, runs `build/g1`..`g10`): **grass grain fixed; it was the colour grading LUT** (also the black sky:
+  the night sky now renders dark navy with the trees and floodlights, `g10`).
+  - The scene target after the pitch draw (FS `170958600`) was smooth (writer map + `.f32`); the two-tone grain came
+    from the post FS `16de63d00`, which reads the scene directly (no TAA; its grain slot t7 is a 1x1 dummy). Its 32^3
+    RGB10A2 grading LUT (t6) had colour in 4381 of 32768 texels: colours that fell in an empty cell went black, their
+    neighbours didn't, so the dark mowing stripes (scene noise ~8%) broke into black/green pixels and read too dark.
+    (The pitch's tiled detail textures t7/t8, 512x512 BC with one level, tiled 4x and 24x over the pitch, were the
+    first suspect; the game creates them that way.)
+  - The LUT is rebuilt at match load: compute `16dd60c00` (33^3 RGBA32F asset -> 33^3 RGB10A2) then `16e714900`
+    (resample to 32^3 with white balance and an Oklab-style gamut map). Two translator bugs, found by replaying
+    `16e714900` offline (`tools/lutreplay.m`, bit-identical to the game, with `tools/msl_probe.py` register probes):
+    - **IADD3 ignored its shift and halves** (register form: bit 37-38 `.RS`/`.LS`, 35/33/31 operand halves). The
+      gamut map's cube roots divide float bits by 3 with a multiply-high (XMADs + `IADD3.RS`), so `(a + b) >> 16`
+      came out as `a + b`. `.RS` now shifts the 33-bit sum. 25 of the 437 dumps use `.RS` (among them the exposure
+      chain `16e884800` / `16e3c8b00` and `16dff9100`); none used the halves.
+    - **Predicated variable-latency results were written back when the predicate was off.** A deferred result
+      (`lwB_K`, see `defer_late`) is committed at the scoreboard wait; with `@P0 MUFU.LG2 r4` off, the commit put
+      back r4's old value over the `@!P0 FFMA r4` that ran in between (the ACEScc encode's linear segment), so every
+      dark channel was garbage (dark greys -> green). Guarded deferrals now keep the guard in `lwvB_K` and commit
+      only if it held. 268 of 437 dumps have such slots (4060 commits); results differ only where the old code
+      was wrong.
+  - After both: 33^3 and 32^3 LUTs are full and smooth along the neutral axis (32^3 diag 75 .. 999, slightly cool
+    from the white balance `cb3[6]` = 0.94, 0.96, 1.10); the grass has no grain, the dark stripes are the right shade,
+    stands and tunnels are neutral. With only the IADD3 fix (`g7`) dark tones went green (bright green sky in the
+    reverse angles); that was the second bug.
+  - Debug aids: `FIFA_DBG_PROBE_3D=1` writes level 0 of 3D textures the probe touches (`[probefs]`, `FIFA_DBG_CSW`)
+    to `build/probe3d_<w>x<h>x<d>_<mtl fmt>.bin`.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -1384,8 +1411,8 @@ so the visual pass (4) comes next. In order:
    (vertex-only programs), ~~the NaN LUT~~ (TLDS array layout), ~~grey patches on
    faces~~ (BRA CC tests, "Visual pass, third round"), ~~black jackets~~ (border colour
    through the alpha-one swizzle, same section), ~~flat black/white crowd~~
-   (`nvnTextureGetViewOffset`, "Visual pass, fourth round"). Left: grass shimmer/grain
-   (not the view offset: unchanged in `k6`), shadows, reflections. (The
+   (`nvnTextureGetViewOffset`, "Visual pass, fourth round"), ~~grass grain~~ (the grading LUT: IADD3.RS and
+   predicated late writes, "Visual pass, fifth round"). Left: shadows, reflections. (The
    black sky is not an issue.)
 5. Shader coverage (`build/shtool`): 437/437 of the dumps translate. Seen
    at boot only: SUATOM (`ea70`, CS `16e61ea00`, `16f0ce900`).

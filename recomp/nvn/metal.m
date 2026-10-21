@@ -999,6 +999,13 @@ void renderer_texture_probe(NvnTexture *t) {
             }
             nz += any;
         }
+        if (is3d && l == 0 && getenv("FIFA_DBG_PROBE_3D")) {  // FIFA_DBG_PROBE_3D: level 0 of probed 3D textures as raw texels
+            char path[128];
+            snprintf(path, sizeof path, "build/probe3d_%lux%lux%lu_%lu.bin", (unsigned long)w, (unsigned long)h, (unsigned long)ls,
+                     (unsigned long)tex.pixelFormat);
+            FILE *f = fopen(path, "wb");
+            if (f) { for (NSUInteger s = 0; s < ls; s++) fwrite(p + s * len / 4, bpp, w * h, f); fclose(f); }
+        }
         LOG(" L%lu %d/%lu (%08x %08x)", (unsigned long)l, nz, (unsigned long)ls, p[0], bpp > 4 ? p[1] : 0);
         if (a2) LOG(" rgb %zu/%lu", rgb, (unsigned long)(w * h * ls));
     }

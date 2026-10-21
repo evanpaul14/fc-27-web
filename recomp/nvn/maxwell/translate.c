@@ -95,6 +95,7 @@ typedef struct {
     uint8_t pred_used[8];
     // results of variable-latency instructions still in flight (scoreboard 0-5): register and stash index
     uint8_t late_reg[6][32], nlate[6], late_used[6];
+    uint32_t late_guard[6], late_gused[6];  // slots whose instruction had a predicate guard (lwvB_K: it ran)
     uint32_t in_attr_mask, out_attr_mask;
     uint32_t vs_in_comp[32];
     bool uses_branches, uses_cc, uses_local, uses_shared, uses_vid, uses_iid, uses_frag_coord, uses_front_facing, uses_lane;
@@ -169,14 +170,20 @@ static bool late_off(void) {
 static void commit_late(Ctx *c, unsigned bmask) {
     for (int b = 0; b < 6; b++) {
         if (!(bmask & (1u << b))) continue;
-        for (int k = 0; k < c->nlate[b]; k++) sp(&c->body, "    r%d = lw%d_%d;\n", c->late_reg[b][k], b, k);
+        for (int k = 0; k < c->nlate[b]; k++) {
+            if (c->late_guard[b] & (1u << k)) sp(&c->body, "    if (lwv%d_%d) r%d = lw%d_%d;\n", b, k, c->late_reg[b][k], b, k);
+            else sp(&c->body, "    r%d = lw%d_%d;\n", c->late_reg[b][k], b, k);
+        }
         c->nlate[b] = 0;
+        c->late_guard[b] = 0;
     }
 }
 
 // After emitting the instruction at body offset `start` with write barrier b: the registers it assigned
-// (statements `rN = ...`) keep their old values until commit_late(b).
-static void defer_late(Ctx *c, size_t start, int b) {
+// (statements `rN = ...`) keep their old values until commit_late(b). `guard` is the instruction's predicate
+// (NULL: none): one that didn't run writes nothing back, so writes made in between by other instructions stay
+// (the grading LUT build's `@P0 MUFU.LG2 r4` followed by `@!P0 FFMA r4` before the wait).
+static void defer_late(Ctx *c, size_t start, int b, const char *guard) {
     int regs[32], n = 0;
     for (size_t i = start; i < c->body.len && n < 32; i++) {
         if (i != start && c->body.buf[i - 1] != '\n') continue;
@@ -199,13 +206,20 @@ static void defer_late(Ctx *c, size_t start, int b) {
     c->body.len = start;
     sp(&c->body, "    {");
     for (int k = 0; k < n; k++) sp(&c->body, " uint sv%d = r%d;", k, regs[k]);
+    if (guard) sp(&c->body, " bool g_ = %s;", guard);  // (before the instruction, which may write its own predicate)
     sp(&c->body, "\n%s", seg);
     free(seg);
     for (int k = 0; k < n; k++) {
         int slot = c->nlate[b]++;
         c->late_reg[b][slot] = (uint8_t)regs[k];
         if (slot + 1 > c->late_used[b]) c->late_used[b] = (uint8_t)(slot + 1);
-        sp(&c->body, "    lw%d_%d = r%d; r%d = sv%d;\n", b, slot, regs[k], regs[k], k);
+        sp(&c->body, "    lw%d_%d = r%d; r%d = sv%d;", b, slot, regs[k], regs[k], k);
+        if (guard) {
+            c->late_guard[b] |= 1u << slot;
+            c->late_gused[b] |= 1u << slot;
+            sp(&c->body, " lwv%d_%d = g_;", b, slot);
+        }
+        sp(&c->body, "\n");
     }
     sp(&c->body, "    }\n");
 }
@@ -1677,16 +1691,32 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     } else if (OPM(0x5cc0000000000000ull, 0xfff0000000000000ull) || OPM(0x4cc0000000000000ull, 0xfff0000000000000ull) ||
                OPM(0x38c0000000000000ull, 0xfef0000000000000ull)) {  // IADD3
         bool wcc3 = bits(w, 47, 1), x3 = bits(w, 48, 1);
+        // Register form only: 16-bit halves of each operand (35 a, 33 b, 31 c: 1 low, 2 high) and a shift of a + b
+        // before c is added (37: 1 right by 16, 2 left by 16). The cube roots of the colour-grading LUT build
+        // (`16e714900`) take the high word of a 32x32 multiply with XMADs and an IADD3.RS.
+        bool reg3 = (w >> 52) == 0x5cc;
+        char oa[96], ob[96], oc[96];
+        const char *hs[3] = {"%s", "(%s & 0xFFFFu)", "(%s >> 16u)"};
+        int ha = reg3 ? (int)bits(w, 35, 2) : 0, hb = reg3 ? (int)bits(w, 33, 2) : 0, hc = reg3 ? (int)bits(w, 31, 2) : 0;
+        int shift3 = reg3 ? (int)bits(w, 37, 2) : 0;
+        snprintf(oa, sizeof oa, hs[ha < 3 ? ha : 0], R(a));
+        snprintf(ob, sizeof ob, hs[hb < 3 ? hb : 0], B(false));
+        snprintf(oc, sizeof oc, hs[hc < 3 ? hc : 0], R((int)bits(w, 39, 8)));
         if (wcc3 || x3) {  // carry in/out (64-bit address math)
             c->uses_cc = true;
-            sp(&c->body, "    { ulong sum = ulong(%s%s) + ulong(%s%s) + ulong(%s%s)%s;\n", bits(w, 51, 1) ? "-" : "", R(a),
-               bits(w, 50, 1) ? "-" : "", B(false), bits(w, 49, 1) ? "-" : "", R((int)bits(w, 39, 8)), x3 ? " + ulong(cc)" : "");
+            if (shift3) fail(c, "IADD3 shift with carry");
+            sp(&c->body, "    { ulong sum = ulong(%s%s) + ulong(%s%s) + ulong(%s%s)%s;\n", bits(w, 51, 1) ? "-" : "", oa,
+               bits(w, 50, 1) ? "-" : "", ob, bits(w, 49, 1) ? "-" : "", oc, x3 ? " + ulong(cc)" : "");
             if (wcc3) sp(&c->body, "      cc = uint(sum >> 32) & 1u;\n");
             if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = uint(sum);\n", d); }
             sp(&c->body, "    }\n");
+        } else if (shift3 == 1) {  // .RS shifts the 33-bit sum (the multiply-high idiom's partial products carry out)
+            sprintf(t, "(uint((ulong(%s%s) + ulong(%s%s)) >> 16u) + %s%s)", bits(w, 51, 1) ? "-" : "", oa,
+                    bits(w, 50, 1) ? "-" : "", ob, bits(w, 49, 1) ? "-" : "", oc);
+            set_reg(c, d, t);
         } else {
-            sprintf(t, "(%s%s + %s%s + %s%s)", bits(w, 51, 1) ? "-" : "", R(a), bits(w, 50, 1) ? "-" : "", B(false),
-                    bits(w, 49, 1) ? "-" : "", R((int)bits(w, 39, 8)));
+            sprintf(t, "(((%s%s + %s%s)%s) + %s%s)", bits(w, 51, 1) ? "-" : "", oa, bits(w, 50, 1) ? "-" : "", ob,
+                    shift3 == 2 ? " << 16u" : "", bits(w, 49, 1) ? "-" : "", oc);
             set_reg(c, d, t);
         }
     } else if (OPM(0x5c18000000000000ull, 0xfff8000000000000ull) || OPM(0x4c18000000000000ull, 0xfff8000000000000ull) ||
@@ -2532,7 +2562,10 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     for (int i = 0; i < 256; i++)
         if (c->reg_used[i]) sp(&s, "  uint r%d = 0u;\n", i);
     for (int b = 0; b < 6; b++)
-        for (int k = 0; k < c->late_used[b]; k++) sp(&s, "  uint lw%d_%d = 0u;\n", b, k);
+        for (int k = 0; k < c->late_used[b]; k++) {
+            sp(&s, "  uint lw%d_%d = 0u;\n", b, k);
+            if (c->late_gused[b] & (1u << k)) sp(&s, "  bool lwv%d_%d = false;\n", b, k);
+        }
     for (int i = 0; i < 7; i++)
         if (c->pred_used[i]) sp(&s, "  bool p%d = false;\n", i);
     if (c->uses_cc) sp(&s, "  uint cc = 0u; bool ccz = false, ccs = false;\n");
@@ -2681,7 +2714,11 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         emit_insn(c, iw, pc);
         if (dbg && maxwell_dbg_pc == 0xfffffffeu) nan_trace(c, start, (uint32_t)i);
         int wbar = (int)((sch >> 5) & 7);
-        if (wbar < 6 && !flow && !late_off()) defer_late(c, start, wbar);
+        if (wbar < 6 && !flow && !late_off()) {
+            int gp = (int)bits(iw, 16, 3);
+            bool gn = bits(iw, 19, 1);
+            defer_late(c, start, wbar, gp == PT && !gn ? NULL : P(gp, gn));
+        }
         for (int k = 0; vdbg && k < 4; k++)
             if (maxwell_dbg_vsreg[k] >= 0 && pc == maxwell_dbg_vspc[k]) {
                 c->reg_used[maxwell_dbg_vsreg[k]] = 1;
@@ -2845,7 +2882,10 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     for (int i = 0; i < 256; i++)
         if (c->reg_used[i]) sp(&s, "  uint r%d = 0;\n", i);
     for (int b = 0; b < 6; b++)
-        for (int k = 0; k < c->late_used[b]; k++) sp(&s, "  uint lw%d_%d = 0u;\n", b, k);
+        for (int k = 0; k < c->late_used[b]; k++) {
+            sp(&s, "  uint lw%d_%d = 0u;\n", b, k);
+            if (c->late_gused[b] & (1u << k)) sp(&s, "  bool lwv%d_%d = false;\n", b, k);
+        }
     for (int i = 0; i < 7; i++)
         if (c->pred_used[i]) sp(&s, "  bool p%d = false;\n", i);
     if (c->uses_cc) sp(&s, "  uint cc = 0; bool ccz = false, ccs = false;\n");

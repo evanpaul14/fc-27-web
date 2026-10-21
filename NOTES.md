@@ -1198,7 +1198,8 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     written by the GPU. A CPU watchpoint on it showed Frostbite copying each layer/level itself to an address from
     **`nvnTextureGetViewOffset`, which was stubbed to 0**: all 32 layers x 10 levels landed on offset 0. It now
     returns `layer * tegra_layer_size + tegra_level(level).offset` for the view's base level / min layer. Atlas 87%
-    non-zero, crowd drawn in colour. Every texture Frostbite loads per subresource went through this.
+    non-zero, crowd drawn in colour in the walkout and open play (`k5`, `k6`; the open-play stands were dark and
+    mostly empty before). Every texture Frostbite loads per subresource went through this. The grass grain is unchanged.
   - Debug aids: `FIFA_WATCH_TEX=<w>x<h>x<d>:<fmt hex>` arms the CPU write watchpoint (`FIFA_WATCH`, `hle/debug.c`) on
     the first such texture when it is initialized (addresses differ between runs); `FIFA_WATCH_GPU=<addr>:<size>` and
     `FIFA_WATCH_FMT=<fmt hex>` log copies/buffer clears into that range or into textures of that format (`[watch]`,
@@ -1380,7 +1381,7 @@ so the visual pass (4) comes next. In order:
    faces~~ (BRA CC tests, "Visual pass, third round"), ~~black jackets~~ (border colour
    through the alpha-one swizzle, same section), ~~flat black/white crowd~~
    (`nvnTextureGetViewOffset`, "Visual pass, fourth round"). Left: grass shimmer/grain
-   (recheck after the view offset fix), shadows, reflections. (The
+   (not the view offset: unchanged in `k6`), shadows, reflections. (The
    black sky is not an issue.)
 5. Shader coverage (`build/shtool`): 437/437 of the dumps translate. Seen
    at boot only: SUATOM (`ea70`, CS `16e61ea00`, `16f0ce900`).

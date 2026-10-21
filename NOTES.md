@@ -297,7 +297,7 @@ copies and readbacks as GPU blits (see "Blits" and "Match profile"). Per frame
 in open play (hidden, no thermal pressure) the CPU takes ~28-30 ms and the GPU
 is busy ~11.5 ms of the 33 ms ("GPU busy vs idle", "Host thunks in
 `a64_call`"). The visual pass over the match is under way (skin, faces, jackets
-crowd and grass grain fixed, night shadows checked; reflections and a day match left: "Next steps" item 4). The
+crowd, grass grain and reflection cubes fixed, night shadows checked; a day match left: "Next steps" item 4). The
 worker-thread crashes were an exclusive-store ordering bug (see "Worker
 thread crashes" below); 8 runs of 2-3 minutes since, none crashed. The rest of
 this section is the history that led here, oldest first.
@@ -372,7 +372,8 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   format; all in "Visual pass, fourth round"), `FIFA_DUMP_VB=1` (first
   6 raw vertices of stream 0 per debug-frame draw; also calls
   `dbg_vb_hook(host, guest)` for lldb), `FIFA_DUMP_VSUBO=1`,
-  `FIFA_LOG_POOLS=1`; the debug frame's `[dtex]` lines give each sampled
+  `FIFA_LOG_POOLS=1`, `FIFA_DBG_PROBE_FS=<fs>[,...]` with `FIFA_DBG_PROBE_PNG=1` (cube/array faces as PNGs, "Visual
+  pass, seventh round"); the debug frame's `[dtex]` lines give each sampled
   texture's tic, format, guest address and how many of its guest bytes are
   nonzero (CPU-written data vs GPU-only contents); LAS's
   `LARECOMP_*` switches are `FIFA_*`. Compute programs are also written to
@@ -1253,6 +1254,31 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     cascades, TLD4.DC with offsets, compare samplers: `sampler_for` maps the compare mode/function).
   - (A `debug` frame with `FIFA_DBG_PERDRAW=1` takes ~0.1 s per draw: give the segment after it a minute or more,
     or the frame is cut off before the main pass.)
+- Visual pass, seventh round (2026-10-21, runs `build/r1`..`r5`): **reflections: cube faces written through views or
+  z offsets all landed on face 0**.
+  - No screen-space reflections on Switch: the reflections are cube maps. Bound in the match (head FS `16fabce00`
+    t9-t11, ~60 lit FS): the sky/environment cube (128^2 RG11B10F, 6 levels, from the sky FS and the compute
+    filters), a 32^2 RGBA16F cube array of 10 local probes (2 captured: stadium faces with floodlights and pitch;
+    the rest empty), a single-channel cube array sampled with the same probe index as t9 (only `.r` kept: a
+    per-probe factor), and a 256^2 cube on a few props (FS `16fcddd00`). The sky cube and the 2 probes check out
+    (all faces, horizon and glow continuous across shared edges).
+  - The factor cube defaults to a 1x1 RGBA8 cube (fmt 0x25, 175e12400 every run) the game fills at boot with six
+    1x1 buffer-to-texture copies, one per face **through a one-face texture view at region z 0**.
+    `copy_region_dims` ignored the view's layer, so all six landed on face 0 (white) and faces 1-5 stayed 0: the
+    local-probe reflections on heads were multiplied by 0 for 5 of 6 directions. Now z counts from the view's min
+    layer for arrays/cubes (buffer-to-texture and texture-to-buffer); cube arrays count as layered too. 6/6 faces
+    now (`r5`). Not compared on screen (the cube only feeds the head FS family; no matching close-up between runs).
+  - Same class, fixed on the way (no hits seen in the match, but wrong): texture-to-texture copies (and
+    `CMD_DOWNSAMPLE`) used layer 0 of both sides whatever the region's z / depth (`copy_texture` now copies each
+    layer as 2D, all layers both have when the region has no depth; a cube source view's face counts);
+    `nvnTextureWriteTexels` ignored its view (level, layer) and the z of layered textures; clears of a whole
+    cube/array target reached layer 0 only (passes with such attachments set `renderTargetArrayLength`, the clear
+    draws one instance per layer through `[[render_target_array_index]]`, `ClearTexture` limited to its region's
+    z range).
+  - Debug aids: `FIFA_DBG_PROBE_FS` takes up to 8 programs (`<fs>,<fs>,...`); `FIFA_DBG_PROBE_PNG=1` writes level 0
+    of every probed cube/array (each face or layer, up to 12) to `build/probeslice_<addr>_<slice>.png` (+ `_n.png`
+    for float formats), once per texture. The `[copy3d]` lines (also printed for `FIFA_DBG_RTW` textures) are what
+    showed the six per-face copies; `[rtw]` doesn't log buffer-to-texture copies.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -1426,7 +1452,9 @@ so the visual pass (4) comes next. In order:
    through the alpha-one swizzle, same section), ~~flat black/white crowd~~
    (`nvnTextureGetViewOffset`, "Visual pass, fourth round"), ~~grass grain~~ (the grading LUT: IADD3.RS and
    predicated late writes, "Visual pass, fifth round"). ~~Shadows~~: the night floodlight
-   shadows work ("Visual pass, sixth round"); sun shadows need a day match. Left: reflections. (The
+   shadows work ("Visual pass, sixth round"); sun shadows need a day match. ~~Reflections~~: cube maps; the
+   per-probe factor cube had 5 black faces (copies through one-face views, "Visual pass, seventh round"). Left:
+   a day match (sun shadows, day sky cube). (The
    black sky is not an issue.)
 5. Shader coverage (`build/shtool`): 437/437 of the dumps translate. Seen
    at boot only: SUATOM (`ea70`, CS `16e61ea00`, `16f0ce900`).

@@ -652,14 +652,37 @@ NVN(nvnTextureViewCompare) { RET(memcmp(AP(0), AP(1), 15) == 0); }
 
 NVN(nvnTextureWriteTexels) {
     // (texture, view, region, data) -- linear data into block-linear storage
+    // The view picks the level and first layer; for arrays and cubes the region's z / depth are layers (faces), each
+    // its own block-linear image. (Both were ignored: a 1x1 cube written face by face got all six into face 0.)
     NvnTexture *t = HOST(NvnTexture, A(0));
     const int32_t *r = GP(A(2));  // xoffset, yoffset, zoffset, width, height, depth
-    LevelLayout l = tegra_level(&t->layout, 0);
+    uint32_t level = 0, layer = 0;
+    if (A(1)) {
+        uint8_t mask = FLD(uint8_t, A(1), 0);
+        if (mask & 1) level = FLD(uint8_t, A(1), 4);
+        if (mask & 2) layer = FLD(uint16_t, A(1), 6);
+    }
+    LevelLayout l = tegra_level(&t->layout, level);
+    bool layered = t->layout.layers > 1;
+    uint32_t d = r && r[5] > 0 ? (uint32_t)r[5] : 1;
+    static int nlog;
+    if (layered && r && nlog++ < 20)
+        LOG("[nvn] WriteTexels %ux%u fmt %#x layers %u: level %u layer %u region %d,%d,%d %dx%dx%d\n", t->width, t->height,
+            t->format, t->layout.layers, level, layer, r[0], r[1], r[2], r[3], r[4], r[5]);
     if (!t->addr) {
         LOG("[nvn] WriteTexels into a virtual pool texture not implemented\n");
-    } else if (r && r[0] == 0 && r[1] == 0 && (uint32_t)r[3] == t->width && (uint32_t)r[4] == t->height) {
-        tegra_swizzle(AP(3), (uint8_t *)GP(t->addr) + l.offset, l.wb, l.hb, r[5] > 0 ? (uint32_t)r[5] : 1,
-                      t->layout.fmt->bpb, l.block_height_log2, l.block_depth_log2);
+    } else if (r && r[0] == 0 && r[1] == 0 && (uint32_t)r[3] == l.w && (uint32_t)r[4] == l.h) {
+        const uint8_t *src = GP(A(3));
+        uint32_t bpb = t->layout.fmt->bpb;
+        if (layered) {
+            uint64_t img = (uint64_t)l.wb * l.hb * bpb;
+            for (uint32_t k = 0; k < d && layer + (uint32_t)r[2] + k < t->layout.layers; k++)
+                tegra_swizzle(src + k * img, (uint8_t *)GP(t->addr) + (layer + (uint32_t)r[2] + k) * tegra_layer_size(&t->layout) + l.offset,
+                              l.wb, l.hb, 1, bpb, l.block_height_log2, l.block_depth_log2);
+        } else {
+            if (r[2]) LOG("[nvn] WriteTexels at depth offset %d not implemented\n", r[2]);
+            tegra_swizzle(src, (uint8_t *)GP(t->addr) + l.offset, l.wb, l.hb, d, bpb, l.block_height_log2, l.block_depth_log2);
+        }
         backend_pool_written(t->addr, tegra_total_size(&t->layout));
     } else {
         LOG("[nvn] partial WriteTexels not implemented\n");

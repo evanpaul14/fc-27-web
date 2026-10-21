@@ -1010,4 +1010,20 @@ void renderer_texture_probe(NvnTexture *t) {
         if (a2) LOG(" rgb %zu/%lu", rgb, (unsigned long)(w * h * ls));
     }
     LOG("\n");
+    // FIFA_DBG_PROBE_PNG: level 0 of probed cubes / arrays, each face or layer (up to 12) to
+    // build/probeslice_<addr>_<slice>.png (and _n.png for float formats), once per texture.
+    static uint64_t saved[32];
+    static int nsaved;
+    if (!getenv("FIFA_DBG_PROBE_PNG") || is3d || tex.textureType == MTLTextureType2D || nsaved >= 32) return;
+    for (int i = 0; i < nsaved; i++)
+        if (saved[i] == t->addr) return;
+    saved[nsaved++] = t->addr;
+    for (NSUInteger s = 0; s < slices && s < 12; s++) {
+        id<MTLTexture> v = [tex newTextureViewWithPixelFormat:tex.pixelFormat textureType:MTLTextureType2D
+                                                       levels:NSMakeRange(0, 1) slices:NSMakeRange(s, 1)];
+        if (!v) continue;
+        char path[128];
+        snprintf(path, sizeof path, "build/probeslice_%llx_%02lu.png", (unsigned long long)t->addr, (unsigned long)s);
+        renderer_save_texture(v, path);
+    }
 }

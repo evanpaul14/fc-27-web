@@ -151,6 +151,8 @@ static id<MTLCommandBuffer> cb(void) {
 }
 
 static float pass_sx = 1, pass_sy = 1;  // allocation scale of the current pass's attachments
+static NSUInteger pass_layers = 1;  // render-target array length of the current pass (cube faces / array layers)
+static NSUInteger clear_layer0, clear_nlayers;  // clear(): these layers of the pass (0 layers: all of them)
 // vp_* is the mapping for the current draw: physical = guest * s + off (LAS Recomp's widescreen UI moved draws;
 // here it is the attachments' allocation scale, always 1).
 static float vp_sx = 1, vp_sy = 1, vp_ox = 0, vp_oy = 0;
@@ -686,12 +688,19 @@ static id<MTLTexture> view_texture(NvnTexture *t, const NvnTextureView *v, bool 
 // ------------------------------------------------------------------ render passes
 static __unsafe_unretained id last_bias_enc;  // encoder the depth bias was last set on
 
+static NSUInteger tex_layers(id<MTLTexture> t) {
+    MTLTextureType y = t.textureType;
+    return y == MTLTextureTypeCube ? 6 : y == MTLTextureTypeCubeArray ? 6 * t.arrayLength
+         : y == MTLTextureType2DArray ? t.arrayLength : 1;
+}
+
 static void begin_pass(void) {
     if (enc && !st.rt_dirty) return;
     end_pass();
     st.rt_dirty = false;
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     int w = 0, h = 0;
+    NSUInteger layers = 0;
     for (int i = 0; i < st.rt.ncolor; i++) {
         NvnTexture *t = st.rt.color[i];
         if (!t) continue;
@@ -702,6 +711,8 @@ static void begin_pass(void) {
         rp.colorAttachments[i].storeAction = MTLStoreActionStore;
         if (!w) renderer_texture_scale(t, &pass_sx, &pass_sy);
         w = (int)tex.width; h = (int)tex.height;
+        NSUInteger n = tex_layers(tex);
+        layers = layers ? MIN(layers, n) : n;
     }
     if (st.rt.depth) {
         renderer_mark_gpu_owned(st.rt.depth);
@@ -717,7 +728,13 @@ static void begin_pass(void) {
             rp.stencilAttachment.storeAction = MTLStoreActionStore;
         }
         if (!w) { renderer_texture_scale(st.rt.depth, &pass_sx, &pass_sy); w = (int)tex.width; h = (int)tex.height; }
+        NSUInteger n = tex_layers(tex);
+        layers = layers ? MIN(layers, n) : n;
     }
+    // Whole cubes / arrays as targets: layered, so clears (and shaders that pick a layer) reach every layer; without
+    // this only layer 0 was written (a cube cleared to white kept 5 black faces).
+    pass_layers = layers ? layers : 1;
+    if (pass_layers > 1) rp.renderTargetArrayLength = pass_layers;
     if (!w) {
         pass_sx = pass_sy = 1;
         rp.renderTargetWidth = 16; rp.renderTargetHeight = 16;
@@ -773,9 +790,9 @@ static void apply_scissor(void) {
 // ------------------------------------------------------------------ clears (full-screen triangle)
 static const char *clear_src =
     "#include <metal_stdlib>\nusing namespace metal;\n"
-    "struct V { float4 pos [[position]]; };\n"
-    "vertex V vs(uint vid [[vertex_id]], constant float4 &d [[buffer(0)]]) {\n"
-    "  float2 p = float2((vid << 1) & 2, vid & 2); V o; o.pos = float4(p * 2.0 - 1.0, d.x, 1); return o; }\n"
+    "struct V { float4 pos [[position]]; uint layer [[render_target_array_index]]; };\n"
+    "vertex V vs(uint vid [[vertex_id]], uint iid [[instance_id]], constant float4 &d [[buffer(0)]]) {\n"
+    "  float2 p = float2((vid << 1) & 2, vid & 2); V o; o.pos = float4(p * 2.0 - 1.0, d.x, 1); o.layer = iid; return o; }\n"
     "struct OF { float4 c [[color(INDEX)]]; };\n"
     "fragment OF fs_f(V in [[stage_in]], constant float4 &c [[buffer(0)]]) { OF o; o.c = c; return o; }\n"
     "struct OI { int4 c [[color(INDEX)]]; };\n"
@@ -828,6 +845,7 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
     id<MTLLibrary> lib = clear_lib(index < 0 ? 0 : index);
     pd.vertexFunction = [lib newFunctionWithName:@"vs"];
+    pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;  // (needed for a layer output)
     static NSString *const fs[] = {@"fs_f", @"fs_i", @"fs_u"};
     pd.fragmentFunction = [lib newFunctionWithName:index >= 0 ? fs[kind] : @"fs_none"];
     attachment_formats(pd);
@@ -873,7 +891,12 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
     float d4[4] = {dval, 0, 0, 0};
     [enc setVertexBytes:d4 length:16 atIndex:0];
     if (index >= 0) [enc setFragmentBytes:color length:16 atIndex:0];
-    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    NSUInteger l0 = clear_nlayers && clear_layer0 < pass_layers ? clear_layer0 : 0;
+    NSUInteger nl = clear_nlayers ? MIN(clear_nlayers, pass_layers - l0) : pass_layers;
+    if (pass_layers > 1)
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3 instanceCount:nl baseInstance:l0];
+    else
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 }
 
 // ------------------------------------------------------------------ shaders (debug dump)
@@ -2351,13 +2374,25 @@ static void skip_log(int n) {
 
 static void log_bound_textures(int stage, ShaderInfo *si);
 static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
-    static uint64_t probe_fs = 1;  // FIFA_DBG_PROBE_FS=<fs>: the debug frame lists that program's textures ([probefs])
-    if (probe_fs == 1) { const char *e = getenv("FIFA_DBG_PROBE_FS"); probe_fs = e ? strtoull(e, NULL, 16) : 0; }
-    if (probe_fs && g_debug_frame && st.program && st.program->stages[1].code_addr == probe_fs) {
-        LOG("[probefs] %llx:", probe_fs);
-        log_bound_textures(1, pr->fi);
-        LOG("\n");
+    // FIFA_DBG_PROBE_FS=<fs>[,<fs>...] (up to 8): the debug frame lists those programs' textures ([probefs])
+    static uint64_t probe_fs[8];
+    static int nprobe_fs = -1;
+    if (nprobe_fs < 0) {
+        nprobe_fs = 0;
+        for (const char *e = getenv("FIFA_DBG_PROBE_FS"); e && *e && nprobe_fs < 8;) {
+            char *end;
+            probe_fs[nprobe_fs++] = strtoull(e, &end, 16);
+            e = *end == ',' ? end + 1 : end;
+            if (end == e) break;
+        }
     }
+    for (int k = 0; k < nprobe_fs && g_debug_frame && st.program; k++)
+        if (st.program->stages[1].code_addr == probe_fs[k]) {
+            LOG("[probefs] %llx:", probe_fs[k]);
+            log_bound_textures(1, pr->fi);
+            LOG("\n");
+            break;
+        }
     static uint64_t dump_fs = 1;
     if (dump_fs == 1) { const char *e = getenv("FIFA_DUMP_UBO"); dump_fs = e ? strtoull(e, NULL, 16) : 0; }
     if (dump_fs && st.program && st.program->stages[1].code_addr == dump_fs) {
@@ -2942,6 +2977,9 @@ static void copy_region_dims(NvnTexture *t, const TexRefRec *ref, const FormatIn
     if (!rg[4]) rg[4] = (int32_t)t->height;
     if (!rg[5]) rg[5] = 1;
     *level = ref->has_view && (ref->view.setmask & 1) ? ref->view.base_level : 0;
+    // Arrays / cubes: z counts from the view's first layer. (Ignored before: the game fills a 1x1 cube with six copies
+    // through one-face views at z 0, and all six landed on face 0, leaving the others black.)
+    if (t->layout.layers > 1 && ref->has_view && (ref->view.setmask & 2)) rg[2] += ref->view.min_layer;
     uint32_t wb = ((uint32_t)rg[3] + (*fi)->bw - 1) / (*fi)->bw, hb = ((uint32_t)rg[4] + (*fi)->bh - 1) / (*fi)->bh;
     *row = st.copy_row_stride ? st.copy_row_stride : (uint64_t)wb * (*fi)->bpb;
     *img = st.copy_image_stride ? st.copy_image_stride : *row * hb;
@@ -2971,7 +3009,8 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
     id<MTLBlitCommandEncoder> b = [cb() blitCommandEncoder];
     id<MTLTexture> tex = renderer_texture(t, b, false);  // make sure prior CPU contents are uploaded first
     renderer_mark_gpu_owned(t);
-    bool array = tex.textureType == MTLTextureType2DArray || tex.textureType == MTLTextureTypeCube;
+    bool array = tex.textureType == MTLTextureType2DArray || tex.textureType == MTLTextureTypeCube ||
+                 tex.textureType == MTLTextureTypeCubeArray;
     uint32_t hb = ((uint32_t)rg[4] + fi->bh - 1) / fi->bh, wb = ((uint32_t)rg[3] + fi->bw - 1) / fi->bw;
     uint64_t mtl_bpb = renderer_pixel_format_bytes(tex.pixelFormat, fi->bpb);
     for (int z = 0; z < (array ? rg[5] : 1); z++) {
@@ -3080,7 +3119,8 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
         tex = small;
     }
     if (renderer_pixel_format_bytes(tex.pixelFormat, fi->bpb) != fi->bpb) return;
-    bool array = tex.textureType == MTLTextureType2DArray || tex.textureType == MTLTextureTypeCube;
+    bool array = tex.textureType == MTLTextureType2DArray || tex.textureType == MTLTextureTypeCube ||
+                 tex.textureType == MTLTextureTypeCubeArray;
     uint64_t total = (uint64_t)(array ? rg[5] : 1) * img, boff;
     // into the pool's own buffer, else through a staging buffer copied out once the GPU is done
     id<MTLBuffer> out = renderer_pool_buffer(dst, total, &boff);
@@ -3099,6 +3139,18 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
     if (staged) memcpy(gptr(dst), out.contents, total);
 }
 
+static void copy_texture_2d(NvnTexture *st_, NvnTexture *dt, id<MTLTexture> s, id<MTLTexture> d, const int32_t *sr,
+                            const int32_t *dr, uint64_t flags);
+
+// One layer of an array / cube (all its levels) as a 2D texture; other textures as they are.
+static id<MTLTexture> slice2d(id<MTLTexture> t, NSUInteger layer) {
+    if (tex_layers(t) <= 1 && t.textureType != MTLTextureType2DArray) return t;
+    return view_cached(t, 0x6100000000000000ull | layer, ^{
+        return [t newTextureViewWithPixelFormat:t.pixelFormat textureType:MTLTextureType2D
+                                         levels:NSMakeRange(0, t.mipmapLevelCount) slices:NSMakeRange(layer, 1)];
+    });
+}
+
 static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t flags) {
     snap_reason = "tex2tex"; snapshots_invalidate(NULL);
     NvnTexture *st_ = (NvnTexture *)(uintptr_t)src->tex, *dt = (NvnTexture *)(uintptr_t)dst->tex;
@@ -3107,10 +3159,30 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
             st_ ? st_->format : 0, dt ? dt->addr : 0, dt ? dt->width : 0, dt ? dt->height : 0, dt ? dt->format : 0, flags);
     if (!st_ || !dt) return;
     end_pass();
-    id<MTLTexture> s = sampled_texture(st_, &src->view, src->has_view, TEXTYPE_2D, false, false);
+    id<MTLTexture> sa = view_texture(st_, &src->view, src->has_view, false, nil);
+    sa = apply_swizzle(sa, st_, &src->view, src->has_view, false);
     renderer_mark_gpu_owned(dt);
-    id<MTLTexture> d = view_texture(dt, &dst->view, dst->has_view, true, nil);
+    id<MTLTexture> da = view_texture(dt, &dst->view, dst->has_view, true, nil);
     const int32_t *sr = src->region, *dr = dst->region;
+    // Arrays and cubes: the region's z / depth are layers (faces). Each layer is copied as 2D; a region without a
+    // depth copies every layer both have. (Copies went to layer 0 only: a cube filled face by face kept 5 black faces.)
+    NSUInteger sl = tex_layers(sa), dl = tex_layers(da);
+    NSUInteger sz = sl > 1 && sr[2] > 0 ? (NSUInteger)sr[2] : 0, dz = dl > 1 && dr[2] > 0 ? (NSUInteger)dr[2] : 0;
+    if (sa.textureType == MTLTextureTypeCube && src->has_view && (src->view.setmask & 2))  // (sampled cube views are whole)
+        sz += src->view.min_layer;
+    NSUInteger nz = sr[5] > 0 ? (NSUInteger)sr[5] : MIN(sl, dl);
+    if (sl > 1 && sz + nz > sl) nz = sz < sl ? sl - sz : 0;
+    if (dl > 1 && dz + nz > dl) nz = dz < dl ? dl - dz : 0;
+    if (sl == 1 || dl == 1) nz = MIN(nz, 1);
+    if (g_debug_frame && (sl > 1 || dl > 1))
+        LOG("[copytex] layers %lu+%lu of %lu -> %lu+ of %lu\n", (unsigned long)sz, (unsigned long)nz, (unsigned long)sl,
+            (unsigned long)dz, (unsigned long)dl);
+    for (NSUInteger k = 0; k < nz; k++)
+        copy_texture_2d(st_, dt, slice2d(sa, sl > 1 ? sz + k : 0), slice2d(da, dl > 1 ? dz + k : 0), sr, dr, flags);
+}
+
+static void copy_texture_2d(NvnTexture *st_, NvnTexture *dt, id<MTLTexture> s, id<MTLTexture> d, const int32_t *sr,
+                            const int32_t *dr, uint64_t flags) {
     if (g_debug_frame) {
         static int nl;
         uint64_t total = tegra_total_size(&st_->layout), nz = 0;
@@ -3480,9 +3552,11 @@ static void exec_list(uint64_t handle, int depth) {
             else { st.scissor[0][0] = st.scissor[0][1] = 0; st.scissor[0][2] = st.scissor[0][3] = 16384; }
             static int nlog;
             if (nlog++ < 8 || g_debug_frame)
-                LOG("[cleartex] %ux%u f%#x region %d,%d %dx%d color %g %g %g %g mask %#llx kind %llu\n", t->width, t->height, t->format,
-                    rg[0], rg[1], rg[3], rg[4], ct->color[0], ct->color[1], ct->color[2], ct->color[3], r->x[4], r->x[6]);
+                LOG("[cleartex] %ux%u f%#x region %d,%d,%d %dx%dx%d color %g %g %g %g mask %#llx kind %llu\n", t->width, t->height, t->format,
+                    rg[0], rg[1], rg[2], rg[3], rg[4], rg[5], ct->color[0], ct->color[1], ct->color[2], ct->color[3], r->x[4], r->x[6]);
+            if (rg[5] > 0) { clear_layer0 = (NSUInteger)(rg[2] > 0 ? rg[2] : 0); clear_nlayers = (NSUInteger)rg[5]; }
             clear(0, (int)r->x[6], ct->color, (uint32_t)r->x[4] ? (uint32_t)r->x[4] : 0xF, false, 0, false, 0, 0);
+            clear_layer0 = clear_nlayers = 0;
             end_pass();
             st.rt = saved;
             memcpy(st.scissor[0], sc, sizeof sc);

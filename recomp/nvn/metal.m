@@ -268,8 +268,15 @@ static MTLTextureType mtl_tex_type(uint32_t target, uint32_t samples) {
 // Buffer textures in a physical pool: a linear texture over the pool's no-copy MTLBuffer, so the GPU reads the guest
 // memory itself (the UI rewrites them every frame; hashing and re-uploading them was the render thread's largest
 // host cost). nil when the alignment or the pool doesn't allow it.
+// FIFA_NO_INPLACE=1: copy vertex/index buffers and buffer textures instead of reading guest memory in place (experiment)
+bool renderer_no_inplace(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("FIFA_NO_INPLACE") != NULL;
+    return v;
+}
+
 static id<MTLTexture> buffer_texture_in_place(NvnTexture *t, MTLTextureDescriptor *d, MtlFormat mf) {
-    if (t->target != 10 || mf.expand_rgb || !t->pool || !t->pool->storage) return nil;
+    if (t->target != 10 || mf.expand_rgb || !t->pool || !t->pool->storage || renderer_no_inplace()) return nil;
     uint32_t bpb = nvn_format_info(t->format)->bpb;
     uint64_t row = (uint64_t)d.width * bpb, off;
     NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:d.pixelFormat];
@@ -566,6 +573,7 @@ id<MTLTexture> renderer_texture(NvnTexture *t, id<MTLBlitCommandEncoder> blit, b
 
 void renderer_mark_gpu_owned(NvnTexture *t) { tex_backend(t)->gpu_owned = true; }
 bool renderer_is_gpu_owned(NvnTexture *t) { return tex_backend(t)->gpu_owned; }
+bool renderer_texture_zero_copy(NvnTexture *t) { return tex_backend(t)->zero_copy; }
 
 void backend_pool_written(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
 

@@ -1188,6 +1188,26 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
     load by FS `16ede1800` from two 2048x2048 D16 top-down captures and an R8 mask; its G input is cleared in the
     same frame before its own pass, so G is 0 as recorded); the step test is uniform over the heads. The sun's PCF
     shadow (pc 0xbf8-0xf28) is ~0 (unshadowed) on faces.
+- Visual pass, fourth round (2026-10-21, runs `build/c1`..`c14`, `k1`..`k5`): **flat black/white crowd fixed**.
+  - The crowd is instanced sprites: VS `170197000` + FS `16fe83400` (far), VS `16f9a2200` + FS `16fd3ac00` (near).
+    The VS checked out (every vertex of 4,191 instances is one affine map of its bone-skinned position); the spiky
+    crowd in `c1`/`c10` came from the per-draw-readback debug frames, which stall for seconds while the game's
+    animation threads keep refilling the CPU-written bone ring (t4), not from normal frames.
+  - The FS's albedo is `atlas.rgb * (1 + atlas.a * (tint - 1))`, the atlas `t4` being a 512x512x32 BC7 sRGB array with
+    10 levels, the layer and tints packed per instance in `t2`. That atlas was 2% non-zero in guest memory and never
+    written by the GPU. A CPU watchpoint on it showed Frostbite copying each layer/level itself to an address from
+    **`nvnTextureGetViewOffset`, which was stubbed to 0**: all 32 layers x 10 levels landed on offset 0. It now
+    returns `layer * tegra_layer_size + tegra_level(level).offset` for the view's base level / min layer. Atlas 87%
+    non-zero, crowd drawn in colour. Every texture Frostbite loads per subresource went through this.
+  - Debug aids: `FIFA_WATCH_TEX=<w>x<h>x<d>:<fmt hex>` arms the CPU write watchpoint (`FIFA_WATCH`, `hle/debug.c`) on
+    the first such texture when it is initialized (addresses differ between runs); `FIFA_WATCH_GPU=<addr>:<size>` and
+    `FIFA_WATCH_FMT=<fmt hex>` log copies/buffer clears into that range or into textures of that format (`[watch]`,
+    with view levels/layers and region). `FIFA_DBG_VSREG=<pc>:<reg>[,...]` (up to 4) adds vertex-stage register
+    probes to `FIFA_DBG_VS`, which now dumps the debug frame's draws of that VS to `build/dbgvs_<n>.bin` (per instance -
+    base < 1024 and vertex < 64: position, first four attributes' raw bits, the probes; `FIFA_DBG_VSTEX=<slot>` adds
+    three texels of that buffer texture at probe 0's value). `FIFA_NO_INPLACE=1` copies vertex/index buffers and
+    buffer textures instead of reading guest memory in place. `[probefs]` lines print levels, views and sampler state;
+    writer maps are named `build/writers_<addr>_<present>.bin`.
 - setjmp: the guest-jmp_buf -> host-context table never dropped entries,
   and EAText's FreeType setjmps in every call, so it overflowed (64) on the
   screen after the offline notice. Entries whose host context lies below
@@ -1358,8 +1378,9 @@ so the visual pass (4) comes next. In order:
    arms/legs/hands~~ (compute fixes), ~~draws skipped in cutscenes~~
    (vertex-only programs), ~~the NaN LUT~~ (TLDS array layout), ~~grey patches on
    faces~~ (BRA CC tests, "Visual pass, third round"), ~~black jackets~~ (border colour
-   through the alpha-one swizzle, same section). Left: flat black/white crowd,
-   grass shimmer/grain, shadows, reflections. (The
+   through the alpha-one swizzle, same section), ~~flat black/white crowd~~
+   (`nvnTextureGetViewOffset`, "Visual pass, fourth round"). Left: grass shimmer/grain
+   (recheck after the view offset fix), shadows, reflections. (The
    black sky is not an issue.)
 5. Shader coverage (`build/shtool`): 437/437 of the dumps translate. Seen
    at boot only: SUATOM (`ea70`, CS `16e61ea00`, `16f0ce900`).

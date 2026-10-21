@@ -983,7 +983,7 @@ static uint64_t ring_snapshot(uint64_t addr, uint64_t size) {
 // Bind guest memory [addr, addr+size) as a buffer: zero-copy inside a memory pool, copied otherwise.
 static void bind_guest(id<MTLRenderCommandEncoder> e, bool vertex_stage, uint64_t addr, uint64_t size, int index) {
     uint64_t poff;
-    id<MTLBuffer> pb = (addr & 3) == 0 ? renderer_pool_buffer(addr, size, &poff) : nil;
+    id<MTLBuffer> pb = (addr & 3) == 0 && !renderer_no_inplace() ? renderer_pool_buffer(addr, size, &poff) : nil;
     if (pb) {
         if (vertex_stage) [e setVertexBuffer:pb offset:poff atIndex:index];
         else [e setFragmentBuffer:pb offset:poff atIndex:index];
@@ -1300,7 +1300,19 @@ static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
         maxwell_dbg_code = dbg_addr ? (const uint8_t *)gptr(dbg_addr) : NULL;
         static unsigned long long dbg_vs;
         static int vparsed;
-        if (!vparsed) { vparsed = 1; const char *e = getenv("FIFA_DBG_VS"); if (e) dbg_vs = strtoull(e, NULL, 16); }
+        if (!vparsed) {
+            vparsed = 1;
+            const char *e = getenv("FIFA_DBG_VS");
+            if (e) dbg_vs = strtoull(e, NULL, 16);
+            extern uint32_t maxwell_dbg_vspc[4];
+            extern int maxwell_dbg_vsreg[4];
+            e = getenv("FIFA_DBG_VSREG");
+            for (int k = 0; e && *e && k < 4; k++) {
+                if (sscanf(e, "%x:%d", &maxwell_dbg_vspc[k], &maxwell_dbg_vsreg[k]) != 2) maxwell_dbg_vsreg[k] = -1;
+                e = strchr(e, ',');
+                if (e) e++;
+            }
+        }
         maxwell_dbg_vs = dbg_vs ? (const uint8_t *)gptr(dbg_vs) : NULL;
         maxwell_dbg_pc = dbg_pc;
         maxwell_dbg_reg = dbg_reg;
@@ -1685,7 +1697,8 @@ static void bind_textures(int stage, ShaderInfo *si) {
             NvnTexture *vt = h && st.tpool && tic < (uint32_t)st.tpool->count ? ((NvnTexEntry *)st.tpool->entries)[tic].tex : NULL;
             LOG("[vtex] %d type %d off %#x bindless %d/%#x handle %llx tic %u -> %s", i, st_->type, st_->handle_offset, st_->bindless, st_->bindless_offset, (unsigned long long)h, tic, vt ? "" : "none");
             static int once; if (!once++) { LOG("[vtex] tex0:"); for (int k = 0; k < 32; k++) if (st.tex[0][k]) LOG(" %d=%llx", k, (unsigned long long)st.tex[0][k]); LOG(" septex0:"); for (int k = 0; k < 128; k++) if (st.septex[0][k]) LOG(" %d=%llx", k, (unsigned long long)st.septex[0][k]); LOG(" sepsmp0:"); for (int k = 0; k < 32; k++) if (st.sepsmp[0][k]) LOG(" %d=%llx", k, (unsigned long long)st.sepsmp[0][k]); LOG("\n"); }
-            if (vt) LOG("target %u fmt %#x %ux%u addr %llx", vt->target, vt->format, vt->width, vt->height, (unsigned long long)vt->addr);
+            if (vt) LOG("target %u fmt %#x %ux%u addr %llx%s%s", vt->target, vt->format, vt->width, vt->height, (unsigned long long)vt->addr,
+                        renderer_texture_zero_copy(vt) ? " in place" : "", renderer_is_gpu_owned(vt) ? " gpu" : "");
             LOG(" mtl type %lu %lux%lu\n", (unsigned long)tex.textureType, (unsigned long)tex.width, (unsigned long)tex.height);
         }
         if (stage == 0) { [enc setVertexTexture:tex atIndex:i]; if (!st_->is_image) [enc setVertexSamplerState:smp atIndex:st_->sampler]; }
@@ -1841,8 +1854,16 @@ static void log_bound_textures(int stage, ShaderInfo *si) {
             size_t nz = 0, len = e->tex->pool ? (size_t)tegra_total_size(&e->tex->layout) : 0;
             const uint8_t *g = gptr(e->tex->addr);
             for (size_t b = 0; b < len; b++) nz += g[b] != 0;
-            LOG(" %ux%u fmt %u addr %llx flags %x label '%s' guest %zu/%zu nonzero, gpu-owned %d", e->tex->width, e->tex->height,
-                e->tex->format, e->tex->addr, e->tex->flags, e->tex->label, nz, len, renderer_is_gpu_owned(e->tex));
+            LOG(" %ux%u fmt %u levels %u addr %llx flags %x label '%s' guest %zu/%zu nonzero, gpu-owned %d", e->tex->width,
+                e->tex->height, e->tex->format, e->tex->levels, e->tex->addr, e->tex->flags, e->tex->label, nz, len,
+                renderer_is_gpu_owned(e->tex));
+            if (e->has_view) LOG(" view levels %u+%u", e->view.base_level, e->view.num_levels);
+        }
+        uint32_t tsc = (uint32_t)(h >> 20) & 0xFFF;
+        if (h && st.spool && tsc < (uint32_t)st.spool->count) {
+            const NvnSamplerDesc *sd = &((NvnSamplerDesc *)st.spool->entries)[tsc];
+            LOG(" | tsc %u min %u mag %u lod %g..%g bias %g aniso %g", tsc, sd->min_filter, sd->mag_filter, sd->lod_min,
+                sd->lod_max, sd->lod_bias, sd->max_aniso);
         }
         LOG(")");
         extern void renderer_texture_probe(NvnTexture *t);
@@ -2275,10 +2296,13 @@ static void perdraw_check(void) {
                     st.program ? (unsigned long long)st.program->stages[0].code_addr : 0ull,
                     st.program ? (unsigned long long)st.program->stages[1].code_addr : 0ull);
                 char path[128];
-                snprintf(path, sizeof path, "build/writers_%llx.bin", (unsigned long long)t->addr);
+                extern uint64_t renderer_present_count(void);
+                snprintf(path, sizeof path, "build/writers_%llx_%llu.bin", (unsigned long long)t->addr,
+                         (unsigned long long)renderer_present_count());
                 FILE *f = fopen(path, "wb");
                 if (f) { fwrite(wt[s].map, 4, n, f); fclose(f); }
-                snprintf(path, sizeof path, "build/writers_%llx.f32", (unsigned long long)t->addr);  // the target's RGBA floats
+                snprintf(path, sizeof path, "build/writers_%llx_%llu.f32", (unsigned long long)t->addr,
+                         (unsigned long long)renderer_present_count());  // the target's RGBA floats
                 if ((f = fopen(path, "wb"))) { fwrite(wt[s].last, 16, n, f); fclose(f); }
             }
             continue;
@@ -2786,8 +2810,8 @@ static void draw(CmdRec *r, bool indexed) {
     static id<MTLBuffer> dbgvs;
     bool dbg_this = maxwell_dbg_vs && (const uint8_t *)gptr(st.program->stages[0].code_addr) == maxwell_dbg_vs;
     if (dbg_this) {
-        if (!dbgvs) dbgvs = [dev newBufferWithLength:2 * 64 * 8 * 16 options:MTLResourceStorageModeShared];
-        memset(dbgvs.contents, 0xff, 2 * 64 * 8 * 16);
+        if (!dbgvs) dbgvs = [dev newBufferWithLength:9 * 65536 * 16 options:MTLResourceStorageModeShared];
+        memset(dbgvs.contents, 0xff, 9 * 65536 * 16);
         [enc setVertexBuffer:dbgvs offset:0 atIndex:DBG_VS_BUFFER_INDEX];
     }
     bind_textures(0, pr->vi);
@@ -2833,7 +2857,7 @@ static void draw(CmdRec *r, bool indexed) {
             uint32_t isz = itype == 1 ? 2 : 4;
             id<MTLBuffer> ib;
             uint64_t ioff;
-            ib = (iaddr % isz) == 0 ? renderer_pool_buffer(iaddr, (uint64_t)count * isz, &ioff) : nil;
+            ib = (iaddr % isz) == 0 && !renderer_no_inplace() ? renderer_pool_buffer(iaddr, (uint64_t)count * isz, &ioff) : nil;
             if (!ib) { ioff = ring_alloc(gptr(iaddr), (uint64_t)count * isz); ib = ring; }
             [enc drawIndexedPrimitives:pt indexCount:count indexType:it indexBuffer:ib indexBufferOffset:ioff
                          instanceCount:inst baseVertex:base_vertex baseInstance:base_inst];
@@ -2869,17 +2893,22 @@ static void draw(CmdRec *r, bool indexed) {
     if (perdraw < 0) perdraw = getenv("FIFA_DBG_PERDRAW") != NULL;
     if (g_debug_frame && perdraw) { perdraw_prog = pr; perdraw_check(); }
     else if (gpu_profile() == 2 && enc) { end_pass(); st.rt_dirty = true; }
-    if (dbg_this) {
+    if (dbg_this && g_debug_frame) {  // FIFA_DBG_VS: the debug frame's draws of that VS -> build/dbgvs_<n>.bin
         static int nlog;
-        if (nlog++ < 4) {
-            renderer_flush();
-            const float *f = dbgvs.contents;
-            LOG("[dbgvs] draw %d:", nlog);
-            for (int i = 0; i < 2; i++)
-                for (int v = 0; v < 4; v++) LOG(" i%d v%d (%g %g %g %g) uv(%g %g %g)", i, v, f[(i * 8 + v) * 4], f[(i * 8 + v) * 4 + 1], f[(i * 8 + v) * 4 + 2], f[(i * 8 + v) * 4 + 3],
-                                                f[(512 + i * 8 + v) * 4], f[(512 + i * 8 + v) * 4 + 1], f[(512 + i * 8 + v) * 4 + 2]);
-            LOG("\n");
+        renderer_flush();
+        char path[64];
+        snprintf(path, sizeof path, "build/dbgvs_%d.bin", nlog);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(dbgvs.contents, 16, 9 * 65536, f); fclose(f); }
+        LOG("[dbgvs] %d: inst %u base %u count %u", nlog++, inst, base_inst, (uint32_t)r->x[2]);
+        if (indexed) {  // index type, base vertex, the first indices
+            uint32_t it = (uint32_t)r->x[1], n = MIN((uint32_t)r->x[2], 96u);
+            LOG(" itype %u at %llx base vertex %d:", it, (unsigned long long)r->x[3], (int32_t)r->x[4]);
+            for (uint32_t k = 0; k < n; k++)
+                LOG(" %u", it == 0 ? ((const uint8_t *)gptr(r->x[3]))[k] : it == 1 ? ((const uint16_t *)gptr(r->x[3]))[k]
+                                                                                   : ((const uint32_t *)gptr(r->x[3]))[k]);
         }
+        LOG("\n");
     }
 }
 
@@ -3240,6 +3269,31 @@ static bool drop_unrenderable_targets(void) {
     return dropped;
 }
 
+// FIFA_WATCH_GPU=<addr>:<size> (hex): log every copy or buffer clear whose destination overlaps that guest range;
+// FIFA_WATCH_FMT=<fmt> (hex): every copy into a texture of that format ([watch]). (FIFA_WATCH is the CPU watchpoint.)
+static void watch_dst(const char *what, uint64_t src, uint64_t addr, uint64_t size, const NvnTexture *t, const TexRefRec *r) {
+    static uint64_t wa = 1, ws, wf;
+    if (wa == 1) {
+        const char *e = getenv("FIFA_WATCH_GPU");
+        wa = 0;
+        if (e) { char *end; wa = strtoull(e, &end, 16); ws = *end == ':' ? strtoull(end + 1, NULL, 16) : 1; }
+        e = getenv("FIFA_WATCH_FMT");
+        wf = e ? strtoull(e, NULL, 16) : 0;
+    }
+    bool hit = wa && addr < wa + ws && addr + size > wa;
+    if (!hit && !(wf && t && t->format == wf)) return;
+    static int n;
+    if (n++ >= 300) return;
+    LOG("[watch] %s %llx -> %llx size %#llx", what, (unsigned long long)src, (unsigned long long)addr, (unsigned long long)size);
+    if (t) LOG(" tex %p %ux%ux%u fmt %#x target %u levels %u", (void *)t, t->width, t->height, t->depth, t->format, t->target, t->levels);
+    if (r && r->has_view) LOG(" view levels %u+%u layers %u+%u", r->view.base_level, r->view.num_levels, r->view.min_layer,
+                              r->view.num_layers);
+    if (r) LOG(" region %d,%d,%d %dx%dx%d", r->region[0], r->region[1], r->region[2], r->region[3], r->region[4], r->region[5]);
+    LOG("\n");
+}
+
+static uint64_t tex_bytes(const NvnTexture *t) { return t && t->pool ? tegra_total_size(&t->layout) : 1; }
+
 // Buffer copy (fill: clear to a repeated byte) as a blit in command order. False when the ranges aren't inside
 // pool buffers, overlap or can't be tracked: the caller drains the GPU and does it on the CPU.
 static bool blit_buffer(uint64_t src, uint64_t dst, uint64_t n, bool fill, uint8_t value) {
@@ -3515,6 +3569,10 @@ static void exec_list(uint64_t handle, int depth) {
         }
         case CMD_COPY_TEXTURE_TO_TEXTURE: {
             const TexRefRec *t = x;
+            if (t[1].tex) {
+                const NvnTexture *s_ = (const NvnTexture *)(uintptr_t)t[0].tex, *d_ = (const NvnTexture *)(uintptr_t)t[1].tex;
+                watch_dst("tex2tex", s_ ? s_->addr : 0, d_->addr, tex_bytes(d_), d_, &t[1]);
+            }
             copy_texture(&t[0], &t[1], r->x[6]);
             break;
         }
@@ -3523,14 +3581,21 @@ static void exec_list(uint64_t handle, int depth) {
             copy_texture(&t[0], &t[1], 1);
             break;
         }
-        case CMD_COPY_BUFFER_TO_TEXTURE: copy_buffer_to_texture(r->x[0], x); break;
+        case CMD_COPY_BUFFER_TO_TEXTURE: {
+            const NvnTexture *d_ = (const NvnTexture *)(uintptr_t)((const TexRefRec *)x)->tex;
+            if (d_) watch_dst("buf2tex", r->x[0], d_->addr, tex_bytes(d_), d_, x);
+            copy_buffer_to_texture(r->x[0], x);
+            break;
+        }
         case CMD_COPY_TEXTURE_TO_BUFFER: copy_texture_to_buffer(x, r->x[3]); break;
         case CMD_COPY_BUFFER_TO_BUFFER:
+            watch_dst("buf2buf", r->x[0], r->x[1], r->x[2], NULL, NULL);
             if (blit_buffer(r->x[0], r->x[1], r->x[2], false, 0)) break;
             renderer_flush();
             memmove(gptr(r->x[1]), gptr(r->x[0]), r->x[2]);
             break;
         case CMD_CLEAR_BUFFER: {  // (address, size, 32-bit value)
+            watch_dst("clearbuf", 0, r->x[0], r->x[1], NULL, NULL);
             uint32_t v = (uint32_t)r->x[2];
             if (g_debug_frame) LOG("[clearbuf] %llx size %#llx value %#x\n", (unsigned long long)r->x[0], (unsigned long long)r->x[1], v);
             if (v == (v & 0xff) * 0x01010101u && blit_buffer(0, r->x[0], r->x[1] & ~3ull, true, (uint8_t)v)) break;

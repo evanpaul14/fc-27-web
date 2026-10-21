@@ -28,6 +28,10 @@ const uint8_t *maxwell_dbg_code;
 uint32_t maxwell_dbg_pc;
 int maxwell_dbg_reg;
 uint32_t maxwell_dbg_pcx[2];
+// FIFA_DBG_VS register probes (FIFA_DBG_VSREG=<pc>:<reg>[,...], up to 4): the register's value after that pc,
+// stored after the vertex dump (records 4..7)
+uint32_t maxwell_dbg_vspc[4];
+int maxwell_dbg_vsreg[4] = {-1, -1, -1, -1};
 int maxwell_dbg_regx[2] = {-1, -1};
 const uint8_t *maxwell_dbg_vs;
 
@@ -2654,6 +2658,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     free(flow_label);
     // translate
     bool dbg = maxwell_dbg_code && blob == maxwell_dbg_code && stage == STAGE_FRAGMENT;
+    bool vdbg = maxwell_dbg_vs && blob == maxwell_dbg_vs && stage == STAGE_VERTEX && !c->glsl;
     static int annotate = -1;
     if (annotate < 0) annotate = getenv("LARECOMP_SAVE_MSL") != NULL;
     c->branchy = any_branch;
@@ -2677,6 +2682,11 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         if (dbg && maxwell_dbg_pc == 0xfffffffeu) nan_trace(c, start, (uint32_t)i);
         int wbar = (int)((sch >> 5) & 7);
         if (wbar < 6 && !flow && !late_off()) defer_late(c, start, wbar);
+        for (int k = 0; vdbg && k < 4; k++)
+            if (maxwell_dbg_vsreg[k] >= 0 && pc == maxwell_dbg_vspc[k]) {
+                c->reg_used[maxwell_dbg_vsreg[k]] = 1;
+                sp(&c->body, "    dbgr[%d] = r%d;\n", k, maxwell_dbg_vsreg[k]);
+            }
         for (int k = 0; dbg && k < 3; k++) {  // probe 0 -> dbgv (R, and G/B without probes 1/2), probes 1/2 -> G/B
             uint32_t ppc = k ? maxwell_dbg_pcx[k - 1] : maxwell_dbg_pc;
             int preg = k ? maxwell_dbg_regx[k - 1] : maxwell_dbg_reg;
@@ -2815,7 +2825,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     if (nsamplers > 16) fail(c, "%d samplers", nsamplers);
     if (stage == STAGE_VERTEX) {
         sp(&s, "vertex VOut main0(VIn in [[stage_in]], uint vid [[vertex_id]], uint iid [[instance_id]]%s%s) {\n",
-           (maxwell_dbg_vs && blob == maxwell_dbg_vs) ? ", device float4 *dbgout [[buffer(29)]]" : "",
+           (maxwell_dbg_vs && blob == maxwell_dbg_vs) ? ", device uint4 *dbgout [[buffer(29)]], uint biid [[base_instance]]" : "",
            args.buf ? args.buf : "");
         sp(&s, "  VOut out = {};\n  out.pos = float4(0, 0, 0, 1);\n");
         for (int i = 0; i < 32; i++)
@@ -2844,6 +2854,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f, dbgv1 = 1.0f, dbgv2 = 1.0f;\n"
                                                   : "  float dbgv = -1.0f, dbgv1 = -1.0f, dbgv2 = -1.0f;\n");
     if (dbg && maxwell_dbg_pc == 0xfffffffeu) sp(&s, "  uint nanpc = 0u;\n");
+    if (maxwell_dbg_vs && blob == maxwell_dbg_vs && stage == STAGE_VERTEX) sp(&s, "  uint dbgr[4] = {~0u, ~0u, ~0u, ~0u};\n");
     if (any_branch) {
         sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0; uint pbk[16]; uint pbk_n = 0; uint pcnt[16]; uint pcnt_n = 0;\n");
         sp(&s, "  bool exit_now = false;\n");
@@ -2872,7 +2883,24 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         if (key && key->flip_y) sp(&s, "  out.pos.y = -out.pos.y;\n");
         if (key && key->flip_x) sp(&s, "  out.pos.x = -out.pos.x;\n");
         if (key && key->depth_minus_one) sp(&s, "  out.pos.z = (out.pos.z + out.pos.w) * 0.5f;\n");
-        if (maxwell_dbg_vs && blob == maxwell_dbg_vs) sp(&s, "  if (iid < 64u && vid < 8u) { dbgout[iid * 8u + vid] = out.pos; dbgout[512u + iid * 8u + vid] = %s; }\n", (c->out_attr_mask & 2u) ? "out.v1" : "float4(0)");
+        if (maxwell_dbg_vs && blob == maxwell_dbg_vs) {
+            // FIFA_DBG_VS: per (instance - base) < 1024 and vertex id < 64: the position, then the first four input
+            // attributes' raw bits (renderer.m dumps them, build/dbgvs_<n>.bin)
+            sp(&s, "  { uint di = iid - biid; if (di < 1024u && vid < 64u) { uint k = di * 64u + vid; dbgout[k] = as_type<uint4>(out.pos);\n");
+            for (int i = 0, n = 0; i < 32 && n < 4; i++)
+                if (c->in_attr_mask & (1u << i)) {
+                    int kind = key ? key->attr_kind[i] : 0;
+                    sp(&s, "    dbgout[%du * 65536u + k] = %s(in.a%d);\n", ++n, kind ? "uint4" : "as_type<uint4>", i);
+                }
+            sp(&s, "    dbgout[5u * 65536u + k] = uint4(dbgr[0], dbgr[1], dbgr[2], dbgr[3]);\n");
+            // FIFA_DBG_VSTEX=<slot>: also the three texels of that buffer texture at probe 0's value (bone rows)
+            const char *vt = getenv("FIFA_DBG_VSTEX");
+            if (vt)
+                for (int r = 0; r < 3; r++)
+                    sp(&s, "    if (dbgr[0] != ~0u) dbgout[%du * 65536u + k] = as_type<uint4>(t%d.read(dbgr[0] + %du));\n", 6 + r,
+                       atoi(vt), r);
+            sp(&s, "  } }\n");
+        }
         sp(&s, "  return out;\n}\n");
     } else if (stage == STAGE_FRAGMENT) {
         bool zero_c1 = key && key->dual_source && !c->glsl && !((c->omap_target >> 4) & 0xF);

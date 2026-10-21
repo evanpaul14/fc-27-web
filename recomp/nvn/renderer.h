@@ -37,4 +37,6 @@ void renderer_mark_gpu_owned(NvnTexture *t);
 void renderer_texture_gone(void *nvn_tex, void *mtl_tex);
 void renderer_texture_scale(NvnTexture *t, float *sx, float *sy);  // allocation scale (always 1 here)
 bool renderer_texture_presented(NvnTexture *t);
+bool renderer_texture_zero_copy(NvnTexture *t);
+bool renderer_no_inplace(void);
 uint64_t renderer_present_count(void);

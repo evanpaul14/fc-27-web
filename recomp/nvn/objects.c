@@ -556,6 +556,17 @@ NVN(nvnTextureInitialize) {
     if (t->flags & 2)
         LOG("[nvn] video texture %p: %ux%u fmt %#x flags %#x target %u addr %llx stride %llu\n", t, t->width, t->height,
             t->format, t->flags, t->target, t->addr, t->stride);
+    // FIFA_WATCH_TEX=<w>x<h>x<d>:<fmt hex>: CPU write watchpoint (FIFA_WATCH) on the first such texture's storage
+    static int wt = -1;
+    static uint32_t ww, wh, wd, wf;
+    if (wt < 0) { const char *e = getenv("FIFA_WATCH_TEX"); wt = e && sscanf(e, "%ux%ux%u:%x", &ww, &wh, &wd, &wf) == 4; }
+    if (wt == 1 && t->addr && t->width == ww && t->height == wh && t->depth == wd && t->format == wf) {
+        extern void dbg_watch(uint64_t g, uint64_t n);
+        wt = 2;
+        LOG("[nvn] watching texture %p %ux%ux%u fmt %#x levels %u addr %llx\n", t, t->width, t->height, t->depth, t->format,
+            t->levels, (unsigned long long)t->addr);
+        dbg_watch(t->addr, tegra_total_size(&t->layout));
+    }
     SET_HOST(A(0), t);
     RET(1);
 }
@@ -585,7 +596,15 @@ NVN(nvnTextureGetMemoryPool) { RET(0); }
 NVN(nvnTextureGetMemoryOffset) { RET(TEX->pool_offset); }
 NVN(nvnTextureGetStorageSize) { RET(tegra_total_size(&TEX->layout)); }
 NVN(nvnTextureGetDebugID) { RET(TEX->debug_id); }
-NVN(nvnTextureGetViewOffset) { RET(0); }
+NVN(nvnTextureGetViewOffset) {
+    // (texture, view): byte offset of the view's first level and layer in the storage (layers hold all their levels).
+    // Frostbite maps each layer/level of a texture it loads at this offset and copies it there.
+    NvnTexture *t = TEX;
+    if (!A(1)) { RET(0); return; }
+    uint8_t mask = FLD(uint8_t, A(1), 0);
+    uint32_t level = (mask & 1) ? FLD(uint8_t, A(1), 4) : 0, layer = (mask & 2) ? FLD(uint16_t, A(1), 6) : 0;
+    RET((uint64_t)layer * tegra_layer_size(&t->layout) + tegra_level(&t->layout, level).offset);
+}
 NVN(nvnTextureGetStorageClass) { RET(0); }
 NVN(nvnTextureGetRawStorageClass) { RET(0); }
 NVN(nvnTextureGetSparseTileLayout) { RET(0); }

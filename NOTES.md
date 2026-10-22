@@ -6,6 +6,7 @@ Game data is read from local files at runtime and is never committed.
 
 ## Setup
 
+- `tools/build_opus.sh` builds libopus (needed by `make -C recomp`).
 - Keys: `~/.switch/prod.keys` (needs keygen 22: `master_key_15`,
   `key_area_key_application_15`, `titlekek_15`, `header_key`). The title key
   comes from the ticket inside the NSP, so `title.keys` is not needed.
@@ -1434,6 +1435,14 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   thread. Works (2026-10-21, checked by ear). With `FIFA_HIDDEN=1` (unless
   `FIFA_AUDIO=1`) or `FIFA_AUDIO=0` the old null sink releases each buffer
   after its duration instead, so benchmarks stay silent.
+- `hwopus` (`recomp/rt/hwopus.c`, libopus v1.5.2 from `tools/build_opus.sh`
+  into `third_party/opus`): music and commentary are Opus streams the game
+  decodes through ~68 multistream decoders (manager cmds 9/6, decoder cmd 9,
+  thousands of packets a minute). The stub answered with zero samples, so
+  only sound effects played; with libopus music and commentary are heard
+  (2026-10-21). Packets have an 8-byte header (BE size, final range).
+  Work buffers (transfer memory) are ignored. For the web build, libopus
+  compiles to wasm as is.
 - `svcCreateTransferMemory` makes an `H_TMEM` handle (`KTransferMemory`:
   address, size, permission) for services to read; the memory stays
   accessible to the guest. nv:: creates one for `nvdrv`.
@@ -1506,7 +1515,8 @@ so the visual pass (4) comes next. In order:
 6. ~~Open play at 12-17 fps in the visible window~~: 30.0 fps visible at
    thermal 0 (v1, v2); it was P-core throttling.
 7. ~~Keyboard~~ (FIFA PC layout) ~~and mouse~~ (touch screen) ~~audio output~~
-   (CoreAudio): all checked in the visible window. Still to try: a gamepad;
+   (CoreAudio), ~~music and commentary~~ (hwopus on libopus): all checked in the
+   visible window. Still to try: a gamepad;
    the dark Continue button on the accessibility screen (seen before the
    threading fix).
 

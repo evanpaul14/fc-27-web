@@ -10,15 +10,18 @@ CFLAGS := -O2 -fno-stack-protector -w -mllvm -enable-misched=false -mllvm -globa
 # Largest units first so the long ones don't finish last.
 GEN := $(shell ls -S $(B)/gen/*.c 2>/dev/null)
 OBJ := $(GEN:$(B)/gen/%.c=$(B)/obj/%.o)
-RT := rt/host.c rt/kernel.c rt/ipc.c rt/services.c rt/am.c rt/time.c rt/fs.c rt/apm.c rt/pctl.c rt/nifm.c rt/aoc.c rt/audout.c rt/hid.c rt/acc.c rt/a64_rt.c rt/input.m $(wildcard hle/*.c)
+RT := rt/host.c rt/kernel.c rt/ipc.c rt/services.c rt/am.c rt/time.c rt/fs.c rt/apm.c rt/pctl.c rt/nifm.c rt/aoc.c rt/audout.c rt/hwopus.c rt/hid.c rt/acc.c rt/a64_rt.c rt/input.m $(wildcard hle/*.c)
 NVN := $(wildcard nvn/*.c) nvn/maxwell/translate.c
 NVN_M := $(wildcard nvn/*.m)
 FRAMEWORKS := -framework Foundation -framework AppKit -framework Metal -framework QuartzCore -framework ImageIO \
   -framework CoreGraphics -framework UniformTypeIdentifiers -framework GameController -framework AudioToolbox
+# libopus for hwopus: tools/build_opus.sh
+OPUS := ../third_party/opus
 HDR := rt/cpu.h rt/runtime.h rt/host.h rt/ipc.h rt/input.h nvn/nvn.h nvn/renderer.h nvn/maxwell/shader.h
 
-$(B)/fifa: $(OBJ) $(RT) $(NVN) $(NVN_M) $(B)/nvn_table.c $(HDR)
-	$(CC) -O1 -g -fobjc-arc -o $@ $(OBJ) $(RT) $(NVN) $(NVN_M) $(B)/nvn_table.c $(FRAMEWORKS)
+$(B)/fifa: $(OBJ) $(RT) $(NVN) $(NVN_M) $(B)/nvn_table.c $(HDR) $(OPUS)/build/libopus.a
+	$(CC) -O1 -g -fobjc-arc -I$(OPUS)/include -o $@ $(OBJ) $(RT) $(NVN) $(NVN_M) $(B)/nvn_table.c $(OPUS)/build/libopus.a \
+	  $(FRAMEWORKS)
 
 $(B)/nvn_table.c: $(NVN) nvn/table.py
 	python3 -I nvn/table.py $@ $(NVN)

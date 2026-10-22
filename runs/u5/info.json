@@ -1,0 +1,17 @@
+{
+ "name": "u5",
+ "command": "tools/bench.py build/u5 1 fps -1:60,fps 60:120",
+ "commit": "d47d96b",
+ "initial_blits": "1",
+ "plan": "fps -1:60,fps 60:120",
+ "env": {},
+ "binary_built": "2026-10-21T18:23:00",
+ "backfilled": true,
+ "uncommitted": [
+  "recomp/build.py",
+  "recomp/rt/input.m",
+  "recomp/rt/audout.c (null sink on absolute deadlines)"
+ ],
+ "outcome": "stopped",
+ "note": "Run as build/f5 (overwrote 2026-10-20 f5). No FIFA_LOG_WAITS, null sink: still stuck at Select Sides, so wait logging is not the cause."
+}

@@ -1,0 +1,4 @@
+build/u2
+  segment                              fps   Gi/f  cpu ms    P%  PGHz gpu ms  fence  flush    mem thm
+  seg 0 fps -1                        29.7  0.051    17.0    74  1.29   22.8    0.0    0.0   2346   0
+  seg 1 fps 60                        59.3  0.042    13.8    61  1.44   18.6    0.8    0.0   2407   0

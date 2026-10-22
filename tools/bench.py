@@ -11,18 +11,92 @@ cores.log: every 2 s the game's CPU seconds on P and E cores, retired instructio
 root). Compare fps only at the same P clock: the P cores throttle to ~0.83 GHz under thermal pressure; compare runs by
 cost per frame instead (tools/benchsum.py: instructions, CPU and GPU time per frame, which don't depend on the clock). SAMPLE=1 also runs
 /usr/bin/sample for 10 s near the end of each segment (<outdir>/seg<i>.sample). VISIBLE=1 shows the window.
+
+Each run is also recorded in git: runs/<name>/ (name = the outdir's basename) gets info.json (command, plan,
+settings, commit and uncommitted diffstat, binary build time, outcome), summary.txt (tools/benchsum.py),
+marks.log, tomatch.log, cores.log and game.log.gz; screenshots and samples stay in <outdir>. The record is written
+when the run ends, fails or is stopped (SIGTERM). A name already used in build/ or runs/ is refused, so a run never
+overwrites another.
+
+  python3 tools/bench.py --record <outdir> [note]     record an existing run (no info.json: a stub with the note)
 """
 import ctypes
+import datetime
+import gzip
+import json
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import threading
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RECORDED = ('marks.log', 'tomatch.log', 'cores.log')
+
+
+def git(*a):
+    return subprocess.run(['git', *a], cwd=REPO, capture_output=True, text=True).stdout.strip()
+
+
+def record(out, info):
+    """Copy the run's text records to runs/<name>/ (tracked)."""
+    dst = os.path.join(REPO, 'runs', os.path.basename(out))
+    os.makedirs(dst, exist_ok=True)
+    with open(os.path.join(dst, 'info.json'), 'w') as f:
+        json.dump(info, f, indent=1)
+        f.write('\n')
+    for n in RECORDED:
+        if os.path.exists(os.path.join(out, n)):
+            shutil.copy(os.path.join(out, n), dst)
+    if os.path.exists(os.path.join(out, 'game.log')):
+        with open(os.path.join(out, 'game.log'), 'rb') as f, gzip.open(os.path.join(dst, 'game.log.gz'), 'wb') as g:
+            shutil.copyfileobj(f, g)
+    r = subprocess.run(['python3', '-I', 'tools/benchsum.py', os.path.relpath(out, REPO)], cwd=REPO,
+                       capture_output=True, text=True)
+    open(os.path.join(dst, 'summary.txt'), 'w').write(r.stdout + r.stderr)
+    print('recorded in %s' % os.path.relpath(dst, REPO), flush=True)
+
+
+if sys.argv[1] == '--record':
+    out = os.path.abspath(sys.argv[2])
+    dst = os.path.join(REPO, 'runs', os.path.basename(out), 'info.json')
+    info = json.load(open(dst)) if os.path.exists(dst) else {'name': os.path.basename(out), 'backfilled': True}
+    if len(sys.argv) > 3:
+        info['note'] = sys.argv[3]
+    record(out, info)
+    sys.exit(0)
+
 out, init, plan = os.path.abspath(sys.argv[1]), sys.argv[2], sys.argv[3]
 LOAD = int(os.environ.get('LOAD', '120'))
-os.makedirs(out, exist_ok=True)
+name = os.path.basename(out)
+for d in (out, os.path.join(REPO, 'runs', name)):
+    if os.path.exists(d):
+        sys.exit('%s already exists: pick a new run name (past runs are cited in NOTES.md)' % os.path.relpath(d, REPO))
+os.makedirs(out)
+binary = os.path.join(REPO, 'build', 'fifa')
+info = {
+    'name': name, 'command': ' '.join(['tools/bench.py'] + sys.argv[1:]), 'initial_blits': init, 'plan': plan,
+    'env': {k: v for k, v in sorted(os.environ.items()) if k.startswith('FIFA_') or k in ('SAMPLE', 'LOAD', 'VISIBLE')},
+    'commit': git('rev-parse', '--short', 'HEAD'), 'uncommitted': git('diff', '--stat', 'HEAD').splitlines(),
+    'binary_built': datetime.datetime.fromtimestamp(os.path.getmtime(binary)).isoformat(timespec='seconds'),
+    'started': datetime.datetime.now().isoformat(timespec='seconds'), 'outcome': 'running',
+}
+
+
+def finish(outcome):
+    info['outcome'] = outcome
+    info['ended'] = datetime.datetime.now().isoformat(timespec='seconds')
+    record(out, info)
+
+
+def on_term(sig, frame):
+    finish('stopped')
+    game.kill()
+    os._exit(1)
+
+
 fifo = os.path.join(out, 'ctl')
 if os.path.exists(fifo):
     os.remove(fifo)
@@ -32,6 +106,7 @@ if os.environ.get('VISIBLE'):  # VISIBLE=1: show the window
     del env['FIFA_HIDDEN']
 t0 = time.time()
 game = subprocess.Popen(['./build/fifa'], cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+signal.signal(signal.SIGTERM, on_term)
 log = open(os.path.join(out, 'game.log'), 'w')
 marks = open(os.path.join(out, 'marks.log'), 'w')
 stop = False
@@ -108,6 +183,7 @@ open(os.path.join(out, 'tomatch.log'), 'w').write(r.stdout + r.stderr)
 if r.returncode:
     mark('tomatch failed')
     game.kill()
+    finish('tomatch failed')
     sys.exit(1)
 mark('match loading')
 time.sleep(LOAD)
@@ -131,3 +207,4 @@ mark('end')
 stop = True
 game.kill()
 game.wait()
+finish('done')

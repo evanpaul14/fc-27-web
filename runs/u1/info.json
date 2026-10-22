@@ -1,0 +1,16 @@
+{
+ "name": "u1",
+ "command": "tools/bench.py build/u1 1 fps -1:60,fps 60:120",
+ "commit": "d47d96b",
+ "initial_blits": "1",
+ "backfilled": true,
+ "plan": "fps -1:60,fps 60:120",
+ "env": {
+  "FIFA_LOG_WAITS": "1",
+  "SAMPLE": "1"
+ },
+ "binary_built": "2026-10-21T17:46:00",
+ "uncommitted": [],
+ "outcome": "done",
+ "note": "tomatch stuck at Select Sides: both segments measured a menu, not the match. fps 60 gave exactly 30.0; waits showed the main loop limiter at 119e4084."
+}

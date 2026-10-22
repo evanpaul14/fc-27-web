@@ -1,0 +1,19 @@
+{
+ "name": "u2",
+ "command": "tools/bench.py build/u2 1 fps -1:60,fps 60:120",
+ "commit": "d47d96b",
+ "initial_blits": "1",
+ "backfilled": true,
+ "plan": "fps -1:60,fps 60:120",
+ "env": {
+  "FIFA_LOG_WAITS": "1",
+  "SAMPLE": "1"
+ },
+ "binary_built": "2026-10-21T18:09:00",
+ "uncommitted": [
+  "recomp/build.py (patch 0x119e3f0c: main loop limiter rate through host_rate_hz)",
+  "recomp/rt/input.m (host_rate_hz)"
+ ],
+ "outcome": "done",
+ "note": "tomatch stuck at Select Sides (menu measured). fps 60: 59.3 fps; the main loop sleeps once per 60 Hz frame."
+}

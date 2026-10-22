@@ -306,7 +306,10 @@ Ultimate Team, Kick Off, ...) at 30 fps on the Metal executor, driven by
 keyboard, gamepad, `FIFA_PRESS` scripts or `FIFA_CONTROL` (see "Input"
 below). Kick Off plays a full match (Bournemouth v Brighton: 3D scene, HUD,
 half-time) at 28-30 fps in open play (the game's 30 fps cap) with buffer
-copies and readbacks as GPU blits (see "Blits" and "Match profile"). Per frame
+copies and readbacks as GPU blits (see "Blits" and "Match profile"). `FIFA_FPS=60`
+(or `fps 60`) lifts both of the game's 30 fps locks: 59.3 fps in the menus
+(u2), not yet measured in a match ("The 30 fps cap"). Audio plays through
+CoreAudio, music and commentary through libopus ("Input", "audout:u"). Per frame
 in open play (hidden, no thermal pressure) the CPU takes ~28-30 ms and the GPU
 is busy ~11.5 ms of the 33 ms ("GPU busy vs idle", "Host thunks in
 `a64_call`"). The visual pass over the match is under way (skin, faces, jackets
@@ -589,9 +592,9 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   `FIFA_CONTROL=<fifo>` drives a running game: `echo 'down 4; a; wait 60;
   shot' > fifo` (commands in `input.m`: `<button> [n]`, `hold`, `stick`,
   `wait`, `shot [path]`, default `build/live.png`, `debug`, `prof <n>`,
-  `csdump [n]`, `blits <0|1>`), so menus can be
+  `csdump [n]`, `blits <0|1>`, `fps <n>`: -1 the game's 30, 0 none, n fps; also `FIFA_FPS=<n>`), so menus can be
   walked one screenshot at a time without rebooting; `tools/tomatch.py`
-  drives it from boot to Kick Off's match.
+  drives it from boot to Kick Off's match (hidden runs currently stick at Select Sides: "The 30 fps cap").
 - Kick Off (2026-10-19): main menu -> Kick Off -> welcome pages -> gameplay
   type picker -> Match Preview (Bournemouth v Brighton) -> Start Match ->
   difficulty notice -> match load. Fixed on the way:
@@ -1450,8 +1453,10 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   (5.1 mixed down to stereo); the render callback releases each buffer when
   played and signals the buffer event, so the device clock paces the audio
   thread. Works (2026-10-21, checked by ear). With `FIFA_HIDDEN=1` (unless
-  `FIFA_AUDIO=1`) or `FIFA_AUDIO=0` the old null sink releases each buffer
-  after its duration instead, so benchmarks stay silent.
+  `FIFA_AUDIO=1`) or `FIFA_AUDIO=0` a null sink releases each buffer
+  when its duration is up instead (absolute deadlines, so it keeps real time), so benchmarks stay silent. Since
+  hwopus decodes for real, hidden runs with the null sink stick at Classic Match's Select Sides (`a` ignored);
+  `FIFA_AUDIO=1` gets through (u3). Cause not found yet ("The 30 fps cap").
 - `hwopus` (`recomp/rt/hwopus.c`, libopus v1.5.2 from `tools/build_opus.sh`
   into `third_party/opus`): music and commentary are Opus streams the game
   decodes through ~68 multistream decoders (manager cmds 9/6, decoder cmd 9,
@@ -1538,7 +1543,8 @@ so the visual pass (4) comes next. In order:
    thermal 0 (v1, v2); it was P-core throttling.
 7. ~~Keyboard~~ (FIFA PC layout) ~~and mouse~~ (touch screen) ~~audio output~~
    (CoreAudio), ~~music and commentary~~ (hwopus on libopus): all checked in the
-   visible window. Still to try: a gamepad;
+   visible window. Regression: hidden runs (null sink) stick at Select Sides since real Opus audio, which blocks
+   `tools/bench.py` (item 2). Still to try: a gamepad;
    the dark Continue button on the accessibility screen (seen before the
    threading fix).
 

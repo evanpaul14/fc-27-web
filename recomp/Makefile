@@ -14,7 +14,7 @@ RT := rt/host.c rt/kernel.c rt/ipc.c rt/services.c rt/am.c rt/time.c rt/fs.c rt/
 NVN := $(wildcard nvn/*.c) nvn/maxwell/translate.c
 NVN_M := $(wildcard nvn/*.m)
 FRAMEWORKS := -framework Foundation -framework AppKit -framework Metal -framework QuartzCore -framework ImageIO \
-  -framework CoreGraphics -framework UniformTypeIdentifiers -framework GameController
+  -framework CoreGraphics -framework UniformTypeIdentifiers -framework GameController -framework AudioToolbox
 HDR := rt/cpu.h rt/runtime.h rt/host.h rt/ipc.h rt/input.h nvn/nvn.h nvn/renderer.h nvn/maxwell/shader.h
 
 $(B)/fifa: $(OBJ) $(RT) $(NVN) $(NVN_M) $(B)/nvn_table.c $(HDR)

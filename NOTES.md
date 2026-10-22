@@ -569,14 +569,22 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   ThreadType, +0x1a0 its name pointer) and list all threads with priority
   and wait state.
 - Input: `recomp/rt/input.m` feeds the npad HLE (the game polls
-  `GetNpadStates(NpadFullKeyState, 16, No1)`). Keyboard in the window:
-  arrows d-pad, WASD/IJKL sticks, Return/Space A, Esc/Delete B, X, Y, Q/E
-  L/R, 1/3 ZL/ZR, =/- Plus/Minus, F/H stick clicks. Gamepads through the
+  `GetNpadStates(NpadFullKeyState, 16, No1)`). Keyboard in the window
+  (2026-10-21): FIFA PC's classic keyboard layout, with Switch buttons by
+  position: arrows left stick, S B (short pass), D A (shoot), W X (through
+  ball), A Y (lob), Shift ZR (sprint, via flagsChanged), Q/E L/R, Z ZL,
+  numpad 8456/2 or IJKL right stick, TFGH d-pad, C/V stick clicks,
+  Return/Space A, Esc/Backspace B, P Plus, Tab Minus (Ctrl is avoided:
+  Ctrl+arrows switches Spaces). The mouse is the touch screen
+  (`GetTouchScreenState<16>` HLE in `hle/npad.c`, letterbox-corrected to
+  1280x720); right button B. Checked by hand in a visible run: menus,
+  mouse and a match all respond. Gamepads through the
   GameController framework, by position (east = A). Headless:
   `FIFA_PRESS=<frame>:<button>[:<frames held>],...`, e.g.
   `FIFA_PRESS=300:a,600:a,900:a,1200:a,1800:a,2400:a,3000:a,3600:a`
   (with `FIFA_SCREENSHOT_EVERY=300`) walks from the intro to the main menu.
-  Keyboard and gamepad paths are untested so far (runs were hidden).
+  Synthetic keystrokes (System Events) are too short to be sampled; use
+  `FIFA_CONTROL` for scripted input.
   `FIFA_CONTROL=<fifo>` drives a running game: `echo 'down 4; a; wait 60;
   shot' > fifo` (commands in `input.m`: `<button> [n]`, `hold`, `stick`,
   `wait`, `shot [path]`, default `build/live.png`, `debug`, `prof <n>`,
@@ -1419,10 +1427,13 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   alone won't cover 64 GB.
 - `aoc:u` (`recomp/rt/aoc.c`): no add-on content; fsp-srv 202
   (OpenDataStorageByDataId) returns TargetNotFound instead of a missing object.
-- `audout:u` (`recomp/rt/audout.c`): a null sink that releases each
-  appended buffer after its duration at 48 kHz on a host thread and signals
-  the buffer event; samples are dropped (a CoreAudio/WebAudio backend goes
-  in `sink_thread`).
+- `audout:u` (`recomp/rt/audout.c`): the game opens one 48 kHz 6-channel
+  output. Buffers are copied at append and played by a CoreAudio output unit
+  (5.1 mixed down to stereo); the render callback releases each buffer when
+  played and signals the buffer event, so the device clock paces the audio
+  thread. Works (2026-10-21, checked by ear). With `FIFA_HIDDEN=1` (unless
+  `FIFA_AUDIO=1`) or `FIFA_AUDIO=0` the old null sink releases each buffer
+  after its duration instead, so benchmarks stay silent.
 - `svcCreateTransferMemory` makes an `H_TMEM` handle (`KTransferMemory`:
   address, size, permission) for services to read; the memory stays
   accessible to the guest. nv:: creates one for `nvdrv`.
@@ -1494,9 +1505,10 @@ so the visual pass (4) comes next. In order:
    pass's vertex (2.6 ms, incl. `gfind`) and fragment (3.9 ms) stages only matter for 60 fps.
 6. ~~Open play at 12-17 fps in the visible window~~: 30.0 fps visible at
    thermal 0 (v1, v2); it was P-core throttling.
-7. Try the keyboard and a gamepad in the visible window; audio output for
-   `audout.c`'s sink thread; the dark Continue button on the accessibility
-   screen (seen before the threading fix; check if it still happens).
+7. ~~Keyboard~~ (FIFA PC layout) ~~and mouse~~ (touch screen) ~~audio output~~
+   (CoreAudio): all checked in the visible window. Still to try: a gamepad;
+   the dark Continue button on the accessibility screen (seen before the
+   threading fix).
 
 Later / as needed:
 

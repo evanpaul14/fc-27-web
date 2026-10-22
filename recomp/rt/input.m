@@ -1,11 +1,15 @@
 // Host input for the npad HLE (hle/npad.c): player 1's Pro Controller state from the keyboard (window key events),
-// any connected gamepad (GameController framework) and FIFA_PRESS scripts, merged each time the game samples.
+// any connected gamepad (GameController framework) and FIFA_PRESS scripts, merged each time the game samples; the
+// mouse drives the touch screen.
 //
-// Keyboard (key positions, so any layout):
-//   arrows      d-pad              WASD        left stick       IJKL     right stick
-//   Return/Space A                 Esc/Delete  B                X / Y    X / Y
-//   Q / E        L / R             1 / 3       ZL / ZR          = / -    Plus / Minus
-//   F / H        left / right stick click
+// Keyboard: FIFA PC's classic keyboard layout (key positions, so any layout). Switch buttons go by position, as
+// with a gamepad: south (B) is the PC's short pass, east (A) shoot, north (X) through ball, west (Y) lob.
+//   arrows      left stick (move)    S  B short pass / contain     D  A shoot / tackle
+//   Shift       ZR sprint            W  X through ball / rush GK   A  Y lob, cross / slide
+//   Q / E       L / R (switch player, finesse)    Z  ZL            C / V  left / right stick click
+//   numpad 8456 or IJKL  right stick (skill moves)                 T F G H  d-pad (tactics)
+//   Return/Space A (confirm)   Esc/Backspace B (back)   P Plus (pause)   Tab Minus
+// Mouse: the left button touches the screen where it points (menus); the right button is B (back).
 // Gamepads map by position: the east face button is A, south B, north X, west Y.
 //
 // FIFA_PRESS=<frame>:<button>[:<frames held>],... presses buttons at presented-frame numbers, for headless runs:
@@ -47,14 +51,34 @@ enum {
 static _Atomic uint64_t kb_buttons;  // npad button bits
 static _Atomic uint32_t kb_dirs;     // stick directions: bits 0-3 left stick L/U/R/D, 4-7 right stick
 
+// ---- mouse: the touch point (bit 63 down, x and y in 1280x720 screen units below) and the right button
+static _Atomic uint64_t mouse_touch;
+static _Atomic bool mouse_b;
+
+void input_mouse(int button, bool down, double x, double y) {
+    if (button == 1) { atomic_store(&mouse_b, down); return; }
+    if (button) return;
+    if (x < 0) x = 0; if (x > 1279) x = 1279;
+    if (y < 0) y = 0; if (y > 719) y = 719;
+    atomic_store(&mouse_touch, down ? 1ull << 63 | (uint64_t)x << 16 | (uint64_t)y : 0);
+}
+bool input_touch(int32_t *x, int32_t *y) {
+    uint64_t t = atomic_load(&mouse_touch);
+    *x = (int32_t)(t >> 16 & 0xffff), *y = (int32_t)(t & 0xffff);
+    return t >> 63;
+}
+
 static const struct { unsigned short key; uint64_t button; uint32_t dir; } keymap[] = {
-    {kVK_LeftArrow, BTN_LEFT, 0}, {kVK_UpArrow, BTN_UP, 0}, {kVK_RightArrow, BTN_RIGHT, 0}, {kVK_DownArrow, BTN_DOWN, 0},
-    {kVK_Return, BTN_A, 0}, {kVK_Space, BTN_A, 0}, {kVK_Escape, BTN_B, 0}, {kVK_Delete, BTN_B, 0},
-    {kVK_ANSI_X, BTN_X, 0}, {kVK_ANSI_Y, BTN_Y, 0}, {kVK_ANSI_Q, BTN_L, 0}, {kVK_ANSI_E, BTN_R, 0},
-    {kVK_ANSI_1, BTN_ZL, 0}, {kVK_ANSI_3, BTN_ZR, 0}, {kVK_ANSI_Equal, BTN_PLUS, 0}, {kVK_ANSI_Minus, BTN_MINUS, 0},
-    {kVK_ANSI_F, BTN_LSTICK, 0}, {kVK_ANSI_H, BTN_RSTICK, 0},
-    {kVK_ANSI_A, 0, 1 << 0}, {kVK_ANSI_W, 0, 1 << 1}, {kVK_ANSI_D, 0, 1 << 2}, {kVK_ANSI_S, 0, 1 << 3},
+    {kVK_LeftArrow, 0, 1 << 0}, {kVK_UpArrow, 0, 1 << 1}, {kVK_RightArrow, 0, 1 << 2}, {kVK_DownArrow, 0, 1 << 3},
+    {kVK_ANSI_S, BTN_B, 0}, {kVK_ANSI_D, BTN_A, 0}, {kVK_ANSI_W, BTN_X, 0}, {kVK_ANSI_A, BTN_Y, 0},
+    {kVK_Shift, BTN_ZR, 0}, {kVK_RightShift, BTN_ZR, 0}, {kVK_ANSI_Z, BTN_ZL, 0},
+    {kVK_ANSI_Q, BTN_L, 0}, {kVK_ANSI_E, BTN_R, 0}, {kVK_ANSI_C, BTN_LSTICK, 0}, {kVK_ANSI_V, BTN_RSTICK, 0},
+    {kVK_ANSI_Keypad4, 0, 1 << 4}, {kVK_ANSI_Keypad8, 0, 1 << 5}, {kVK_ANSI_Keypad6, 0, 1 << 6},
+    {kVK_ANSI_Keypad2, 0, 1 << 7}, {kVK_ANSI_Keypad5, 0, 1 << 7},
     {kVK_ANSI_J, 0, 1 << 4}, {kVK_ANSI_I, 0, 1 << 5}, {kVK_ANSI_L, 0, 1 << 6}, {kVK_ANSI_K, 0, 1 << 7},
+    {kVK_ANSI_T, BTN_UP, 0}, {kVK_ANSI_F, BTN_LEFT, 0}, {kVK_ANSI_G, BTN_DOWN, 0}, {kVK_ANSI_H, BTN_RIGHT, 0},
+    {kVK_Return, BTN_A, 0}, {kVK_ANSI_KeypadEnter, BTN_A, 0}, {kVK_Space, BTN_A, 0},
+    {kVK_Escape, BTN_B, 0}, {kVK_Delete, BTN_B, 0}, {kVK_ANSI_P, BTN_PLUS, 0}, {kVK_Tab, BTN_MINUS, 0},
 };
 
 void input_key(unsigned short key, bool down) {
@@ -72,6 +96,8 @@ void input_key(unsigned short key, bool down) {
 void input_release_all(void) {  // focus lost: key-up events go elsewhere
     atomic_store(&kb_buttons, 0);
     atomic_store(&kb_dirs, 0);
+    atomic_store(&mouse_b, false);
+    atomic_store(&mouse_touch, 0);
 }
 
 static void dirs_to_stick(uint32_t d, int32_t *x, int32_t *y) {
@@ -279,7 +305,7 @@ void input_state(InputState *s) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{ parse_presses(); start_control(); });
     memset(s, 0, sizeof *s);
-    s->buttons = atomic_load(&kb_buttons);
+    s->buttons = atomic_load(&kb_buttons) | (atomic_load(&mouse_b) ? BTN_B : 0);
     uint32_t d = atomic_load(&kb_dirs);
     dirs_to_stick(d & 15, &s->lx, &s->ly);
     dirs_to_stick(d >> 4, &s->rx, &s->ry);

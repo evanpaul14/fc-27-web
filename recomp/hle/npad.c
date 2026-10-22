@@ -70,3 +70,27 @@ HLE(_ZN2nn3hid24GetSupportedNpadStyleSetEv) { RET(supported_styles); }
 
 /* Result ShowControllerSupport(const ControllerSupportArg &): the controller is already there */
 HLE(_ZN2nn3hid21ShowControllerSupportERKNS0_20ControllerSupportArgE) { RET(0); }
+
+/* void GetTouchScreenState<16>(TouchScreenState<16> *out): the mouse (rt/input.m) as one finger.
+ * TouchScreenState<N> { s64 sampling_number; s32 count, reserved; TouchState touches[N] }, TouchState (0x28):
+ * { TimeSpan delta_time; u32 attributes (bit 0 start, bit 1 end); s32 finger_id, x, y, diameter_x, diameter_y,
+ * rotation_angle, reserved }, x, y in 1280x720 screen units. */
+typedef struct {
+  int64_t delta_time;
+  uint32_t attributes;
+  int32_t finger_id, x, y, diameter_x, diameter_y, rotation_angle, reserved;
+} TouchState;
+
+HLE(_ZN2nn3hid19GetTouchScreenStateILm16EEEvPNS0_16TouchScreenStateIXT_EEE) {
+  static int was_down;
+  struct { int64_t sampling_number; int32_t count, reserved; TouchState touches[16]; } *out = gptr(ARG(0));
+  memset(out, 0, sizeof *out);
+  out->sampling_number = sampling_number();
+  int32_t x, y;
+  int down = input_touch(&x, &y);
+  if (down) {
+    out->count = 1;
+    out->touches[0] = (TouchState){.attributes = was_down ? 0 : 1, .x = x, .y = y, .diameter_x = 15, .diameter_y = 15};
+  }
+  was_down = down;
+}

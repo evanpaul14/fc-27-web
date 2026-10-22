@@ -6,6 +6,7 @@
 // its guest pages (widened to host pages; overlapping wraps are fine), and renderer.m binds addresses through
 // renderer_pool_buffer().
 #import <AppKit/AppKit.h>
+#import <Carbon/Carbon.h>
 #import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -897,8 +898,27 @@ void backend_present(NvnTexture *t) {
 - (BOOL)wantsUpdateLayer { return YES; }
 - (CALayer *)makeBackingLayer { return layer; }
 - (BOOL)acceptsFirstResponder { return YES; }
-- (void)keyDown:(NSEvent *)e { if (!e.isARepeat) input_key(e.keyCode, true); }  // (handled here, so no beep)
+- (void)keyDown:(NSEvent *)e {  // (handled here, so no beep; Cmd shortcuts go on to the menu)
+    if (e.modifierFlags & NSEventModifierFlagCommand) [super keyDown:e];
+    else if (!e.isARepeat) input_key(e.keyCode, true);
+}
 - (void)keyUp:(NSEvent *)e { input_key(e.keyCode, false); }
+- (void)flagsChanged:(NSEvent *)e {  // modifier keys (Shift: sprint)
+    if (e.keyCode == kVK_Shift || e.keyCode == kVK_RightShift)
+        input_key(e.keyCode, (e.modifierFlags & NSEventModifierFlagShift) != 0);
+}
+// The mouse in 1280x720 screen units: the image is letterboxed at 16:9 in the view (present).
+- (void)mouse:(NSEvent *)e button:(int)button down:(bool)down {
+    NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+    NSSize v = self.bounds.size;
+    double s = fmin(v.width / 1280, v.height / 720), x0 = (v.width - 1280 * s) / 2, y0 = (v.height - 720 * s) / 2;
+    input_mouse(button, down, (p.x - x0) / s, 720 - (p.y - y0) / s);
+}
+- (void)mouseDown:(NSEvent *)e { [self mouse:e button:0 down:true]; }
+- (void)mouseDragged:(NSEvent *)e { [self mouse:e button:0 down:true]; }
+- (void)mouseUp:(NSEvent *)e { [self mouse:e button:0 down:false]; }
+- (void)rightMouseDown:(NSEvent *)e { [self mouse:e button:1 down:true]; }
+- (void)rightMouseUp:(NSEvent *)e { [self mouse:e button:1 down:false]; }
 @end
 
 @interface FifaDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>

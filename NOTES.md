@@ -283,6 +283,18 @@ from the roots (215k functions), which rewrites every unit and costs a full
   instruction static initializer) are emitted as 4k-instruction chunk
   functions that return the next guest address to a driver loop; compile
   time is superlinear in function size otherwise.
+- Guest X registers and sp live in C locals `X0`..`X31` (`recomp/regs.py`); V registers stay in `CPU`. Each
+  function has a summary: R (registers it may read before writing them) and W (registers that may differ at its
+  return; a callee-saved one restored from its save slot on every path, or sp back at entry, doesn't count). The
+  `CPU` struct is synced only at calls, svcs and returns: before a call the changed locals the callee reads, or may
+  change and are needed after it; after it, reloads where live; at a return every changed local. Indirect calls,
+  host replacements and unbuilt code are taken as AAPCS64 (read `ABI_IN`, change `CLOB`). Summaries are computed
+  callee-first over the call graph's SCCs (~70 s, cached in `gen/summaries.pkl`); a unit's key includes the
+  summaries of what it calls. Chunked functions and setjmp callers keep registers in `CPU`. Switches:
+  `build.py --no-locals` (all in `CPU`), `--check-locals` (store everything changed before calls, report kept
+  registers that differ after: `locals check` lines), `FIFA_NO_LOCALS=lo-hi,...` (hex; those functions in `CPU`,
+  for bisecting). `python3 -I tools/verify_locals.py` checks every function's stores/reloads statically (~4 min,
+  must report 0 problems after a change to regs.py).
 
 ## Status (2026-10-21)
 
@@ -1104,6 +1116,18 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   instructions (1,207 chunks) dispatch with `switch (pc)`. The hottest guest function `F_0fc1e9c0` is the job system's
   LDXR/STXR work-queue poll (spinning, not work). Busy samples (b17): ~50% guest code over hundreds of functions,
   `a64_call` 6-8%, every runtime piece (texture checks, ring snapshots, pool lookups, objc) ~1% each.
+- Guest registers in locals across calls (2026-10-21, runs `build/b19` new, `b20` the binary before it, back to back,
+  thermal 0 both): the translator change from item 2. First try (V registers as locals too) made large functions up
+  to ~40% bigger (128-bit V spills on the host); X only: -11% memory ops on a sample unit. Two protocol bugs crashed
+  the boot, found with a unit then function bisect (`FIFA_NO_LOCALS`): a local not reloaded after a call (dead) was
+  later stored at a return joined by a path that had changed it, overwriting the callee's result in `CPU`
+  (`F_0ac73480`); and a register the callee may change but that's needed after the call has to be stored before it,
+  or `CPU` holds a stale value on paths where the callee leaves it alone. `tools/verify_locals.py` checks both on all
+  339,737 functions (and reports thousands of problems on either earlier version). b19 vs b20: 0.164 vs 0.173 Gi/frame
+  (-5%), 27.0 vs 27.7 CPU ms/frame at a lower P clock (2.68 vs 2.80 GHz): ~72 vs ~78 M P-cycles/frame (-7%); b20's
+  scene drew ~9% more (32.7k vs 29.8k draws per 2 s), so part of that is the scene. Cores busy 1.63 vs 1.68, swap
+  ~1.0 GB both, game RSS ~760-850 MB in open play. Binary 536 -> 529 MB (also `-fno-stack-protector`). Full rebuild
+  ~25-28 min with -j6. Regeneration ~4-8 min (was 80 s).
 - Visual pass, first round (2026-10-20, runs `build/w1` hidden, `build/v1`..`v3` visible: `VISIBLE=1 LOAD=4
   tools/bench.py ... 'fps -1:3' x12` takes walkout shots every ~3 s). Shader coverage 437/437 (shtool):
   - The 5 compute programs that failed are dispatched at match load: VMNMX (`3a2c`, `16ea01d00` `16ebcb400`, and an
@@ -1444,8 +1468,9 @@ so the visual pass (4) comes next. In order:
    (`restrict`, -O2), ~~structured loops~~ (already gotos), ~~thunk calls
    missing `a64_call`'s cache~~. What's left is spread thin (see "Host thunks
    in `a64_call`"): ~50% guest code over hundreds of functions, `a64_call`'s
-   indirect calls ~6%. A further real gain needs a translator change (e.g.
-   guest registers passed between functions instead of through `CPU`).
+   indirect calls ~6%. ~~Guest registers in locals across calls~~ (-5% instructions,
+   "Guest registers in locals across calls"); next step on that line: pass x0-x7
+   and the results as C arguments/return values so they skip `CPU` too.
    Measure with `tools/bench.py` + `tools/benchsum.py` (cost per frame; draws
    per 2 s differ between runs, compare them too), never while building.
    The second 30 fps lock (see "The 30 fps cap"): find it with `fps 60` and

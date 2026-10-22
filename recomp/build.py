@@ -18,6 +18,7 @@ import argparse, bisect, collections, glob, hashlib, json, multiprocessing, os, 
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from a64 import translate, Unsupported, bits, sx  # noqa: E402
+import regs  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PC_RELATIVE = {'adr', 'adrp', 'ldr_lit', 'ldrsw_lit', 'ldr_lit_v', 'svc'}
@@ -533,7 +534,18 @@ def cname(a):
 
 
 RESTRICT = True  # --no-restrict
+LOCALS = True  # --no-locals
+# Only the X registers and sp become locals: V registers live across calls spill whole q registers on the host
+# (only d8-d15's low halves are callee-saved), which made large functions up to ~40% bigger.
+LOCAL_MASK = regs.xs(0, 31)
+# Debug: FIFA_NO_LOCALS=lo-hi[,lo-hi...] (hex) emits the functions starting there with registers in the CPU struct.
+NO_LOCALS = [tuple(int(x, 16) for x in r.split('-')) for r in os.environ.get('FIFA_NO_LOCALS', '').split(',') if r]
 CHUNK = 4000  # functions above 1.5x this are split into chunk functions
+
+
+def direct(t):
+    """A call to t goes to a translated function (one with a register summary)."""
+    return t in _BUILT and t not in _HLE
 
 
 def emit_func(p, fn, built, hle, decls):
@@ -549,6 +561,18 @@ def emit_func(p, fn, built, hle, decls):
             lines.insert(0, f'  goto L_{fn.start:x};')
         jbs = ''.join(f'  jmp_buf JB_{a:x};\n' for a in body
                       if p.insn(a).kind == 'bl' and p.insn(a).target in p.setjmp_calls)
+        if LOCALS and not jbs and not any(lo <= fn.start < hi for lo, hi in NO_LOCALS):
+            # guest X registers in locals X0..X31 (regs.py); `c` is synced at calls and returns
+            blocks, entry = regs.cfg(p, fn, direct)
+            pl = regs.plan(blocks, entry, _SUMM, _SUMM[fn.start][1])
+            lines = emit_region(p, fn, body, built, hle, decls, None, pl)
+            if body[0] != fn.start:
+                lines.insert(0, f'  goto L_{fn.start:x};')
+            text = '\n'.join(lines)
+            used = sorted({int(m[1]) for m in re.finditer(r'\bX(\d\d?)\b', text)})
+            dec = '  uint64_t ' + ', '.join(f'X{i} = c->x[{i}]' for i in used) + ';\n' if used else ''
+            return (head + f'WEAK void {cname(fn.start)}(CPU *restrict c) {{\n  uint8_t *const M = mem;\n'
+                    f'  Flags F = {{0}};\n' + dec + text + '\n}')
         # restrict: guest stores (through M) never reach the CPU struct, so guest registers can stay in host
         # registers between calls. Not with a setjmp: longjmp would bring back host registers cached before it.
         cq = 'CPU *' if jbs or not RESTRICT else 'CPU *restrict '
@@ -575,11 +599,24 @@ def emit_func(p, fn, built, hle, decls):
     return '\n\n'.join(out)
 
 
-def emit_region(p, fn, addrs, built, hle, decls, inside):
+def emit_region(p, fn, addrs, built, hle, decls, inside, pl=None):
     """Statements for the instructions at addrs. inside is None for a whole
-    function, else the chunk's address set: jumps leaving it return the target."""
+    function, else the chunk's address set: jumps leaving it return the target.
+    pl: guest registers in locals, regs.plan's stores/reloads per site."""
     out = []
     ret = 'return;' if inside is None else 'return 0;'
+    if pl is None:
+        def st(key): return ''
+        def rl(key): return ''
+        def C(code): return code
+    else:
+        def st(key): return regs.stores(pl.get(key, (0, 0))[0] & LOCAL_MASK).lstrip()
+        def rl(key):
+            e = pl.get(key, (0, 0))
+            chk = ''.join(f' if (c->x[{i}] != X{i}) a64_locals_check(c, {key[0]:#x}ull, {i}, X{i});'
+                          for i in range(32) if len(e) > 2 and e[2] >> i & 1)
+            return regs.reloads(e[1] & LOCAL_MASK) + chk
+        C = regs.rename
 
     def call(t):
         if t in built:
@@ -602,44 +639,51 @@ def emit_region(p, fn, addrs, built, hle, decls, inside):
         k = ins.kind
         if k == 'op':
             if ins.c:
-                out.append('  ' + ins.c)
+                if pl is not None and 'a64_svc(' in ins.c:
+                    out.append(f'  {st((a, "s"))} {C(ins.c)}{rl((a, "s"))}')
+                else:
+                    out.append('  ' + C(ins.c))
         elif k == 'b':
             t = ins.target
-            out.append(f'  {jump(t)}' if local(t) else f'  {call(t)} {ret}')
+            out.append(f'  {jump(t)}' if local(t) else f'  {st((a, "t"))} {call(t)} {ret}')
         elif k == 'bcond':
             t = ins.target
             if local(t):
-                out.append(f'  if ({ins.c}) {jump(t)}')
+                out.append(f'  if ({C(ins.c)}) {jump(t)}')
             else:
-                out.append(f'  if ({ins.c}) {{ {call(t)} {ret} }}')
+                out.append(f'  if ({C(ins.c)}) {{ {st((a, "t"))} {call(t)} {ret} }}')
         elif k == 'bl' and ins.target in p.setjmp_calls:
             # setjmp returns twice: the host context is taken here, in the caller's
             # frame, and recomp/hle/setjmp.c's longjmp comes back to it
             out.append(f'  c->x[30] = {a + 4:#x}ull; if (!_setjmp(JB_{a:x})) {{ a64_pending_jb = &JB_{a:x}; {call(ins.target)} }}')
         elif k == 'bl':
-            out.append(f'  c->x[30] = {a + 4:#x}ull; {call(ins.target)}')
+            if pl is None:
+                out.append(f'  c->x[30] = {a + 4:#x}ull; {call(ins.target)}')
+            else:
+                out.append(f'  X30 = {a + 4:#x}ull; {st((a, "c"))} {call(ins.target)}{rl((a, "c"))}')
         elif k == 'blr':
-            out.append(f'  {{ uint64_t t = {ins.c}; c->x[30] = {a + 4:#x}ull; a64_call(c, t); }}')
+            out.append(f'  {{ uint64_t t = {C(ins.c)}; {C("c->x[30]")} = {a + 4:#x}ull; {st((a, "c"))} a64_call(c, t);'
+                       f'{rl((a, "c"))} }}')
         elif k == 'br':
             ts = fn.jt.get(a)
             if ts:
-                cases = ' '.join(f'case {t:#x}ull: {jump(t)}' if local(t) else f'case {t:#x}ull: {{ {call(t)} {ret} }}'
-                                 for t in ts)
-                out.append(f'  {{ uint64_t t = {ins.c}; switch (t) {{ {cases} default: a64_bad_jump(c, {a:#x}ull, t); {ret} }} }}')
+                cases = ' '.join(f'case {t:#x}ull: {jump(t)}' if local(t) else
+                                 f'case {t:#x}ull: {{ {st((a, t))} {call(t)} {ret} }}' for t in ts)
+                out.append(f'  {{ uint64_t t = {C(ins.c)}; switch (t) {{ {cases} default: a64_bad_jump(c, {a:#x}ull, t); {ret} }} }}')
             else:
-                out.append(f'  a64_call(c, {ins.c}); {ret}')
+                out.append(f'  {{ uint64_t t = {C(ins.c)}; {st((a, "t"))} a64_call(c, t); {ret} }}')
         elif k == 'ret':
-            out.append(f'  {ret}')
+            out.append(f'  {st((a, "x"))} {ret}')
         else:
-            out.append('  ' + ins.c.replace('return;', ret))
+            out.append(f'  {st((a, "x"))} ' + C(ins.c).replace('return;', ret))
         falls_through = k in ('op', 'bl', 'blr', 'bcond')
         if a in fn.falls:
             t = fn.falls[a]
             if falls_through:
                 if p.is_text(t):
-                    out.append(f'  {call(t)} {ret}')
+                    out.append(f'  {st((a, "f"))} {call(t)} {ret}')
                 else:
-                    out.append(f'  a64_trap(c, {t:#x}ull, 0); {ret}')
+                    out.append(f'  {st((a, "f"))} a64_trap(c, {t:#x}ull, 0); {ret}')
         elif falls_through and inside is not None and a == addrs[-1]:
             out.append(f'  c->fl = F; return {a + 4:#x}ull;')
     return out
@@ -660,6 +704,7 @@ def load_hle(p):
 
 
 _P = _BUILT = _HLE = _GDIR = None  # shared with forked workers
+_SUMM = {}  # register summaries (regs.py): function -> (R, W)
 
 
 def closure(p, roots, hle):
@@ -701,6 +746,135 @@ def write_bucket(job):
     return name, st, uns
 
 
+def direct_callees(fn):
+    """Translated functions fn calls or jumps to (their summaries shape fn's code)."""
+    ts = set(fn.calls)
+    for v in fn.jt.values():
+        ts.update(v or ())
+    return sorted(t for t in ts if direct(t))
+
+
+def scan_callees(fs):
+    _P.cache.clear()  # per-address translations: a worker sees most of the program, keep its memory down
+    return [(f, direct_callees(discover(_P, f))) for f in fs]
+
+
+def summarize_sccs(job):
+    """Summaries of a list of (SCC, recursive) whose outside callees are in
+    `known`. A recursive SCC iterates from (0, 0) up to the least fixed point."""
+    sccs, known = job
+    _P.cache.clear()
+    summ = dict(known)
+    out = {}
+    for scc, rec in sccs:
+        cfgs = [(f, regs.cfg(_P, discover(_P, f), direct)) for f in scc]
+        while True:
+            changed = False
+            for f, (blocks, entry) in cfgs:
+                s = regs.summarize(blocks, entry, summ)
+                if s != summ.get(f, (0, 0)):
+                    summ[f] = s
+                    changed = True
+            if not changed or not rec:
+                break
+        for f in scc:
+            out[f] = summ.get(f, (0, 0))
+    return out
+
+
+def sccs_by_level(order, callees):
+    """Strongly connected components of the call graph (Tarjan, iterative),
+    grouped by level: a component's callees are all in lower levels."""
+    index, low, on, stack, comp = {}, {}, set(), [], {}
+    comps = []
+    n = 0
+    for root in order:
+        if root in index:
+            continue
+        work = [(root, 0)]
+        while work:
+            v, i = work[-1]
+            if i == 0:
+                index[v] = low[v] = n
+                n += 1
+                stack.append(v)
+                on.add(v)
+            cs = callees.get(v, ())
+            if i < len(cs):
+                work[-1] = (v, i + 1)
+                w = cs[i]
+                if w not in index:
+                    work.append((w, 0))
+                elif w in on:
+                    low[v] = min(low[v], index[w])
+                continue
+            work.pop()
+            if work:
+                u = work[-1][0]
+                low[u] = min(low[u], low[v])
+            if low[v] == index[v]:
+                c = []
+                while True:
+                    w = stack.pop()
+                    on.discard(w)
+                    comp[w] = len(comps)
+                    c.append(w)
+                    if w == v:
+                        break
+                comps.append(c)
+    # Tarjan emits components callees-first
+    level = [0] * len(comps)
+    for ci, c in enumerate(comps):
+        lv = 0
+        for f in c:
+            for t in callees.get(f, ()):
+                if comp[t] != ci:
+                    lv = max(lv, level[comp[t]] + 1)
+        level[ci] = lv
+    by = collections.defaultdict(list)
+    for ci, c in enumerate(comps):
+        by[level[ci]].append(c)
+    return [by[k] for k in sorted(by)]
+
+
+def summaries(order, buckets, key, gdir, pool):
+    """Callees and register summaries of every function, cached in gen/summaries.pkl under key."""
+    import pickle
+    path = os.path.join(gdir, 'summaries.pkl')
+    if os.path.exists(path):
+        try:
+            d = pickle.load(open(path, 'rb'))
+            if d['key'] == key:
+                return d['callees'], d['summ']
+        except Exception:
+            pass
+    t0 = time.time()
+    callees = {}
+    for res in pool.imap_unordered(scan_callees, [fs for fs in buckets.values()]):
+        callees.update(res)
+    levels = sccs_by_level(order, callees)
+    t1 = time.time()
+    summ = {}
+    for lv in levels:
+        # chunks of ~equal size; each carries the summaries its SCCs' outside callees have
+        n = max(1, min(len(lv) // (4 * os.cpu_count()), 256))
+        jobs = []
+        for i in range(0, len(lv), n):
+            ch = [(scc, len(scc) > 1 or scc[0] in callees[scc[0]]) for scc in lv[i:i + n]]
+            need = {t for scc, _ in ch for f in scc for t in callees[f]}
+            jobs.append((ch, {t: summ[t] for t in need if t in summ}))
+        if len(jobs) == 1:
+            res = [summarize_sccs(jobs[0])]
+        else:
+            res = pool.imap_unordered(summarize_sccs, jobs)
+        for r in res:
+            summ.update(r)
+    print(f'register summaries: {len(summ)} functions, {len(levels)} levels '
+          f'(callees {t1 - t0:.1f}s, summaries {time.time() - t1:.1f}s)')
+    pickle.dump({'key': key, 'callees': callees, 'summ': summ}, open(path, 'wb'))
+    return callees, summ
+
+
 def bucket_name(key):
     return f'f_{key << BUCKET_SHIFT:08x}.c'
 
@@ -708,7 +882,7 @@ def bucket_name(key):
 def inputs_hash(bdir):
     """Everything that can change generated code apart from function starts."""
     h = hashlib.sha1()
-    for f in ('a64.py', 'a64_simd.py', 'build.py'):
+    for f in ('a64.py', 'a64_simd.py', 'build.py', 'regs.py'):
         h.update(open(os.path.join(HERE, f), 'rb').read())
     for f in sorted(glob.glob(os.path.join(bdir, '*.img'))) + [os.path.join(bdir, 'symbols.tsv')]:
         st = os.stat(f)
@@ -753,6 +927,10 @@ def main():
     ap.add_argument('--hle-only', action='store_true', help='only rewrite hle_table.c')
     ap.add_argument('--no-restrict', action='store_true',
                     help='plain CPU *c: guest registers exact in CPU at a fault (crash dumps), slower')
+    ap.add_argument('--check-locals', action='store_true',
+                    help='store all changed locals before calls and check the ones the callee keeps after them')
+    ap.add_argument('--no-locals', action='store_true',
+                    help='guest registers in the CPU struct throughout instead of C locals (regs.py)')
     args = ap.parse_args()
     t0 = time.time()
     p = Program(args.bdir)
@@ -780,8 +958,10 @@ def main():
 
     gdir = os.path.join(args.bdir, 'gen')
     os.makedirs(gdir, exist_ok=True)
-    global _P, _BUILT, _HLE, _GDIR, RESTRICT
+    global _P, _BUILT, _HLE, _GDIR, _SUMM, RESTRICT, LOCALS
     RESTRICT = not args.no_restrict
+    LOCALS = not args.no_locals
+    regs.CHECK = args.check_locals
     if args.all:
         order = sorted(f for f in p.starts if p.is_text(f))
         funcs = None
@@ -796,13 +976,22 @@ def main():
     buckets = collections.defaultdict(list)
     for f in order:
         buckets[f >> BUCKET_SHIFT].append(f)
-    base = inputs_hash(args.bdir) + ('' if RESTRICT else ' no-restrict')
+    base = inputs_hash(args.bdir) + ('' if RESTRICT else ' no-restrict') + ('' if LOCALS else ' no-locals') + (' check' if regs.CHECK else '')
+    callees = {}
+    if LOCALS:
+        # a unit's code depends on the summaries of what its functions call
+        skey = base + hashlib.sha1(repr(order).encode()).hexdigest()
+        with multiprocessing.get_context('fork').Pool(os.cpu_count()) as pool:
+            callees, _SUMM = summaries(order, buckets, skey, gdir, pool)
     keys_path = os.path.join(gdir, 'keys.json')
     old_keys = json.load(open(keys_path)) if os.path.exists(keys_path) and not args.force else {}
     new_keys, jobs = {}, []
     for key, fs in buckets.items():
         h = hashlib.sha1(base.encode())
         h.update(repr((fs, buckets.get(key + 1, [])[:1], funcs is None)).encode())
+        if LOCALS:
+            h.update(repr(sorted((t, _SUMM[t]) for f in fs for t in callees[f] + [f])).encode())
+            h.update(repr([r for r in NO_LOCALS if r[0] < (key + 1) << BUCKET_SHIFT and r[1] > key << BUCKET_SHIFT]).encode())
         name = bucket_name(key)
         new_keys[name] = h.hexdigest()
         if old_keys.get(name) != new_keys[name] or not os.path.exists(os.path.join(gdir, name)):

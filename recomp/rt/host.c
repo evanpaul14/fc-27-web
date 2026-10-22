@@ -143,6 +143,13 @@ void a64_bad_jump(CPU *c, uint64_t pc, uint64_t t) {
        (unsigned long long)t, (unsigned long long)c->x[30]);
 }
 
+void a64_locals_check(CPU *c, uint64_t pc, unsigned r, uint64_t mine) {
+  static _Atomic int n;
+  if (n++ < 200)
+    HLOG("locals check: call at %#llx: x%u is %#llx in CPU, %#llx in the caller\n", (unsigned long long)pc, r,
+         (unsigned long long)c->x[r], (unsigned long long)mine);
+}
+
 void a64_trap(CPU *c, uint64_t pc, uint32_t word) {
   uint64_t off = 0;
   const char *s = host_symbol(pc, &off);

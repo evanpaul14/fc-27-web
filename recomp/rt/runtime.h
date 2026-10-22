@@ -19,3 +19,5 @@ extern const unsigned a64_missing_count;
 void a64_call(CPU *c, uint64_t target);
 /* `br` whose target is not in the function's resolved jump table. */
 void a64_bad_jump(CPU *c, uint64_t pc, uint64_t target);
+/* build.py --check-locals: register r after the call at pc differs from the caller's copy */
+void a64_locals_check(CPU *c, uint64_t pc, unsigned r, uint64_t mine);

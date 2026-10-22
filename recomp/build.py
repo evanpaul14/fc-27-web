@@ -30,6 +30,10 @@ PATCHES = {
     # what's left of it each frame. host_frame_period_ms applies FIFA_FPS / the `fps` control command.
     0x0ad4b4d8: (0x1e691d40, '{ extern double host_frame_period_ms(double); V128 R = {0}; R.fd[0] = host_frame_period_ms(!F.zf ? c->v[10].fd[0] : c->v[9].fd[0]); '
                              'c->v[0] = R; }'),
+    # The main loop's own limiter (F_119e3e70, sleeps at 119e4080): period 1 / rate with `ldr d0, [x0, #8]` the rate
+    # in Hz (30), a second 30 fps lock under the pacer's. host_rate_hz applies the same FIFA_FPS / `fps` setting.
+    0x119e3f0c: (0xfd400400, '{ extern double host_rate_hz(double); V128 R = {0}; R.d[0] = LD64(X0 + 8ull); '
+                             'R.fd[0] = host_rate_hz(R.fd[0]); c->v[0] = R; }'),
 }
 BUCKET_SHIFT = 18  # 256 KB of code per translation unit
 ROOT = os.path.dirname(HERE)

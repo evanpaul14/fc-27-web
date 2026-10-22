@@ -222,6 +222,11 @@ double host_frame_period_ms(double game_ms) {
     int v = fps_cap_now();
     return v < 0 ? game_ms : v == 0 ? 0.0 : 1000.0 / v;
 }
+// The same cap as a rate (the main loop's limiter, also a patch): 0 (none) is a rate high enough never to sleep.
+double host_rate_hz(double game_hz) {
+    int v = fps_cap_now();
+    return v < 0 ? game_hz : v == 0 ? 1e6 : (double)v;
+}
 static _Atomic int csdump_req;
 int input_take_csdump(void) { return atomic_exchange(&csdump_req, 0); }
 void input_shot_done(void) { atomic_fetch_add(&shots_done, 1); }

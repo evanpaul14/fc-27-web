@@ -1044,6 +1044,23 @@ renderer, 8.7k presents in 300 s, no crash). Pieces:
   to finish), the main loop thread (`1202ec18`, which slept ~7.7 ms per frame at the cap) no longer sleeps, and frames
   still land on 30; `fps 40` gives 29.7. The critical path is the three job workers: command-list submission
   (`nvnQueueSubmitCommands` -> `exec_list`) on them, plus ~1,900 of ~19k samples in `nvnSyncWait` on the GPU.
+  Second lock found (2026-10-21, u1: `fps -1` 60 s then `fps 60` 120 s, `FIFA_LOG_WAITS=1`): at today's cost (CPU
+  ~22-24 ms, GPU ~22 ms per frame, P cores ~15% busy at 1.6 GHz) `fps 60` still gives exactly 30.0, so it's a timed
+  lock, not throughput. The main loop thread (0x6c, `1202ec18`) does sleep at `fps 60`, once per frame, ~24 ms (21 ms
+  at `fps -1`), from `119e4084`: `F_119e3e70` (one caller, `119e3310`) is a second limiter of the pacer's shape, period
+  `1.0 / [x0+8]` (a rate in Hz, 30.0) and the rest of it slept at `119e4080`. Its `ldr d0, [x0, #8]` (`119e3f0c`)
+  is now a patch through `host_rate_hz` (same `FIFA_FPS` / `fps` setting; 0 means no limit).
+  The pacer's own 30/60 choice is a game flag: byte `+0xda` of the object at `[0x155b46d8]` (ELF `0xd5b46d8`;
+  main's ELF is based at 0, the guest at `0x8000000`), 1 = 33.3 ms. FIFA sets it to 1 at `0xfc6a9e0` and to 0 at
+  `0xfc73a94`, each unless a query (message 0x1c9) says otherwise; `0xae9cdd0` / `0xae9ce00` set 0 / 1 (likely
+  console commands). Its other readers (`0xaff98a0`, `0xaffa260`) only feed a 10-entry ring (telemetry). So the
+  game has a 60 fps mode of its own.
+  With the patch (u2) `fps 60` gives 59.3 fps, the main loop sleeping once per 60 Hz frame (~9 ms) - but u1 and u2
+  never reached the match: hidden runs (u1, u2, u4, u5) stick on Classic Match's Select Sides screen, `a` presses
+  arriving and ignored. u3 (`FIFA_AUDIO=1` while hidden: CoreAudio instead of the null sink) got through, and b20
+  (17:27, before hwopus decoded for real) did with the null sink, so the trigger looks like real Opus audio through
+  the null sink. Not wait logging (u5 had none). The null sink now paces buffers on absolute deadlines (relative
+  sleeps drifted slow), which didn't fix it (u4, u5). So 60 fps in the match is still unmeasured.
 - CPU cost per frame, second round (b9 counters, b10): per 2 s ~460-2,400 sampled texture checks, 8-317 full
   hashes (1-55 MB), ~0-1 uploads; 240-760 MB through `ring_alloc`. `fnv_sample` now hashes 512 whole cache lines
   instead of 4,096 bytes on 4,096 lines, and uniform snapshots reuse the last copy of the same range in the ring
@@ -1492,9 +1509,14 @@ so the visual pass (4) comes next. In order:
    "Guest registers in locals across calls"); next step on that line: pass x0-x7
    and the results as C arguments/return values so they skip `CPU` too.
    Measure with `tools/bench.py` + `tools/benchsum.py` (cost per frame; draws
-   per 2 s differ between runs, compare them too), never while building.
-   The second 30 fps lock (see "The 30 fps cap"): find it with `fps 60` and
-   `FIFA_LOG_WAITS=1`, if uncapping is still wanted.
+   per 2 s differ between runs, compare them too), never while building. Each bench run is recorded in git under
+   `runs/<name>/` (info.json: command, settings, commit, uncommitted diffstat, outcome; summary, marks, tomatch,
+   cores, game.log.gz); a name already used in `build/` or `runs/` is refused. Runs before u1 aren't recorded, and
+   the 2026-10-20 `f1`..`f5` were overwritten by today's u1..u5 (named f1..f5 then).
+   The second 30 fps lock (see "The 30 fps cap"): found, the main loop's limiter
+   `F_119e3e70` (patched through `host_rate_hz`). Next: bench `fps 60` with it, and check the match doesn't run at
+   double speed (a fixed step per tick would need `ForceSimRate` / `ForceDeltaTime` to follow). Blocked first on
+   hidden runs sticking at Select Sides (null-sink audio, "The 30 fps cap"); `FIFA_AUDIO=1` gets through.
 3. ~~The black 3D scene for part of the first half~~ fixed by the lane
    masks. ~~The 32^3 3D texture sampled as 2D~~ is the game's own stale
    binding, harmless (see "Blits").

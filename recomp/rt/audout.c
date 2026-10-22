@@ -100,20 +100,25 @@ static AudioComponentInstance open_unit(AudioOut *o) {
   return u;
 }
 
-static void sink_thread_sleep(uint64_t ns) {
-  struct timespec ts = {(time_t)(ns / 1000000000), (long)(ns % 1000000000)};
-  nanosleep(&ts, 0);
-}
+static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 
+/* Each buffer ends at an absolute deadline (the last one's end, or now after an underrun), so sleep overshoot doesn't
+ * add up: relative sleeps ran the audio clock slower than real time, and the game waits on its clips' ends. */
 static void *sink_thread(void *arg) {
   AudioOut *o = arg;
+  uint64_t deadline = 0;
   pthread_mutex_lock(&o->lock);
   for (;;) {
     while (!o->closing && (o->state != STATE_STARTED || !o->nqueued)) pthread_cond_wait(&o->cv, &o->lock);
     if (o->closing) break;
-    uint64_t frames = o->queued[0].frames;
+    uint64_t frames = o->queued[0].frames, t = now_ns();
+    if (deadline < t) deadline = t;
+    deadline += frames * 1000000000ull / SAMPLE_RATE;
     pthread_mutex_unlock(&o->lock);
-    sink_thread_sleep(frames * 1000000000ull / SAMPLE_RATE);
+    if (deadline > t) {
+      struct timespec ts = {(time_t)((deadline - t) / 1000000000), (long)((deadline - t) % 1000000000)};
+      nanosleep(&ts, 0);
+    }
     pthread_mutex_lock(&o->lock);
     if (o->state != STATE_STARTED || !o->nqueued) continue;  /* stopped or flushed meanwhile */
     release_head(o);
